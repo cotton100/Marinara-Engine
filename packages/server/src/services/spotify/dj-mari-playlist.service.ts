@@ -493,7 +493,7 @@ async function buildRecentChatContext(args: {
   for (const mode of modes) {
     const chat = args.chats.find((candidate) => candidate.mode === mode);
     if (!chat) continue;
-    const messages = await args.chatsStorage.listMessagesPaginated(chat.id, RECENT_CHAT_MESSAGE_LIMIT);
+    const messages = await args.chatsStorage.listMessagesPaginatedWithActiveSwipes(chat.id, RECENT_CHAT_MESSAGE_LIMIT);
     contexts.push({
       mode,
       chatName: chat.name,

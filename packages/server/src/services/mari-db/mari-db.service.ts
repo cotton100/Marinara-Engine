@@ -16,6 +16,7 @@ import * as schema from "../../db/schema/index.js";
 import { getFileStorageDir, getMonorepoRoot, isCustomToolScriptEnabled } from "../../config/runtime-config.js";
 import { logger } from "../../lib/logger.js";
 import { createCharactersStorage } from "../storage/characters.storage.js";
+import { createChatsStorage } from "../storage/chats.storage.js";
 import { newId, now } from "../../utils/id-generator.js";
 import { normalizeThemeCss } from "../../utils/theme-css.js";
 import { getMariImagesService } from "./mari-images.service.js";
@@ -3768,8 +3769,7 @@ export class MariDbService {
         const limit = limitFlag !== undefined ? normalizeLimit(limitFlag, 20, 200) : null;
         const offset = normalizeOffset(flagString(flags, "offset"));
         const tail = hasFlag(flags, "tail");
-        let messages = (await this.rawRows("messages")).filter((m) => m.chatId === chatId);
-        messages.sort((a, b) => String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")));
+        let messages = await createChatsStorage(this.db).listMessagesWithActiveSwipes(chatId);
         if (tail) {
           const offsetMessages = offset > 0 ? messages.slice(0, Math.max(0, messages.length - offset)) : messages;
           messages = limit !== null ? offsetMessages.slice(-limit) : offsetMessages;

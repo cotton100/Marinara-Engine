@@ -581,7 +581,7 @@ export async function registerDryRunRoute(app: FastifyInstance) {
     };
 
     // Pull existing messages, apply the same conversation-start + context limit filtering
-    const allChatMessages = await chats.listMessages(chatId);
+    const allChatMessages = await chats.listMessagesWithActiveSwipes(chatId);
     const chatMode = (chat.mode as string) ?? "roleplay";
     const activeChatSummary = resolveRoleplayChatSummary(chatMode, chatMeta);
     const dryRunActiveAgentIds = Array.isArray(chatMeta.activeAgentIds) ? (chatMeta.activeAgentIds as string[]) : [];

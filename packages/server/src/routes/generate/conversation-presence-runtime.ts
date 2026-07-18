@@ -1,10 +1,7 @@
 import { normalizeTextForMatch } from "@marinara-engine/shared";
 
 import type { DB } from "../../db/connection.js";
-import {
-  dailyCapForCharacter,
-  getAutonomousDailyBudget,
-} from "../../services/conversation/autonomous.service.js";
+import { dailyCapForCharacter, getAutonomousDailyBudget } from "../../services/conversation/autonomous.service.js";
 import {
   getDirectMessageDelay,
   getEffectiveCurrentStatus,
@@ -37,12 +34,61 @@ type ConversationPresenceChatsStore = {
     updater: (current: Record<string, unknown>) => Record<string, unknown>,
     options?: { touchUpdatedAt?: boolean },
   ): Promise<unknown>;
-  listMessages(chatId: string): Promise<any[]>;
+  listMessagesWithActiveSwipes(chatId: string): Promise<any[]>;
 };
 
 type ConversationPresenceCharactersStore = {
   getById(id: string): Promise<{ data?: unknown } | null>;
 };
+
+export function hasExactConversationPresenceRoster<T extends { charId: string }>(
+  characters: readonly T[],
+  expectedCharacterIds: readonly string[],
+): boolean {
+  if (characters.length !== expectedCharacterIds.length) return false;
+  const actualIds = new Set(characters.map((character) => character.charId));
+  return actualIds.size === characters.length && expectedCharacterIds.every((id) => actualIds.has(id));
+}
+
+export function selectConversationPresenceResponders<T extends { charId: string; name: string; displayName: string }>(
+  characters: readonly T[],
+  input: {
+    characterIds: readonly string[];
+    scopedCharacterIds?: readonly string[] | null;
+    forCharacterId?: string | null;
+    mentionedCharacterNames?: readonly string[] | null;
+  },
+): { respondingCharacters: T[]; hasTargeting: boolean } {
+  if (Array.isArray(input.scopedCharacterIds)) {
+    const stableScopeIds = new Set(input.scopedCharacterIds);
+    return {
+      respondingCharacters: characters.filter((character) => stableScopeIds.has(character.charId)),
+      hasTargeting: true,
+    };
+  }
+
+  const manualTargetCharId =
+    typeof input.forCharacterId === "string" && input.characterIds.includes(input.forCharacterId)
+      ? input.forCharacterId
+      : null;
+  const requestedMentionNames = new Set(
+    (input.mentionedCharacterNames ?? []).map((name) => normalizeTextForMatch(name)),
+  );
+  const scopedCharacters = manualTargetCharId
+    ? characters.filter((character) => character.charId === manualTargetCharId)
+    : requestedMentionNames.size > 0
+      ? characters.filter(
+          (character) =>
+            requestedMentionNames.has(normalizeTextForMatch(character.name)) ||
+            requestedMentionNames.has(normalizeTextForMatch(character.displayName)),
+        )
+      : [...characters];
+
+  return {
+    respondingCharacters: scopedCharacters.length > 0 ? scopedCharacters : [...characters],
+    hasTargeting: requestedMentionNames.size > 0 || !!manualTargetCharId,
+  };
+}
 
 export async function resolveConversationPresenceRuntime(args: {
   db: DB;
@@ -55,6 +101,8 @@ export async function resolveConversationPresenceRuntime(args: {
   promptNow: Date;
   forCharacterId?: string | null;
   mentionedCharacterNames?: string[] | null;
+  /** Stable, preflight-validated response scope. Null keeps legacy request targeting. */
+  scopedCharacterIds?: readonly string[] | null;
   shouldAccountAutonomousGeneration: boolean;
   regenerateMessageId?: string | null;
   impersonate?: boolean;
@@ -88,28 +136,27 @@ export async function resolveConversationPresenceRuntime(args: {
     actualNow: args.actualNow ?? new Date(),
     promptNow: args.promptNow,
   });
+  const convoCharNames = convoCharInfo.map((character) => character.displayName);
+  const charNameList = convoCharNames.length ? convoCharNames.join(", ") : "the character";
+
+  if (!hasExactConversationPresenceRoster(convoCharInfo, args.characterIds)) {
+    args.writeSse({ type: "error", data: "The Conversation character roster changed. Please retry." });
+    args.writeSse({ type: "done" });
+    args.endSse();
+    return buildPresenceResult({ ended: true, convoCharInfo, convoCharNames, charNameList, args });
+  }
 
   persistConversationPresenceState(args.chats, args.chatId, convoCharInfo);
 
-  const convoCharNames = convoCharInfo.map((character) => character.displayName);
-  const charNameList = convoCharNames.length ? convoCharNames.join(", ") : "the character";
-  const manualTargetCharId =
-    typeof args.forCharacterId === "string" && args.characterIds.includes(args.forCharacterId)
-      ? args.forCharacterId
-      : null;
-  const requestedMentionNames = new Set(
-    (args.mentionedCharacterNames ?? []).map((name) => normalizeTextForMatch(name)),
-  );
-  const scopedConvoCharInfo = manualTargetCharId
-    ? convoCharInfo.filter((character) => character.charId === manualTargetCharId)
-    : requestedMentionNames.size > 0
-      ? convoCharInfo.filter(
-          (character) =>
-            requestedMentionNames.has(normalizeTextForMatch(character.name)) ||
-            requestedMentionNames.has(normalizeTextForMatch(character.displayName)),
-        )
-      : convoCharInfo;
-  let respondingConvoCharInfo = scopedConvoCharInfo.length > 0 ? scopedConvoCharInfo : convoCharInfo;
+  const presenceSelection = selectConversationPresenceResponders(convoCharInfo, {
+    characterIds: args.characterIds,
+    scopedCharacterIds: args.scopedCharacterIds,
+    forCharacterId: args.forCharacterId,
+    mentionedCharacterNames: args.mentionedCharacterNames,
+  });
+  // A validated stable scope must never widen back to the whole roster if the
+  // character rows drift between preflight and presence resolution.
+  let respondingConvoCharInfo = presenceSelection.respondingCharacters;
 
   if (args.shouldAccountAutonomousGeneration && !args.regenerateMessageId && !args.impersonate) {
     const budget = getAutonomousDailyBudget(args.chatMeta);
@@ -144,7 +191,7 @@ export async function resolveConversationPresenceRuntime(args: {
   let chatMessages = args.chatMessages;
   let finalMessages = args.finalMessages;
   if (!args.regenerateMessageId && !args.impersonate && !args.skipPresenceDelay) {
-    const hasMentions = requestedMentionNames.size > 0 || !!manualTargetCharId;
+    const hasMentions = presenceSelection.hasTargeting;
     const worstStatus = respondingConvoCharInfo.reduce((worst, character) => {
       const rank = { online: 0, idle: 1, dnd: 2, offline: 3 } as Record<string, number>;
       const cStatus = effectiveStatus(character);
@@ -185,7 +232,7 @@ export async function resolveConversationPresenceRuntime(args: {
         });
       }
 
-      const refreshed = await args.chats.listMessages(args.chatId);
+      const refreshed = await args.chats.listMessagesWithActiveSwipes(args.chatId);
       const rStartIdx = findLatestConversationStartIndex(refreshed);
       const rScoped = rStartIdx > 0 ? refreshed.slice(rStartIdx) : refreshed;
       chatMessages = args.supportsHiddenFromAI ? rScoped.filter((message) => !isMessageHiddenFromAI(message)) : rScoped;
@@ -202,10 +249,18 @@ export async function resolveConversationPresenceRuntime(args: {
   }
 
   if (args.regenerateMessageId) {
-    args.writeSse({ type: "typing", characters: convoCharNames });
+    args.writeSse({ type: "typing", characters: respondingConvoCharNames });
   }
 
-  return buildPresenceResult({ ended: false, convoCharInfo, convoCharNames, charNameList, args, chatMessages, finalMessages });
+  return buildPresenceResult({
+    ended: false,
+    convoCharInfo,
+    convoCharNames,
+    charNameList,
+    args,
+    chatMessages,
+    finalMessages,
+  });
 }
 
 async function resolveConversationPromptCharacters(args: {

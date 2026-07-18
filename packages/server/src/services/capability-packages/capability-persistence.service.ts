@@ -22,6 +22,7 @@ import {
   spatialContextSnapshots,
 } from "../../db/schema/index.js";
 import { withChatMetadataPatchQueue } from "../storage/chats.storage.js";
+import { overlayActiveSwipesForMessages } from "../storage/message-swipe-authority.js";
 
 function parseStringArray(value: unknown): string[] {
   if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === "string");
@@ -194,11 +195,14 @@ function createPersistenceSession(db: DB): CapabilityPersistenceSession {
       return rows[0] ? mapChat(rows[0]) : null;
     },
     async listMessages(chatId) {
-      const rows = await db
-        .select()
-        .from(messages)
-        .where(eq(messages.chatId, chatId))
-        .orderBy(messages.createdAt, messages.id);
+      const rows = await db.transaction(async (tx) => {
+        const messageRows = await tx
+          .select()
+          .from(messages)
+          .where(eq(messages.chatId, chatId))
+          .orderBy(messages.createdAt, messages.id);
+        return overlayActiveSwipesForMessages(tx, messageRows);
+      });
       return rows.map(mapMessage);
     },
     async listExistingLorebookEntryIds(entryIds) {
@@ -219,6 +223,10 @@ function createPersistenceSession(db: DB): CapabilityPersistenceSession {
           .where(eq(chats.id, input.chatId))
           .limit(1);
         const createdAt = ensureTimestampAfter(input.createdAt, chatRows[0]?.lastMessageAt);
+        const completeExtra = {
+          ...input.extra,
+          swipeCharacterId: input.characterId,
+        };
         const message: typeof messages.$inferInsert = {
           id: input.id,
           chatId: input.chatId,
@@ -226,7 +234,7 @@ function createPersistenceSession(db: DB): CapabilityPersistenceSession {
           characterId: input.characterId,
           content: input.content,
           activeSwipeIndex: 0,
-          extra: JSON.stringify(input.extra),
+          extra: JSON.stringify(completeExtra),
           createdAt,
         };
         await tx.insert(messages).values(message);
@@ -235,7 +243,7 @@ function createPersistenceSession(db: DB): CapabilityPersistenceSession {
           messageId: input.id,
           index: 0,
           content: input.content,
-          extra: JSON.stringify({}),
+          extra: JSON.stringify(completeExtra),
           createdAt,
         });
         return mapMessage(message as typeof messages.$inferSelect);

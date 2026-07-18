@@ -105,11 +105,11 @@ async function buildRecentContext(
   seatNames: Record<string, string>,
 ): Promise<string> {
   try {
-    const messages = await chats.listMessages(chatId);
+    const messages = await chats.listMessagesWithActiveSwipes(chatId);
     const tail = messages.slice(-4);
     const lines = tail
       .map((m: { role: string; characterId: string | null; content: string }) => {
-        const who = m.role === "user" ? "You" : seatNames[m.characterId ?? ""] ?? "Someone";
+        const who = m.role === "user" ? "You" : (seatNames[m.characterId ?? ""] ?? "Someone");
         const text = truncate(m.content, 200);
         return text ? `${who}: ${text}` : "";
       })
@@ -159,7 +159,8 @@ async function drainAndVoiceAnnouncements(args: {
   turnIndex: number;
   signal?: AbortSignal;
 }): Promise<{ state: unknown } | null> {
-  const { chatId, active, humanSeatId, chats, characters, engineStorage, provider, model, reply, turnIndex, signal } = args;
+  const { chatId, active, humanSeatId, chats, characters, engineStorage, provider, model, reply, turnIndex, signal } =
+    args;
   const { engine, state } = active;
 
   if (typeof engine.drainAnnouncements !== "function") return null;
@@ -204,7 +205,12 @@ async function drainAndVoiceAnnouncements(args: {
   if (!dealerLine) dealerLine = eventSummary;
 
   if (dealerCharId && dealerLine) {
-    const saved = await chats.createMessage({ chatId, role: "assistant", characterId: dealerCharId, content: dealerLine });
+    const saved = await chats.createMessage({
+      chatId,
+      role: "assistant",
+      characterId: dealerCharId,
+      content: dealerLine,
+    });
     if (saved) {
       await engineStorage.create({
         chatId,
@@ -326,7 +332,11 @@ export async function runTurnGameBotTurns(args: RunBotTurnsArgs): Promise<void> 
     // Break rather than spin the rest of the cap on a stuck seat.
     const signature = JSON.stringify(state);
     if (signature === lastSignature) {
-      logger.warn("[turn-game] board not advancing for chat %s (seat %s still to act); stopping bot loop", chatId, seatId);
+      logger.warn(
+        "[turn-game] board not advancing for chat %s (seat %s still to act); stopping bot loop",
+        chatId,
+        seatId,
+      );
       break;
     }
     lastSignature = signature;
@@ -342,7 +352,11 @@ export async function runTurnGameBotTurns(args: RunBotTurnsArgs): Promise<void> 
     const view = engine.describeForModel(state, seatId);
     const tools: LLMToolDefinition[] = engine.toolManifests().map((t) => ({
       type: "function",
-      function: { name: t.name, description: t.description, parameters: t.parameters as unknown as Record<string, unknown> },
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.parameters as unknown as Record<string, unknown>,
+      },
     }));
     const persona = await buildPersonaBlock(characters, seatId, seatName);
     const recent = await buildRecentContext(chats, chatId, state.seatNames ?? {});
@@ -419,7 +433,16 @@ export async function runTurnGameBotTurns(args: RunBotTurnsArgs): Promise<void> 
       await engineStorage.updateStateById(active.row.id, JSON.stringify(nextState), true);
     } else {
       // ── Narration: a natural in-character turn — may banter with the table AND flavor the move ──
-      let narration = await narrateOutcome(provider, model, persona, seatName, engine.label, eventSummary, recent, signal);
+      let narration = await narrateOutcome(
+        provider,
+        model,
+        persona,
+        seatName,
+        engine.label,
+        eventSummary,
+        recent,
+        signal,
+      );
       if (!narration) narration = eventSummary || `${seatName} makes a move.`;
 
       // ── Persist narration message + per-message engine snapshot ──
@@ -521,7 +544,9 @@ async function narrateOutcome(
   recent: string,
   signal?: AbortSignal,
 ): Promise<string> {
-  const did = eventSummary.startsWith(`${name} `) ? eventSummary.slice(name.length + 1) : eventSummary || "made your move";
+  const did = eventSummary.startsWith(`${name} `)
+    ? eventSummary.slice(name.length + 1)
+    : eventSummary || "made your move";
   try {
     const messages: ChatMessage[] = [
       {
@@ -538,7 +563,12 @@ async function narrateOutcome(
     ];
     // maxTokens leaves headroom for reasoning models that think before the line;
     // stripInlineThinking removes what they emit inline.
-    const res = await provider.chatComplete(messages, { model, temperature: 0.9, maxTokens: 300, ...(signal ? { signal } : {}) });
+    const res = await provider.chatComplete(messages, {
+      model,
+      temperature: 0.9,
+      maxTokens: 300,
+      ...(signal ? { signal } : {}),
+    });
     return stripInlineThinking(res.content ?? "");
   } catch {
     return "";

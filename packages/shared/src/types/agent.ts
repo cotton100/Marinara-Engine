@@ -2,10 +2,7 @@
 // Agent System Types
 // ──────────────────────────────────────────────
 
-import {
-  BUILT_IN_AGENT_MANIFESTS,
-  replaceBuiltInAgentManifestRegistry,
-} from "../features/agents/agent-registry.js";
+import { BUILT_IN_AGENT_MANIFESTS, replaceBuiltInAgentManifestRegistry } from "../features/agents/agent-registry.js";
 import type { BuiltInAgentManifest } from "../features/agents/agent-manifest.types.js";
 import type { AgentToolConfig, ToolDefinition } from "../features/function-calls/tool-definitions.js";
 import type { ChatMode } from "./chat.js";
@@ -217,10 +214,7 @@ export function getAgentPromptTemplateOptions(input: {
 
 export function resolveDefaultAgentPromptTemplateId(settingsValue: unknown): string {
   const settings = parseAgentSettingsRecord(settingsValue);
-  const configuredId = normalizePromptTemplateId(
-    settings.defaultPromptTemplateId,
-    DEFAULT_AGENT_PROMPT_TEMPLATE_ID,
-  );
+  const configuredId = normalizePromptTemplateId(settings.defaultPromptTemplateId, DEFAULT_AGENT_PROMPT_TEMPLATE_ID);
   if (configuredId === DEFAULT_AGENT_PROMPT_TEMPLATE_ID) return configuredId;
   return normalizeAgentPromptTemplateOptions(settings.promptTemplates).some((option) => option.id === configuredId)
     ? configuredId
@@ -367,6 +361,8 @@ export interface AgentContext {
     avatarCrop?: unknown;
     rpgStats?: import("./character.js").RPGStatsConfig;
   }>;
+  /** Character whose scoped turn identity owns singular character macros. */
+  primaryCharacterId?: string | null;
   /** Latest known tracker entries, including recurring characters that are currently absent. */
   characterTrackerHistory?: import("./game-state.js").PresentCharacter[];
   /** User persona info */
@@ -471,19 +467,19 @@ export interface BuiltInAgentMeta {
 
 function toBuiltInAgentMeta(agent: BuiltInAgentManifest): BuiltInAgentMeta {
   return {
-  id: agent.id,
-  name: agent.name,
-  description: agent.description,
-  author: agent.author ?? DEFAULT_AGENT_AUTHOR,
-  phase: normalizeAgentPhaseForType(agent.id, agent.phase),
-  enabledByDefault: agent.enabledByDefault,
-  ...(agent.defaultInjectAsSection !== undefined ? { defaultInjectAsSection: agent.defaultInjectAsSection } : {}),
-  category: agent.category,
-  ...(agent.libraryHidden !== undefined ? { libraryHidden: agent.libraryHidden } : {}),
-  ...(agent.runtimeDisabled !== undefined ? { runtimeDisabled: agent.runtimeDisabled } : {}),
-  ...(agent.modeAllowlist !== undefined ? { modeAllowlist: [...agent.modeAllowlist] } : {}),
-  ...(agent.promptTemplates !== undefined ? { promptTemplates: [...agent.promptTemplates] } : {}),
-  ...(agent.execution !== undefined ? { execution: agent.execution } : {}),
+    id: agent.id,
+    name: agent.name,
+    description: agent.description,
+    author: agent.author ?? DEFAULT_AGENT_AUTHOR,
+    phase: normalizeAgentPhaseForType(agent.id, agent.phase),
+    enabledByDefault: agent.enabledByDefault,
+    ...(agent.defaultInjectAsSection !== undefined ? { defaultInjectAsSection: agent.defaultInjectAsSection } : {}),
+    category: agent.category,
+    ...(agent.libraryHidden !== undefined ? { libraryHidden: agent.libraryHidden } : {}),
+    ...(agent.runtimeDisabled !== undefined ? { runtimeDisabled: agent.runtimeDisabled } : {}),
+    ...(agent.modeAllowlist !== undefined ? { modeAllowlist: [...agent.modeAllowlist] } : {}),
+    ...(agent.promptTemplates !== undefined ? { promptTemplates: [...agent.promptTemplates] } : {}),
+    ...(agent.execution !== undefined ? { execution: agent.execution } : {}),
   };
 }
 

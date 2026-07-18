@@ -22,7 +22,7 @@ type ConnectedCharacterRow = {
 
 type ConnectedChatsStore = {
   getById(id: string): Promise<ConnectedChatRow | null>;
-  listMessages(chatId: string): Promise<ConnectedChatMessage[]>;
+  listMessagesWithActiveSwipes(chatId: string): Promise<ConnectedChatMessage[]>;
 };
 
 type ConnectedCharactersStore = {
@@ -54,7 +54,7 @@ export async function resolveConversationConnectedChatContext(args: {
   const connectedChat = await args.chats.getById(args.connectedChatId as string);
 
   if (connectedChat && connectedChat.mode === "roleplay") {
-    const rpMessages = await args.chats.listMessages(connectedChat.id);
+    const rpMessages = await args.chats.listMessagesWithActiveSwipes(connectedChat.id);
     const recentRp = rpMessages.slice(-20);
 
     const rpCharIds: string[] =
@@ -118,9 +118,7 @@ export async function resolveConversationConnectedChatContext(args: {
     }
   } else if (connectedChat && connectedChat.mode === "game") {
     const gameMeta =
-      typeof connectedChat.metadata === "string"
-        ? JSON.parse(connectedChat.metadata)
-        : (connectedChat.metadata ?? {});
+      typeof connectedChat.metadata === "string" ? JSON.parse(connectedChat.metadata) : (connectedChat.metadata ?? {});
     const sessionNumber = (gameMeta.gameSessionNumber as number) ?? 1;
     const sessionStatus = (gameMeta.gameSessionStatus as string) ?? "setup";
     const activeState = (gameMeta.gameActiveState as string) ?? "exploration";
@@ -133,7 +131,7 @@ export async function resolveConversationConnectedChatContext(args: {
         }>)
       : [];
     const latestSummary = storedSummaries[storedSummaries.length - 1] ?? null;
-    const gameMessages = await args.chats.listMessages(connectedChat.id);
+    const gameMessages = await args.chats.listMessagesWithActiveSwipes(connectedChat.id);
     const recentGame = gameMessages.slice(-20);
     const latestConnectedState =
       (await args.gameStateStore.getLatestCommitted(connectedChat.id)) ??

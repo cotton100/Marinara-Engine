@@ -10,6 +10,10 @@ import { eq } from "../db/file-query.js";
 import { chats as chatsTable } from "../db/schema/index.js";
 import { logger, logDebugOverride } from "../lib/logger.js";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
+import {
+  acquireMessageMutationLease,
+  requireActiveGenerationRegistry,
+} from "../services/generation/active-generation-registry.js";
 import { createConnectionsStorage } from "../services/storage/connections.storage.js";
 import { createCharactersStorage } from "../services/storage/characters.storage.js";
 import { createGalleryStorage } from "../services/storage/gallery.storage.js";
@@ -3857,7 +3861,7 @@ async function runGameLorebookKeeperAfterConclusion(args: {
       parameters: generationParameters,
     });
 
-    const messages = await chats.listMessages(args.chatId);
+    const messages = await chats.listMessagesWithActiveSwipes(args.chatId);
     const partyNames = await resolveGameLorebookKeeperPartyNames(args.app, chat, meta, setupConfig);
     const existingEntries = (await lorebooksStore.listEntries(lorebook.id)) as Array<{
       name?: string | null;
@@ -5282,11 +5286,9 @@ async function resolveMessageContentForSwipe(
   chats: ReturnType<typeof createChatsStorage>,
   message: NonNullable<Awaited<ReturnType<ReturnType<typeof createChatsStorage>["getMessage"]>>>,
   swipeIndex: number,
-): Promise<string> {
-  if ((message.activeSwipeIndex ?? 0) === swipeIndex) return message.content ?? "";
-  const swipes = await chats.getSwipes(message.id).catch(() => []);
-  const target = swipes.find((swipe: { index?: number; content?: string }) => swipe.index === swipeIndex);
-  return target?.content ?? message.content ?? "";
+): Promise<string | null> {
+  const storyboardMessage = await chats.getMessageWithSwipe(message.id, swipeIndex);
+  return storyboardMessage?.content ?? null;
 }
 
 function buildStoryboardGameContextBlock(args: {
@@ -5580,6 +5582,7 @@ async function serializeGameTurnStoryboard(args: {
 }
 
 export async function gameRoutes(app: FastifyInstance) {
+  const activeGenerations = requireActiveGenerationRegistry(app);
   await recoverStaleGameStoryboards(createGameStoryboardsStorage(app.db), new Date().toISOString(), "startup");
 
   const buildHydratedGameMeta = async (
@@ -6604,7 +6607,7 @@ export async function gameRoutes(app: FastifyInstance) {
     // during that race window would fire a duplicate /api/generate. Instead:
     // re-flip status back to "active" silently and tell the client we already
     // started so it skips generateInitialGameTurn.
-    const existingMessages = await chats.listMessages(chatId);
+    const existingMessages = await chats.listMessagesWithActiveSwipes(chatId);
     const hasGmTurn = existingMessages.some(
       (m) => m.role === "assistant" && typeof m.content === "string" && m.content.trim().length > 0,
     );
@@ -6763,7 +6766,7 @@ export async function gameRoutes(app: FastifyInstance) {
       }
 
       const sessionNumber = summaries.length + 1;
-      const latestSessionMessages = await chats.listMessages(latestSession.id);
+      const latestSessionMessages = await chats.listMessagesWithActiveSwipes(latestSession.id);
       let latestSessionEndingBeat: string | null = null;
       for (let i = latestSessionMessages.length - 1; i >= 0; i--) {
         const message = latestSessionMessages[i]!;
@@ -7015,7 +7018,7 @@ export async function gameRoutes(app: FastifyInstance) {
       const prevSummaries = normalizeStoredSessionSummaries(meta.gamePreviousSessionSummaries);
       const sessionNumber = prevSummaries.length + 1;
 
-      const messages = await chats.listMessages(chatId);
+      const messages = await chats.listMessagesWithActiveSwipes(chatId);
       const relevantMessages = applyGameSegmentEditsForPrompt(messages, meta).filter(
         (message) => message.role !== "system",
       );
@@ -7559,7 +7562,7 @@ export async function gameRoutes(app: FastifyInstance) {
     }
     const existingNextSessionRequest = prevSummaries[targetIndex]?.nextSessionRequest?.trim() || null;
 
-    const messages = await chats.listMessages(chatId);
+    const messages = await chats.listMessagesWithActiveSwipes(chatId);
     const conclusionHeader = `**Session ${sessionNumber} Concluded**`;
     const relevantMessages = applyGameSegmentEditsForPrompt(messages, meta).filter(
       (message) => message.role !== "system" && !isSessionConclusionMessage(message.content),
@@ -7765,7 +7768,7 @@ export async function gameRoutes(app: FastifyInstance) {
 
     const conclusionHeader = `**Session ${sessionNumber} Concluded**`;
     const nextContent = `**Session ${sessionNumber} Concluded**\n\n${appliedConclusion.summary.summary}\n\n*Party Dynamics:* ${appliedConclusion.summary.partyDynamics}`;
-    const messages = await chats.listMessages(chatId);
+    const messages = await chats.listMessagesWithActiveSwipes(chatId);
     const existingConclusionMessage = [...messages]
       .reverse()
       .find((message) => message.role === "narrator" && message.content.trim().startsWith(conclusionHeader));
@@ -7811,7 +7814,7 @@ export async function gameRoutes(app: FastifyInstance) {
     const targetMeta = parseMeta(targetSession.metadata);
     const setupConfig =
       (currentMeta.gameSetupConfig as GameSetupConfig | null) ?? (targetMeta.gameSetupConfig as GameSetupConfig | null);
-    const targetMessages = await chats.listMessages(targetSession.id);
+    const targetMessages = await chats.listMessagesWithActiveSwipes(targetSession.id);
     const relevantMessages = applyGameSegmentEditsForPrompt(targetMessages, targetMeta).filter(
       (message) => message.role !== "system" && !isSessionConclusionMessage(message.content),
     );
@@ -8165,7 +8168,10 @@ export async function gameRoutes(app: FastifyInstance) {
         const provider = await createGameMainProvider(connections, conn, baseUrl);
         const generationParameters = resolveStoredGameGenerationParameters(meta, defaultGenerationParameters);
         const latestState = await stateStore.getLatest(input.chatId);
-        const recentMessages = applyGameSegmentEditsForPrompt(await chats.listMessages(input.chatId), meta);
+        const recentMessages = applyGameSegmentEditsForPrompt(
+          await chats.listMessagesWithActiveSwipes(input.chatId),
+          meta,
+        );
         const recentTranscript = recentMessages
           .filter((message) => message.role !== "system")
           .slice(-12)
@@ -8433,7 +8439,7 @@ export async function gameRoutes(app: FastifyInstance) {
     messageId: z.string().min(1).optional(),
   });
 
-  app.post("/skill-check", async (req) => {
+  app.post("/skill-check", async (req, reply) => {
     const input = skillCheckSchema.parse(req.body);
     const stateStore = createGameStateStorage(app.db);
 
@@ -8478,17 +8484,41 @@ export async function gameRoutes(app: FastifyInstance) {
     let updatedContent: string | undefined;
     if (input.messageId) {
       const chats = createChatsStorage(app.db);
-      const message = await chats.getMessage(input.messageId);
-      if (message?.chatId === input.chatId && (message.role === "assistant" || message.role === "narrator")) {
-        const nextContent = replaceFirstUnresolvedSkillCheckTag(
-          message.content,
-          { skill: input.skill, dc: input.dc },
-          result,
-        );
-        if (nextContent !== message.content) {
-          await chats.updateMessageContent(input.messageId, nextContent);
-          updatedContent = nextContent;
+      const mutationLease = await acquireMessageMutationLease(
+        activeGenerations,
+        input.chatId,
+        input.messageId,
+        (messageId) => chats.getMessage(messageId),
+      );
+      if (mutationLease.kind === "not_found") return reply.status(404).send({ error: "Message not found" });
+      if (mutationLease.kind === "busy") {
+        return reply.status(409).send({ error: "A generation is already in progress for this chat" });
+      }
+      try {
+        const message = await chats.getMessageWithActiveSwipe(input.messageId);
+        if (!message || message.chatId !== input.chatId) return reply.status(404).send({ error: "Message not found" });
+        if (message.role === "assistant" || message.role === "narrator") {
+          const nextContent = replaceFirstUnresolvedSkillCheckTag(
+            message.content,
+            { skill: input.skill, dc: input.dc },
+            result,
+          );
+          if (nextContent !== message.content) {
+            const write = await chats.updateMessageContentForSwipe(
+              input.messageId,
+              message.activeSwipeIndex,
+              nextContent,
+              { requireActive: true, expectedContent: message.content },
+            );
+            if (write.status === "conflict") {
+              return reply.status(409).send({ error: "The selected message swipe changed; retry the skill check" });
+            }
+            if (write.status === "not_found") return reply.status(404).send({ error: "Message swipe not found" });
+            updatedContent = nextContent;
+          }
         }
+      } finally {
+        mutationLease.lease.release();
       }
     }
 
@@ -10278,6 +10308,7 @@ export async function gameRoutes(app: FastifyInstance) {
       `storyboard:${input.chatId}`,
       storyboardAbortSignal,
     );
+    let releaseMessageMutationLease: (() => boolean) | null = null;
     try {
       const requestDebug = input.debugMode === true;
       const debugOverrideEnabled = requestDebug || isDebugAgentsEnabled();
@@ -10297,14 +10328,25 @@ export async function gameRoutes(app: FastifyInstance) {
       const chat = await chats.getById(input.chatId);
       if (!chat) return reply.status(404).send({ error: "Chat not found" });
 
-      const message = await chats.getMessage(input.messageId);
-      if (!message || message.chatId !== input.chatId) return reply.status(404).send({ error: "GM message not found" });
+      const messageMutation = await acquireMessageMutationLease(
+        activeGenerations,
+        input.chatId,
+        input.messageId,
+        (messageId) => chats.getMessage(messageId),
+      );
+      if (messageMutation.kind === "not_found") return reply.status(404).send({ error: "GM message not found" });
+      if (messageMutation.kind === "busy") {
+        return reply.status(409).send({ error: "A generation is already in progress for this chat" });
+      }
+      releaseMessageMutationLease = () => messageMutation.lease.release();
+
+      const message = await chats.getMessageWithSwipe(input.messageId, input.swipeIndex);
+      if (!message || message.chatId !== input.chatId) return reply.status(404).send({ error: "Storyboard source swipe not found" });
       if (message.role !== "assistant" && message.role !== "narrator") {
         return reply.status(400).send({ error: "Storyboards can only be generated from GM narration turns." });
       }
 
-      const rawNarration = await resolveMessageContentForSwipe(chats, message, input.swipeIndex);
-      const sourceNarration = compactStoryboardSourceNarration(stripGmCommandTags(rawNarration));
+      const sourceNarration = compactStoryboardSourceNarration(stripGmCommandTags(message.content));
       if (!sourceNarration) return reply.status(400).send({ error: "This GM turn has no narration to storyboard." });
       const sourceSections = normalizeStoryboardSections(input.sections, sourceNarration);
 
@@ -10879,6 +10921,8 @@ export async function gameRoutes(app: FastifyInstance) {
       });
       const releaseBackgroundStoryboardLock = releaseStoryboardLock;
       releaseStoryboardLock = null;
+      const releaseBackgroundMessageMutationLease = releaseMessageMutationLease;
+      releaseMessageMutationLease = null;
 
       void (async () => {
         const backgroundTimeout = setTimeout(() => {
@@ -10920,6 +10964,7 @@ export async function gameRoutes(app: FastifyInstance) {
           });
         } finally {
           clearTimeout(backgroundTimeout);
+          releaseBackgroundMessageMutationLease?.();
           releaseBackgroundStoryboardLock?.();
         }
       })();
@@ -10932,6 +10977,7 @@ export async function gameRoutes(app: FastifyInstance) {
       const message = err instanceof Error ? err.message : "Storyboard generation failed";
       return reply.status(502).send({ error: message });
     } finally {
+      releaseMessageMutationLease?.();
       releaseStoryboardLock?.();
     }
   });
@@ -11084,7 +11130,7 @@ export async function gameRoutes(app: FastifyInstance) {
     const latestState = await createGameStateStorage(app.db)
       .getLatest(input.chatId)
       .catch(() => null);
-    const messages = await chats.listMessages(input.chatId);
+    const messages = await chats.listMessagesWithActiveSwipes(input.chatId);
     const setupConfig = (meta.gameSetupConfig as Record<string, unknown> | null) ?? null;
     const galleryItems = await gallery.listByChatId(input.chatId).catch(() => []);
     const latestIllustrationPrompt =

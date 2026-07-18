@@ -29,6 +29,10 @@ import { basename, join, resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 import { getBuildCommit, getBuildLabel } from "./config/build-info.js";
 import {
+  createActiveGenerationRegistry,
+  type ActiveGenerationRegistry,
+} from "./services/generation/active-generation-registry.js";
+import {
   getLogLevel,
   getNodeEnv,
   isRequestLoggingDisabled,
@@ -82,6 +86,7 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   // ── Storage ──
   const db = await getDB();
   app.decorate("db", db);
+  app.decorate("activeGenerations", createActiveGenerationRegistry());
   app.addHook("onClose", async () => {
     try {
       const stopResults = await Promise.allSettled([
@@ -306,5 +311,6 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
 declare module "fastify" {
   interface FastifyInstance {
     db: DB;
+    activeGenerations: ActiveGenerationRegistry;
   }
 }

@@ -166,7 +166,7 @@ async function getRecentMessages(
   chatId: string,
   limit: number = 30,
 ): Promise<ChatMessage[]> {
-  const allMsgs = await chats.listMessages(chatId);
+  const allMsgs = await chats.listMessagesWithActiveSwipes(chatId);
   return allMsgs
     .sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
     .slice(-limit)
@@ -633,7 +633,7 @@ export async function sceneRoutes(app: FastifyInstance) {
 
     // Sort explicitly before validating/slicing `upToMessageId` so "clone from
     // here" always copies a chronological prefix even if storage ordering changes.
-    const sceneMessages = (await chats.listMessages(sceneChatId)).sort(
+    const sceneMessages = (await chats.listMessagesWithActiveSwipes(sceneChatId)).sort(
       (a: { createdAt: string }, b: { createdAt: string }) =>
         new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
     );

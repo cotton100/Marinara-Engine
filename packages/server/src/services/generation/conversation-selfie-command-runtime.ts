@@ -30,9 +30,11 @@ type CharactersStore = {
 };
 
 type ChatsStore = {
-  appendSwipeAttachment(messageId: string, swipeIndex: number, attachment: Record<string, unknown>): Promise<unknown>;
-  appendMessageAttachment(messageId: string, attachment: Record<string, unknown>): Promise<unknown>;
-  getMessage(id: string): Promise<{ activeSwipeIndex?: number | null } | null>;
+  appendAttachmentForSwipe(
+    messageId: string,
+    swipeIndex: number,
+    attachment: Record<string, unknown>,
+  ): Promise<unknown>;
 };
 
 type ConnectionsStore = IllustratorPromptConnectionsStore & {
@@ -306,12 +308,7 @@ async function generateSelfie(
       prompt: compiledSelfiePrompt.prompt,
       galleryId: galleryEntry?.id,
     };
-    await args.chats.appendSwipeAttachment(args.messageId, generationSwipeIndex, attachment);
-
-    const currentMsgRow = await args.chats.getMessage(args.messageId);
-    if (currentMsgRow && (currentMsgRow.activeSwipeIndex ?? 0) === generationSwipeIndex) {
-      await args.chats.appendMessageAttachment(args.messageId, attachment);
-    }
+    await args.chats.appendAttachmentForSwipe(args.messageId, generationSwipeIndex, attachment);
   }
 
   args.sendEvent({

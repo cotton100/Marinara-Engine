@@ -1011,7 +1011,7 @@ export async function conversationRoutes(app: FastifyInstance) {
     }
 
     // Initialize activity state from DB if not already in memory (handles server restart / fresh load)
-    const messages = await chats.listMessages(chatId);
+    const messages = await chats.listMessagesWithActiveSwipes(chatId);
     initializeActivityFromMessages(
       chatId,
       messages as Array<{ role: string; createdAt?: string; characterId?: string | null }>,
@@ -1168,13 +1168,7 @@ export async function conversationRoutes(app: FastifyInstance) {
     const scheduleNow = toZonedWallClockDate(now, resolveConversationTimeZone(meta));
 
     if (!schedule) {
-      const { status, activity } = getEffectiveCurrentStatus(
-        null,
-        statusOverrides[characterId],
-        now,
-        "",
-        scheduleNow,
-      );
+      const { status, activity } = getEffectiveCurrentStatus(null, statusOverrides[characterId], now, "", scheduleNow);
       return reply.send({ delayMs: getBusyDelay(status), status, activity });
     }
 
@@ -1223,13 +1217,20 @@ export async function conversationRoutes(app: FastifyInstance) {
     for (const busyId of sceneBusyCharIds) {
       delete filteredSchedules[busyId];
     }
-    const messages = await chats.listMessages(chatId);
+    const messages = await chats.listMessagesWithActiveSwipes(chatId);
     initializeActivityFromMessages(
       chatId,
       messages as Array<{ role: string; createdAt?: string; characterId?: string | null }>,
     );
 
-    const result = checkCharacterExchange(chatId, lastSpeakerCharId, filteredSchedules, statusOverrides, now, scheduleNow);
+    const result = checkCharacterExchange(
+      chatId,
+      lastSpeakerCharId,
+      filteredSchedules,
+      statusOverrides,
+      now,
+      scheduleNow,
+    );
     if (result.shouldTrigger) {
       const allowedCharacterId = result.characterIds.find(
         (characterId) => !isAutonomousDailyBudgetExhausted(characterId, schedules[characterId], meta),

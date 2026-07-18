@@ -292,7 +292,7 @@ export async function promptsRoutes(app: FastifyInstance) {
     if (!chat) return reply.status(404).send({ error: "Chat not found" });
 
     const characterIds: string[] = JSON.parse(chat.characterIds as string);
-    const chatMessages = await chats.listMessages(chatId);
+    const chatMessages = await chats.listMessagesWithActiveSwipes(chatId);
     let chatMeta: Record<string, unknown> = {};
     try {
       chatMeta =

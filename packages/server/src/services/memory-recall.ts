@@ -10,6 +10,7 @@ import { messages, memoryChunks } from "../db/schema/index.js";
 import { newId, now } from "../utils/id-generator.js";
 import { localEmbed } from "./local-embedder.js";
 import { logger } from "../lib/logger.js";
+import { overlayActiveSwipesForMessages } from "./storage/message-swipe-authority.js";
 const isLite = process.env.MARINARA_LITE === "true" || process.env.MARINARA_LITE === "1";
 let warnedUnavailableEmbeddingSource = false;
 
@@ -102,7 +103,9 @@ export async function embedMemoryRecallTexts(
 
   if (!warnedUnavailableEmbeddingSource) {
     warnedUnavailableEmbeddingSource = true;
-    logger.warn("[memory-recall] No embedder configured; memory recall is disabled until an embedding source is available");
+    logger.warn(
+      "[memory-recall] No embedder configured; memory recall is disabled until an embedding source is available",
+    );
   }
   return [];
 }
@@ -252,17 +255,22 @@ export async function chunkAndEmbedMessages(
   options: ChunkAndEmbedMessagesOptions = {},
 ): Promise<void> {
   if (isLite) return;
-  const allMessages = await db
-    .select({
-      id: messages.id,
-      role: messages.role,
-      characterId: messages.characterId,
-      content: messages.content,
-      createdAt: messages.createdAt,
-    })
-    .from(messages)
-    .where(eq(messages.chatId, chatId))
-    .orderBy(messages.createdAt);
+  const allMessages = await db.transaction(async (tx) => {
+    const rows = await tx
+      .select({
+        id: messages.id,
+        role: messages.role,
+        characterId: messages.characterId,
+        content: messages.content,
+        createdAt: messages.createdAt,
+        activeSwipeIndex: messages.activeSwipeIndex,
+        extra: messages.extra,
+      })
+      .from(messages)
+      .where(eq(messages.chatId, chatId))
+      .orderBy(messages.createdAt);
+    return overlayActiveSwipesForMessages(tx, rows);
+  });
 
   await pruneStaleNativeMemoryChunks(db, chatId, allMessages);
 
@@ -348,7 +356,11 @@ export async function chunkAndEmbedMessages(
     .where(and(eq(memoryChunks.chatId, chatId), isNull(memoryChunks.sourceChatId), isNotNull(memoryChunks.embedding)))
     .limit(1);
   const existingEmbedding = parseStoredEmbedding(existingEmbeddedChunk[0]?.embedding ?? null);
-  if (Array.isArray(existingEmbedding) && existingEmbedding.length > 0 && existingEmbedding.length !== embeddingDimension) {
+  if (
+    Array.isArray(existingEmbedding) &&
+    existingEmbedding.length > 0 &&
+    existingEmbedding.length !== embeddingDimension
+  ) {
     logger.warn(
       "[memory-recall] Skipping memory chunk insert for chat %s because embedding dimension changed from %d to %d. Rebuild memories before mixing embedding models.",
       chatId,

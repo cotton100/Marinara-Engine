@@ -4,8 +4,15 @@ import type { GenerationPromptMessage } from "../../services/generation/prompt-m
 import { wrapContent } from "../../services/prompt/format-engine.js";
 import { parseExtra } from "./generate-route-utils.js";
 
-export const CONVERSATION_GROUP_NAME_PREFIX_INSTRUCTION =
-  "Remember to prefix messages with `Name: message`!";
+export const CONVERSATION_GROUP_NAME_PREFIX_INSTRUCTION = "Remember to prefix messages with `Name: message`!";
+
+export function resolveConversationOutputCharacterNames(
+  responseCharacterIds: readonly string[],
+  characters: readonly { id: string; name: string }[],
+): string[] {
+  const namesById = new Map(characters.map((character) => [character.id, character.name]));
+  return Array.from(new Set(responseCharacterIds.filter(Boolean))).map((id) => namesById.get(id)?.trim() || id);
+}
 
 export function formatConversationGroupOutputFormat(args: {
   wrapFormat: WrapFormat;

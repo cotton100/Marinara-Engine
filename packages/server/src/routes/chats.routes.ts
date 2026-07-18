@@ -96,6 +96,15 @@ import {
   parseGameStateRow,
   stripSpeakerTagsExceptLastAssistant,
 } from "./generate/generate-route-utils.js";
+import { extractPortableConversationSwipeExtra } from "./generate/generation-replay.js";
+import { MESSAGE_STABLE_EXTRA_KEYS } from "../services/storage/message-swipe-authority.js";
+import {
+  acquireChatMutationLease,
+  acquireMessageMutationLease,
+  requireActiveGenerationRegistry,
+  takeOverActiveGenerationLease,
+  takeOverActiveGenerationLeases,
+} from "../services/generation/active-generation-registry.js";
 import {
   filterGameInternalAgentIds,
   resolveLorebookScopeExclusions,
@@ -110,6 +119,12 @@ import { sanitizeGameNpcAvatarUrls } from "../services/game/npc-avatar-utils.js"
 import { buildCommittedTrackerContextBlock } from "../services/generation/committed-tracker-context.js";
 import { parseLorebookWriteApprovalText } from "./generate/agent-write-approval.js";
 import { persistLorebookKeeperUpdates } from "./generate/lorebook-keeper-utils.js";
+import {
+  lorebookPromptContextsEqual,
+  normalizeLorebookAccessContext,
+  normalizeLorebookCharacterFilterIds,
+  normalizeLorebookPromptContext,
+} from "../services/lorebook/access-context.js";
 import {
   clampRoleplaySummaryMaxTokens,
   formatRoleplaySummaryChatLog,
@@ -425,6 +440,9 @@ function resolveEntryStateOverrides(value: unknown): EntryStateOverrides | undef
 
 export async function chatsRoutes(app: FastifyInstance) {
   const storage = createChatsStorage(app.db);
+  const activeGenerations = requireActiveGenerationRegistry(app);
+  const acquireSwipeMutationLease = (chatId: string, messageId: string) =>
+    acquireMessageMutationLease(activeGenerations, chatId, messageId, (id) => storage.getMessage(id));
   const appSettings = createAppSettingsStorage(app.db);
 
   const cleanupEmptyRoleplayDmChats = async () => {
@@ -705,69 +723,80 @@ export async function chatsRoutes(app: FastifyInstance) {
   // Update chat
   app.patch<{ Params: { id: string } }>("/:id", async (req, reply) => {
     const data = createChatSchema.partial().parse(req.body);
-    const existing = await storage.getById(req.params.id);
-    if (!existing || isHomeProfessorMariChat(existing)) {
-      return reply.status(404).send({ error: "Chat not found" });
+    const changesConversationScope = data.characterIds !== undefined || data.mode !== undefined;
+    const scopeMutationLease = changesConversationScope
+      ? acquireChatMutationLease(activeGenerations, req.params.id)
+      : null;
+    if (changesConversationScope && !scopeMutationLease) {
+      return reply.status(409).send({ error: "Cannot change the conversation scope while generation is in progress" });
     }
-    if (data.characterIds?.includes(PROFESSOR_MARI_ID) && !hasProfessorMariCharacter(existing)) {
-      return reply.status(400).send({ error: "Professor Mari is only available from the Home screen." });
-    }
-    if (data.characterIds !== undefined) {
-      const previousIds = resolveChatCharacterIds(existing.characterIds);
-      const nextIds = data.characterIds;
-      const nextSet = new Set(nextIds);
-      const previousSet = new Set(previousIds);
-      const removedIds = previousIds.filter((id) => !nextSet.has(id));
-      const addedIds = nextIds.filter((id) => !previousSet.has(id));
+    try {
+      const existing = await storage.getById(req.params.id);
+      if (!existing || isHomeProfessorMariChat(existing)) {
+        return reply.status(404).send({ error: "Chat not found" });
+      }
+      if (data.characterIds?.includes(PROFESSOR_MARI_ID) && !hasProfessorMariCharacter(existing)) {
+        return reply.status(400).send({ error: "Professor Mari is only available from the Home screen." });
+      }
+      if (data.characterIds !== undefined) {
+        const previousIds = resolveChatCharacterIds(existing.characterIds);
+        const nextIds = data.characterIds;
+        const nextSet = new Set(nextIds);
+        const previousSet = new Set(previousIds);
+        const removedIds = previousIds.filter((id) => !nextSet.has(id));
+        const addedIds = nextIds.filter((id) => !previousSet.has(id));
 
-      if (removedIds.length > 0 || addedIds.length > 0) {
-        const existingMessages = await storage.listMessages(req.params.id);
-        const existingMetadata = parseChatMetadata(existing.metadata);
-        const hasStartedChat =
-          existingMetadata.conversationSetupComplete === true ||
-          existingMessages.some((message) => message.role === "user" || message.role === "assistant");
-        const snapshots: Record<string, unknown> = {};
-        const eventNames = new Map<string, string>();
-        for (const id of [...removedIds, ...addedIds]) {
-          const snapshot = await buildCharacterDisplaySnapshot(app, id);
-          if (!snapshot) continue;
-          snapshots[id] = snapshot;
-          eventNames.set(id, snapshot.name);
-        }
-        if (Object.keys(snapshots).length > 0) {
-          await storage.patchMetadata(req.params.id, (current) => ({
-            archivedCharacterSnapshots: {
-              ...(isRecord(current.archivedCharacterSnapshots) ? current.archivedCharacterSnapshots : {}),
-              ...snapshots,
-            },
-          }));
-        }
-        // Character selection can be patched more than once while the setup
-        // wizard is still configuring a new chat. Membership events begin only
-        // after setup completes or a real user/assistant turn starts the timeline.
-        if (hasStartedChat) {
-          for (const id of addedIds) {
-            await storage.createMessage({
-              chatId: req.params.id,
-              role: "system",
-              characterId: null,
-              content: `${eventNames.get(id) ?? "A character"} has joined the chat.`,
-              extra: { conversationMembershipEvent: "joined", characterId: id },
-            });
+        if (removedIds.length > 0 || addedIds.length > 0) {
+          const existingMessages = await storage.listMessages(req.params.id);
+          const existingMetadata = parseChatMetadata(existing.metadata);
+          const hasStartedChat =
+            existingMetadata.conversationSetupComplete === true ||
+            existingMessages.some((message) => message.role === "user" || message.role === "assistant");
+          const snapshots: Record<string, unknown> = {};
+          const eventNames = new Map<string, string>();
+          for (const id of [...removedIds, ...addedIds]) {
+            const snapshot = await buildCharacterDisplaySnapshot(app, id);
+            if (!snapshot) continue;
+            snapshots[id] = snapshot;
+            eventNames.set(id, snapshot.name);
           }
-          for (const id of removedIds) {
-            await storage.createMessage({
-              chatId: req.params.id,
-              role: "system",
-              characterId: null,
-              content: `${eventNames.get(id) ?? "A character"} has left the chat.`,
-              extra: { conversationMembershipEvent: "left", characterId: id },
-            });
+          if (Object.keys(snapshots).length > 0) {
+            await storage.patchMetadata(req.params.id, (current) => ({
+              archivedCharacterSnapshots: {
+                ...(isRecord(current.archivedCharacterSnapshots) ? current.archivedCharacterSnapshots : {}),
+                ...snapshots,
+              },
+            }));
+          }
+          // Character selection can be patched more than once while the setup
+          // wizard is still configuring a new chat. Membership events begin only
+          // after setup completes or a real user/assistant turn starts the timeline.
+          if (hasStartedChat) {
+            for (const id of addedIds) {
+              await storage.createMessage({
+                chatId: req.params.id,
+                role: "system",
+                characterId: null,
+                content: `${eventNames.get(id) ?? "A character"} has joined the chat.`,
+                extra: { conversationMembershipEvent: "joined", characterId: id },
+              });
+            }
+            for (const id of removedIds) {
+              await storage.createMessage({
+                chatId: req.params.id,
+                role: "system",
+                characterId: null,
+                content: `${eventNames.get(id) ?? "A character"} has left the chat.`,
+                extra: { conversationMembershipEvent: "left", characterId: id },
+              });
+            }
           }
         }
       }
+      return storage.update(req.params.id, data);
+    } finally {
+      scopeMutationLease?.release();
     }
-    return storage.update(req.params.id, data);
   });
 
   app.post<{ Params: { id: string } }>("/:id/touch", async (req, reply) => {
@@ -780,120 +809,133 @@ export async function chatsRoutes(app: FastifyInstance) {
 
   // Update chat metadata (partial merge)
   app.patch<{ Params: { id: string } }>("/:id/metadata", async (req, reply) => {
-    const chat = await storage.getById(req.params.id);
-    if (!chat) return reply.status(404).send({ error: "Chat not found" });
     const incoming = req.body as Record<string, unknown>;
-    // Validate Discord webhook URL if provided
-    if (typeof incoming.discordWebhookUrl === "string" && incoming.discordWebhookUrl.trim()) {
-      const url = incoming.discordWebhookUrl.trim();
-      if (!/^https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[\w-]+$/.test(url)) {
-        return reply.status(400).send({ error: "Invalid Discord webhook URL" });
-      }
-      incoming.discordWebhookUrl = url;
+    const changesConversationRoster = Object.prototype.hasOwnProperty.call(incoming, "inactiveCharacterIds");
+    const rosterMutationLease = changesConversationRoster
+      ? acquireChatMutationLease(activeGenerations, req.params.id)
+      : null;
+    if (changesConversationRoster && !rosterMutationLease) {
+      return reply.status(409).send({ error: "Cannot change the conversation roster while generation is in progress" });
     }
-    if (incoming.inactiveCharacterIds !== undefined) {
-      if (
-        !Array.isArray(incoming.inactiveCharacterIds) ||
-        !incoming.inactiveCharacterIds.every((id) => typeof id === "string")
-      ) {
-        return reply.status(400).send({ error: "inactiveCharacterIds must be an array of strings" });
-      }
-      const characterIds: string[] =
-        typeof chat.characterIds === "string"
-          ? JSON.parse(chat.characterIds)
-          : Array.isArray(chat.characterIds)
-            ? chat.characterIds
-            : [];
-      const validIds = new Set(characterIds);
-      incoming.inactiveCharacterIds = Array.from(
-        new Set((incoming.inactiveCharacterIds as string[]).filter((id) => validIds.has(id))),
-      );
-    }
-    if (incoming.excludedLorebookIds !== undefined) {
-      if (
-        !Array.isArray(incoming.excludedLorebookIds) ||
-        !incoming.excludedLorebookIds.every((id) => typeof id === "string")
-      ) {
-        return reply.status(400).send({ error: "excludedLorebookIds must be an array of strings" });
-      }
-      incoming.excludedLorebookIds = Array.from(new Set(incoming.excludedLorebookIds as string[]));
-    }
-    if (incoming.conversationSchedulesEnabled === false) {
-      await clearConversationScheduleState(chat);
-      incoming.characterSchedules = undefined;
-      incoming.scheduleWeekStart = undefined;
-    }
-    if (Object.prototype.hasOwnProperty.call(incoming, "summaryMaxTokens")) {
-      incoming.summaryMaxTokens = clampRoleplaySummaryMaxTokens(incoming.summaryMaxTokens);
-    }
-    if (
-      Object.prototype.hasOwnProperty.call(incoming, "noodleTimelineContextEnabled") &&
-      typeof incoming.noodleTimelineContextEnabled !== "boolean"
-    ) {
-      return reply.status(400).send({ error: "noodleTimelineContextEnabled must be a boolean" });
-    }
-    if (
-      Object.prototype.hasOwnProperty.call(incoming, "hideSummarisedMessages") &&
-      typeof incoming.hideSummarisedMessages === "boolean"
-    ) {
-      return storage.patchMetadata(req.params.id, async (freshMeta) => {
-        const previousHideEnabled = freshMeta.hideSummarisedMessages === true;
-        if (previousHideEnabled === incoming.hideSummarisedMessages) {
-          return incoming;
+    try {
+      const chat = await storage.getById(req.params.id);
+      if (!chat) return reply.status(404).send({ error: "Chat not found" });
+      // Validate Discord webhook URL if provided
+      if (typeof incoming.discordWebhookUrl === "string" && incoming.discordWebhookUrl.trim()) {
+        const url = incoming.discordWebhookUrl.trim();
+        if (!/^https:\/\/discord(?:app)?\.com\/api\/webhooks\/\d+\/[\w-]+$/.test(url)) {
+          return reply.status(400).send({ error: "Invalid Discord webhook URL" });
         }
-
-        const allMessages = await storage.listMessages(req.params.id);
-        const currentEntries = normalizeChatSummaryEntries(freshMeta.summaryEntries, {
-          legacySummary: typeof freshMeta.summary === "string" ? freshMeta.summary : null,
-        });
-        const now = new Date().toISOString();
-        let nextEntries: ChatSummaryEntry[];
-
-        if (incoming.hideSummarisedMessages) {
-          const tail = resolveRoleplaySummaryTail(freshMeta.summaryTailMessages);
-          nextEntries = [];
-          for (const entry of currentEntries) {
-            if (!entry.enabled || !entry.messageIds?.length) {
-              nextEntries.push(entry);
-              continue;
-            }
-
-            const eligibleToHide = computeSummaryHideIds({
-              messages: allMessages,
-              entryMessageIds: entry.messageIds,
-              tail,
-            });
-            const hiddenMessageIds =
-              eligibleToHide.length > 0 ? await storage.bulkSetHiddenFromAI(req.params.id, eligibleToHide, true) : [];
-            const ownedHiddenMessageIds = Array.from(new Set([...(entry.hiddenMessageIds ?? []), ...hiddenMessageIds]));
-            nextEntries.push(
-              ownedHiddenMessageIds.length > 0
-                ? { ...entry, hiddenMessageIds: ownedHiddenMessageIds, updatedAt: now }
-                : entry,
-            );
+        incoming.discordWebhookUrl = url;
+      }
+      if (incoming.inactiveCharacterIds !== undefined) {
+        if (
+          !Array.isArray(incoming.inactiveCharacterIds) ||
+          !incoming.inactiveCharacterIds.every((id) => typeof id === "string")
+        ) {
+          return reply.status(400).send({ error: "inactiveCharacterIds must be an array of strings" });
+        }
+        const characterIds: string[] =
+          typeof chat.characterIds === "string"
+            ? JSON.parse(chat.characterIds)
+            : Array.isArray(chat.characterIds)
+              ? chat.characterIds
+              : [];
+        const validIds = new Set(characterIds);
+        incoming.inactiveCharacterIds = Array.from(
+          new Set((incoming.inactiveCharacterIds as string[]).filter((id) => validIds.has(id))),
+        );
+      }
+      if (incoming.excludedLorebookIds !== undefined) {
+        if (
+          !Array.isArray(incoming.excludedLorebookIds) ||
+          !incoming.excludedLorebookIds.every((id) => typeof id === "string")
+        ) {
+          return reply.status(400).send({ error: "excludedLorebookIds must be an array of strings" });
+        }
+        incoming.excludedLorebookIds = Array.from(new Set(incoming.excludedLorebookIds as string[]));
+      }
+      if (incoming.conversationSchedulesEnabled === false) {
+        await clearConversationScheduleState(chat);
+        incoming.characterSchedules = undefined;
+        incoming.scheduleWeekStart = undefined;
+      }
+      if (Object.prototype.hasOwnProperty.call(incoming, "summaryMaxTokens")) {
+        incoming.summaryMaxTokens = clampRoleplaySummaryMaxTokens(incoming.summaryMaxTokens);
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(incoming, "noodleTimelineContextEnabled") &&
+        typeof incoming.noodleTimelineContextEnabled !== "boolean"
+      ) {
+        return reply.status(400).send({ error: "noodleTimelineContextEnabled must be a boolean" });
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(incoming, "hideSummarisedMessages") &&
+        typeof incoming.hideSummarisedMessages === "boolean"
+      ) {
+        return storage.patchMetadata(req.params.id, async (freshMeta) => {
+          const previousHideEnabled = freshMeta.hideSummarisedMessages === true;
+          if (previousHideEnabled === incoming.hideSummarisedMessages) {
+            return incoming;
           }
-        } else {
-          const summaryOwnedHiddenIds = Array.from(
-            new Set(currentEntries.flatMap((entry) => entry.hiddenMessageIds ?? [])),
-          );
-          if (summaryOwnedHiddenIds.length > 0) {
-            await storage.bulkSetHiddenFromAI(req.params.id, summaryOwnedHiddenIds, false);
-          }
-          nextEntries = currentEntries.map((entry) => {
-            if (!entry.hiddenMessageIds?.length) return entry;
-            const { hiddenMessageIds: _hiddenMessageIds, ...rest } = entry;
-            return { ...rest, updatedAt: now };
+
+          const allMessages = await storage.listMessages(req.params.id);
+          const currentEntries = normalizeChatSummaryEntries(freshMeta.summaryEntries, {
+            legacySummary: typeof freshMeta.summary === "string" ? freshMeta.summary : null,
           });
-        }
+          const now = new Date().toISOString();
+          let nextEntries: ChatSummaryEntry[];
 
-        return {
-          ...incoming,
-          summaryEntries: nextEntries,
-          summary: compileChatSummaryEntries(nextEntries),
-        };
-      });
+          if (incoming.hideSummarisedMessages) {
+            const tail = resolveRoleplaySummaryTail(freshMeta.summaryTailMessages);
+            nextEntries = [];
+            for (const entry of currentEntries) {
+              if (!entry.enabled || !entry.messageIds?.length) {
+                nextEntries.push(entry);
+                continue;
+              }
+
+              const eligibleToHide = computeSummaryHideIds({
+                messages: allMessages,
+                entryMessageIds: entry.messageIds,
+                tail,
+              });
+              const hiddenMessageIds =
+                eligibleToHide.length > 0 ? await storage.bulkSetHiddenFromAI(req.params.id, eligibleToHide, true) : [];
+              const ownedHiddenMessageIds = Array.from(
+                new Set([...(entry.hiddenMessageIds ?? []), ...hiddenMessageIds]),
+              );
+              nextEntries.push(
+                ownedHiddenMessageIds.length > 0
+                  ? { ...entry, hiddenMessageIds: ownedHiddenMessageIds, updatedAt: now }
+                  : entry,
+              );
+            }
+          } else {
+            const summaryOwnedHiddenIds = Array.from(
+              new Set(currentEntries.flatMap((entry) => entry.hiddenMessageIds ?? [])),
+            );
+            if (summaryOwnedHiddenIds.length > 0) {
+              await storage.bulkSetHiddenFromAI(req.params.id, summaryOwnedHiddenIds, false);
+            }
+            nextEntries = currentEntries.map((entry) => {
+              if (!entry.hiddenMessageIds?.length) return entry;
+              const { hiddenMessageIds: _hiddenMessageIds, ...rest } = entry;
+              return { ...rest, updatedAt: now };
+            });
+          }
+
+          return {
+            ...incoming,
+            summaryEntries: nextEntries,
+            summary: compileChatSummaryEntries(nextEntries),
+          };
+        });
+      }
+      return storage.patchMetadata(req.params.id, incoming);
+    } finally {
+      rosterMutationLease?.release();
     }
-    return storage.patchMetadata(req.params.id, incoming);
   });
 
   // Mark a chat as having autonomous messages the user has not viewed yet.
@@ -1119,6 +1161,46 @@ export async function chatsRoutes(app: FastifyInstance) {
       const writableLorebookIds = Array.isArray(payload.writableLorebookIds)
         ? payload.writableLorebookIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0)
         : null;
+      const hasAccessContext = Object.prototype.hasOwnProperty.call(payload, "accessContext");
+      const hasPromptContext = Object.prototype.hasOwnProperty.call(payload, "lorebookPromptContext");
+      const hasNewEntryCharacterFilterIds = Object.prototype.hasOwnProperty.call(payload, "newEntryCharacterFilterIds");
+      const hasAllowCreateTarget = Object.prototype.hasOwnProperty.call(payload, "allowCreateTarget");
+      const accessContext = hasAccessContext ? normalizeLorebookAccessContext(payload.accessContext) : null;
+      const lorebookPromptContext = hasPromptContext
+        ? normalizeLorebookPromptContext(payload.lorebookPromptContext)
+        : accessContext;
+      if (hasAccessContext && !accessContext) {
+        return reply.status(400).send({ error: "Invalid lorebook approval access context" });
+      }
+      if (accessContext && accessContext.chatId !== req.params.id) {
+        return reply.status(400).send({ error: "Lorebook approval access context does not match this chat" });
+      }
+      if (hasPromptContext && !lorebookPromptContext) {
+        return reply.status(400).send({ error: "Invalid lorebook approval prompt context" });
+      }
+      if (hasAccessContext && (!hasPromptContext || !hasNewEntryCharacterFilterIds || !hasAllowCreateTarget)) {
+        return reply.status(400).send({ error: "Incomplete lorebook approval access context" });
+      }
+      if (
+        accessContext &&
+        lorebookPromptContext &&
+        !lorebookPromptContextsEqual(accessContext, lorebookPromptContext)
+      ) {
+        return reply.status(400).send({ error: "Lorebook approval contexts do not match" });
+      }
+      if ((hasPromptContext || hasNewEntryCharacterFilterIds) && !accessContext) {
+        return reply.status(400).send({ error: "Incomplete lorebook approval access context" });
+      }
+      const normalizedNewEntryCharacterFilterIds = hasNewEntryCharacterFilterIds
+        ? normalizeLorebookCharacterFilterIds(payload.newEntryCharacterFilterIds, accessContext ?? undefined)
+        : undefined;
+      if (hasNewEntryCharacterFilterIds && !normalizedNewEntryCharacterFilterIds) {
+        return reply.status(400).send({ error: "Invalid lorebook approval character scope" });
+      }
+      if (hasAllowCreateTarget && typeof payload.allowCreateTarget !== "boolean") {
+        return reply.status(400).send({ error: "Invalid lorebook approval create permission" });
+      }
+      const newEntryCharacterFilterIds = normalizedNewEntryCharacterFilterIds ?? undefined;
       const lorebooksStore = createLorebooksStorage(app.db);
       const targetLorebookId = await persistLorebookKeeperUpdates({
         lorebooksStore,
@@ -1127,6 +1209,14 @@ export async function chatsRoutes(app: FastifyInstance) {
         preferredTargetLorebookId,
         writableLorebookIds,
         updates,
+        ...(accessContext
+          ? {
+              accessContext,
+              lorebookPromptContext: lorebookPromptContext ?? accessContext,
+              newEntryCharacterFilterIds,
+              allowCreateTarget: payload.allowCreateTarget === true,
+            }
+          : {}),
       });
       return { ok: true, targetLorebookId };
     }
@@ -1186,7 +1276,7 @@ export async function chatsRoutes(app: FastifyInstance) {
       personas.find((candidate) => candidate.isActive === "true");
     const personaName = persona?.name ?? "User";
 
-    const allMessages = await storage.listMessages(req.params.id);
+    const allMessages = await storage.listMessagesWithActiveSwipes(req.params.id);
     let startIdx = 0;
     for (let i = allMessages.length - 1; i >= 0; i--) {
       const extra = parseExtra(allMessages[i]!.extra);
@@ -1321,13 +1411,27 @@ export async function chatsRoutes(app: FastifyInstance) {
   app.delete<{ Params: { groupId: string }; Querystring: { force?: string } }>(
     "/group/:groupId",
     async (req, reply) => {
+      const groupChats = await storage.listByGroup(req.params.groupId);
+      const expectedChatIds = groupChats.map((chat) => chat.id);
       const force = req.query.force === "true" || req.query.force === "1";
       const guard = await storage.canDeleteGroup(req.params.groupId, { force });
       if (!guard.allowed) {
         return reply.status(409).send({ error: guard.reason });
       }
-      await storage.removeGroup(req.params.groupId);
-      return reply.status(204).send();
+      const groupDeletionLease = takeOverActiveGenerationLeases(activeGenerations, expectedChatIds);
+      if (!groupDeletionLease) {
+        return reply.status(409).send({ error: "A chat in this group is already being deleted" });
+      }
+      try {
+        const removed = await storage.removeGroup(req.params.groupId, expectedChatIds);
+        if (!removed) {
+          return reply.status(409).send({ error: "Chat group membership changed; retry deletion" });
+        }
+        for (const chatId of expectedChatIds) clearChatActivity(chatId);
+        return reply.status(204).send();
+      } finally {
+        groupDeletionLease.release();
+      }
     },
   );
 
@@ -1338,33 +1442,34 @@ export async function chatsRoutes(app: FastifyInstance) {
     if (!guard.allowed) {
       return reply.status(409).send({ error: guard.reason });
     }
-    // If this is a scene chat, clean up the origin chat's scene pointer
-    const chat = await storage.getById(req.params.id);
-    if (chat) {
-      const meta = parseExtra(chat.metadata) as Record<string, unknown>;
-      const originId = meta.sceneOriginChatId;
-      if (typeof originId === "string" && originId) {
-        const origin = await storage.getById(originId);
-        if (origin) {
-          const originMeta = parseExtra(origin.metadata) as Record<string, unknown>;
-          delete originMeta.activeSceneChatId;
-          delete originMeta.sceneBusyCharIds;
-          await storage.updateMetadata(originId, originMeta);
+    const deletionLease = takeOverActiveGenerationLease(activeGenerations, req.params.id);
+    if (!deletionLease) {
+      return reply.status(409).send({ error: "Chat deletion is already in progress" });
+    }
+    try {
+      // If this is a scene chat, clean up the origin chat's scene pointer
+      const chat = await storage.getById(req.params.id);
+      if (chat) {
+        const meta = parseExtra(chat.metadata) as Record<string, unknown>;
+        const originId = meta.sceneOriginChatId;
+        if (typeof originId === "string" && originId) {
+          const origin = await storage.getById(originId);
+          if (origin) {
+            const originMeta = parseExtra(origin.metadata) as Record<string, unknown>;
+            delete originMeta.activeSceneChatId;
+            delete originMeta.sceneBusyCharIds;
+            await storage.updateMetadata(originId, originMeta);
+          }
         }
       }
+      clearChatActivity(req.params.id);
+      // Disconnect from partner chat before deleting
+      await storage.disconnectChat(req.params.id);
+      await storage.remove(req.params.id);
+      return reply.status(204).send();
+    } finally {
+      deletionLease.release();
     }
-    const activeGenerations = (
-      app as unknown as {
-        activeGenerations?: Map<string, { abortController?: AbortController }>;
-      }
-    ).activeGenerations;
-    activeGenerations?.get(req.params.id)?.abortController?.abort();
-    activeGenerations?.delete(req.params.id);
-    clearChatActivity(req.params.id);
-    // Disconnect from partner chat before deleting
-    await storage.disconnectChat(req.params.id);
-    await storage.remove(req.params.id);
-    return reply.status(204).send();
   });
 
   // ── Messages ──
@@ -1650,8 +1755,19 @@ export async function chatsRoutes(app: FastifyInstance) {
 
   // Delete message
   app.delete<{ Params: { chatId: string; messageId: string } }>("/:chatId/messages/:messageId", async (req, reply) => {
-    await storage.removeMessage(req.params.messageId);
-    return reply.status(204).send();
+    const messageMutation = await acquireSwipeMutationLease(req.params.chatId, req.params.messageId);
+    if (messageMutation.kind === "not_found") {
+      return reply.status(404).send({ error: "Message not found" });
+    }
+    if (messageMutation.kind === "busy") {
+      return reply.status(409).send({ error: "Cannot delete a message while generation is in progress" });
+    }
+    try {
+      await storage.removeMessage(req.params.messageId);
+      return reply.status(204).send();
+    } finally {
+      messageMutation.lease.release();
+    }
   });
 
   // Bulk delete messages
@@ -1660,17 +1776,36 @@ export async function chatsRoutes(app: FastifyInstance) {
     if (!Array.isArray(messageIds) || messageIds.length === 0) {
       return reply.status(400).send({ error: "messageIds array is required" });
     }
-    await storage.removeMessages(messageIds, req.params.chatId);
-    return reply.status(204).send();
+    const bulkMutationLease = acquireChatMutationLease(activeGenerations, req.params.chatId);
+    if (!bulkMutationLease) {
+      return reply.status(409).send({ error: "Cannot delete messages while generation is in progress" });
+    }
+    try {
+      await storage.removeMessages(messageIds, req.params.chatId);
+      return reply.status(204).send();
+    } finally {
+      bulkMutationLease.release();
+    }
   });
 
   // Edit message content
   app.patch<{ Params: { chatId: string; messageId: string } }>("/:chatId/messages/:messageId", async (req, reply) => {
     const { content } = req.body as { content: string };
     if (typeof content !== "string") return reply.status(400).send({ error: "content is required" });
-    const updated = await storage.updateMessageContent(req.params.messageId, content);
-    if (!updated) return reply.status(404).send({ error: "Message not found" });
-    return updated;
+    const messageMutation = await acquireSwipeMutationLease(req.params.chatId, req.params.messageId);
+    if (messageMutation.kind === "not_found") {
+      return reply.status(404).send({ error: "Message not found" });
+    }
+    if (messageMutation.kind === "busy") {
+      return reply.status(409).send({ error: "Cannot edit a message while generation is in progress" });
+    }
+    try {
+      const updated = await storage.updateMessageContent(req.params.messageId, content);
+      if (!updated) return reply.status(404).send({ error: "Message not found" });
+      return updated;
+    } finally {
+      messageMutation.lease.release();
+    }
   });
 
   // Update message extra (partial merge) — also syncs to the active swipe
@@ -1697,23 +1832,6 @@ export async function chatsRoutes(app: FastifyInstance) {
           );
         if (userReacted) recordUserReaction(req.params.chatId);
       }
-      const syncAllSwipeExtra: Record<string, unknown> = {};
-      if (Object.prototype.hasOwnProperty.call(partial, "hiddenFromAI")) {
-        syncAllSwipeExtra.hiddenFromAI = partial.hiddenFromAI;
-      }
-      if (Object.prototype.hasOwnProperty.call(partial, "reactions")) {
-        syncAllSwipeExtra.reactions = partial.reactions;
-      }
-
-      if (Object.keys(syncAllSwipeExtra).length > 0) {
-        // hiddenFromAI and reactions are message-level fields, so keep them
-        // stable across swipe changes instead of binding them to one swipe.
-        const swipes = await storage.getSwipes(req.params.messageId);
-        for (const swipe of swipes) {
-          await storage.updateSwipeExtra(req.params.messageId, swipe.index, syncAllSwipeExtra);
-        }
-      }
-
       return updated;
     },
   );
@@ -2066,7 +2184,7 @@ export async function chatsRoutes(app: FastifyInstance) {
     const chat = await storage.getById(req.params.id);
     if (!chat) return reply.status(404).send({ error: "Chat not found" });
 
-    const chatMessages = await storage.listMessages(req.params.id);
+    const chatMessages = await storage.listMessagesWithActiveSwipes(req.params.id);
     const requestedMessageId = typeof req.body?.messageId === "string" ? req.body.messageId.trim() : "";
     const requestedMessage = requestedMessageId
       ? (chatMessages.find((message) => message.id === requestedMessageId) ?? null)
@@ -2128,11 +2246,13 @@ export async function chatsRoutes(app: FastifyInstance) {
 
     if (promptSourceMessage?.role === "assistant") {
       const extra = parseExtra(promptSourceMessage.extra) as Record<string, unknown>;
-      let cached = readCachedPrompt(extra, Boolean(requestedMessage));
+      let cached: ReturnType<typeof readCachedPrompt> = null;
+      let swipes: Awaited<ReturnType<typeof storage.getSwipes>> = [];
 
-      // If message-level extra doesn't have it (swipe overwrite), check swipes.
-      if (!cached && promptSourceMessage.id) {
-        const swipes = await storage.getSwipes(promptSourceMessage.id);
+      // The selected swipe is authoritative. The message envelope can lag behind
+      // it, so use envelope cache only as a legacy fallback.
+      if (promptSourceMessage.id) {
+        swipes = await storage.getSwipes(promptSourceMessage.id);
         const activeSwipe = swipes.find((s: any) => s.index === promptSourceMessage.activeSwipeIndex);
         if (activeSwipe) {
           cached = readCachedPrompt(
@@ -2140,12 +2260,13 @@ export async function chatsRoutes(app: FastifyInstance) {
             Boolean(requestedMessage),
           );
         }
-        if (!cached) {
-          for (const sw of swipes) {
-            cached = readCachedPrompt(parseExtra(sw.extra) as Record<string, unknown>, Boolean(requestedMessage));
-            if (cached) break;
-          }
-        }
+      }
+
+      // An existing swipe row makes the selected row authoritative even when
+      // its cache is absent. Falling back to the envelope or another swipe
+      // would mislabel a different prompt as exact.
+      if (!cached && swipes.length === 0) {
+        cached = readCachedPrompt(extra, Boolean(requestedMessage));
       }
 
       if (cached) {
@@ -2775,34 +2896,55 @@ export async function chatsRoutes(app: FastifyInstance) {
   });
 
   // Add a swipe
-  app.post<{ Params: { chatId: string; messageId: string } }>("/:chatId/messages/:messageId/swipes", async (req) => {
-    const { content, silent } = req.body as { content: string; silent?: boolean };
-    return storage.addSwipe(req.params.messageId, content, silent);
-  });
+  app.post<{ Params: { chatId: string; messageId: string } }>(
+    "/:chatId/messages/:messageId/swipes",
+    async (req, reply) => {
+      const swipeMutation = await acquireSwipeMutationLease(req.params.chatId, req.params.messageId);
+      if (swipeMutation.kind === "not_found") {
+        return reply.status(404).send({ error: "Message not found" });
+      }
+      if (swipeMutation.kind === "busy") {
+        return reply.status(409).send({ error: "Cannot change swipes while generation is in progress" });
+      }
+      try {
+        const { content, silent } = req.body as { content: string; silent?: boolean };
+        return await storage.addSwipe(req.params.messageId, content, silent);
+      } finally {
+        swipeMutation.lease.release();
+      }
+    },
+  );
 
   // Add multiple swipes in one round trip. Used for alternate greetings during chat setup.
   app.post<{ Params: { chatId: string; messageId: string } }>(
     "/:chatId/messages/:messageId/swipes/bulk",
     async (req, reply) => {
-      const { contents, silent } = req.body as { contents?: unknown; silent?: boolean };
-      if (!Array.isArray(contents)) {
-        return reply.status(400).send({ error: "contents must be a non-empty array of strings" });
-      }
-      const normalized = contents
-        .map((content) => (typeof content === "string" ? content.trim() : ""))
-        .filter((content) => content.length > 0);
-      if (normalized.length === 0) {
-        return reply.status(400).send({ error: "contents must include at least one non-empty string" });
-      }
-      const message = await storage.getMessage(req.params.messageId);
-      if (!message || message.chatId !== req.params.chatId) {
+      const swipeMutation = await acquireSwipeMutationLease(req.params.chatId, req.params.messageId);
+      if (swipeMutation.kind === "not_found") {
         return reply.status(404).send({ error: "Message not found" });
       }
-      const created: Array<{ id: string; index: number }> = [];
-      for (const content of normalized) {
-        created.push(await storage.addSwipe(req.params.messageId, content, silent ?? true));
+      if (swipeMutation.kind === "busy") {
+        return reply.status(409).send({ error: "Cannot change swipes while generation is in progress" });
       }
-      return { swipes: created };
+      try {
+        const { contents, silent } = req.body as { contents?: unknown; silent?: boolean };
+        if (!Array.isArray(contents)) {
+          return reply.status(400).send({ error: "contents must be a non-empty array of strings" });
+        }
+        const normalized = contents
+          .map((content) => (typeof content === "string" ? content.trim() : ""))
+          .filter((content) => content.length > 0);
+        if (normalized.length === 0) {
+          return reply.status(400).send({ error: "contents must include at least one non-empty string" });
+        }
+        const created: Array<{ id: string; index: number }> = [];
+        for (const content of normalized) {
+          created.push(await storage.addSwipe(req.params.messageId, content, silent ?? true));
+        }
+        return { swipes: created };
+      } finally {
+        swipeMutation.lease.release();
+      }
     },
   );
 
@@ -2814,32 +2956,53 @@ export async function chatsRoutes(app: FastifyInstance) {
       if (!Number.isInteger(index) || index < 0) {
         return reply.status(400).send({ error: "Valid swipe index is required" });
       }
-
-      const swipes = await storage.getSwipes(req.params.messageId);
-      if (swipes.length <= 1) {
-        return reply.status(400).send({ error: "Cannot delete the last remaining swipe" });
-      }
-
-      const target = swipes.find((swipe: any) => swipe.index === index);
-      if (!target) {
-        return reply.status(404).send({ error: "Swipe not found" });
-      }
-
-      const updated = await storage.removeSwipe(req.params.messageId, index);
-      if (!updated) {
+      const swipeMutation = await acquireSwipeMutationLease(req.params.chatId, req.params.messageId);
+      if (swipeMutation.kind === "not_found") {
         return reply.status(404).send({ error: "Message not found" });
       }
+      if (swipeMutation.kind === "busy") {
+        return reply.status(409).send({ error: "Cannot change swipes while generation is in progress" });
+      }
+      try {
+        const swipes = await storage.getSwipes(req.params.messageId);
+        if (swipes.length <= 1) {
+          return reply.status(400).send({ error: "Cannot delete the last remaining swipe" });
+        }
 
-      return updated;
+        const target = swipes.find((swipe: any) => swipe.index === index);
+        if (!target) {
+          return reply.status(404).send({ error: "Swipe not found" });
+        }
+
+        const updated = await storage.removeSwipe(req.params.messageId, index);
+        if (!updated) {
+          return reply.status(404).send({ error: "Message not found" });
+        }
+
+        return updated;
+      } finally {
+        swipeMutation.lease.release();
+      }
     },
   );
 
   // Set active swipe
   app.put<{ Params: { chatId: string; messageId: string } }>(
     "/:chatId/messages/:messageId/active-swipe",
-    async (req) => {
-      const { index } = req.body as { index: number };
-      return storage.setActiveSwipe(req.params.messageId, index);
+    async (req, reply) => {
+      const swipeMutation = await acquireSwipeMutationLease(req.params.chatId, req.params.messageId);
+      if (swipeMutation.kind === "not_found") {
+        return reply.status(404).send({ error: "Message not found" });
+      }
+      if (swipeMutation.kind === "busy") {
+        return reply.status(409).send({ error: "Cannot change swipes while generation is in progress" });
+      }
+      try {
+        const { index } = req.body as { index: number };
+        return await storage.setActiveSwipe(req.params.messageId, index);
+      } finally {
+        swipeMutation.lease.release();
+      }
     },
   );
 
@@ -2910,6 +3073,7 @@ export async function chatsRoutes(app: FastifyInstance) {
     "generationInfo",
     "generationReplay",
     "lorebookScan",
+    "swipeCharacterId",
   ]);
 
   const sanitizeExportExtra = (extra: Record<string, unknown>): Record<string, unknown> => {
@@ -2929,12 +3093,39 @@ export async function chatsRoutes(app: FastifyInstance) {
     return sanitized;
   };
 
-  const sanitizeBranchedMessageExtra = (extra: Record<string, unknown>): Record<string, unknown> => {
+  const sanitizeJsonlSwipeExtra = (
+    extra: Record<string, unknown>,
+    portable = extractPortableConversationSwipeExtra(extra),
+  ): Record<string, unknown> => ({
+    ...sanitizeJsonlMessageExtra(extra),
+    ...portable,
+  });
+
+  const overlayMessageStableExportExtra = (
+    swipeExtra: Record<string, unknown>,
+    messageExtra: Record<string, unknown>,
+  ): Record<string, unknown> => {
+    const merged = { ...swipeExtra };
+    for (const key of MESSAGE_STABLE_EXTRA_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(messageExtra, key)) merged[key] = messageExtra[key];
+    }
+    return merged;
+  };
+
+  const sanitizeBranchedMessageExtraBase = (extra: Record<string, unknown>): Record<string, unknown> => {
     const sanitized = sanitizeExportExtra(extra);
+    for (const key of EXPORT_REASONING_EXTRA_KEYS) {
+      delete sanitized[key];
+    }
     delete sanitized.summaryCandidate;
     delete sanitized.summaryDebug;
     return sanitized;
   };
+
+  const sanitizeBranchedMessageExtra = (extra: Record<string, unknown>): Record<string, unknown> => ({
+    ...sanitizeBranchedMessageExtraBase(extra),
+    ...extractPortableConversationSwipeExtra(extra),
+  });
 
   const isExportRecord = (value: unknown): value is Record<string, unknown> =>
     !!value && typeof value === "object" && !Array.isArray(value);
@@ -3036,7 +3227,7 @@ export async function chatsRoutes(app: FastifyInstance) {
     options: { includeReasoning?: boolean } = {},
   ) => {
     const includeReasoning = options.includeReasoning === true;
-    const msgs = await storage.listMessages(chat.id);
+    const msgs = await storage.listMessagesWithActiveSwipes(chat.id);
     const charIds = parseExportCharacterIds(chat.characterIds);
     const metadata = parseExportMetadata(chat.metadata);
     const messageIndexById = new Map(msgs.map((message, index) => [message.id, index]));
@@ -3080,7 +3271,8 @@ export async function chatsRoutes(app: FastifyInstance) {
       collectExportJournalNpcNames(metadata, charNameMap),
     );
     const persona = await buildPersonaSnapshotForChat(app, chat);
-    const { buildPromptMacroContext, resolvePromptMessageMacros } = await import("../services/prompt/index.js");
+    const { buildPromptMacroContext, resolveCharacterMacroData, resolvePromptMessageMacros } =
+      await import("../services/prompt/index.js");
     const exportCharacterIds = resolveActiveCharacterIds(charIds, metadata, {
       mode: (chat.mode as string | undefined) ?? "roleplay",
       allowEmpty: true,
@@ -3104,6 +3296,7 @@ export async function chatsRoutes(app: FastifyInstance) {
       chatId: chat.id,
       lastGenerationType: "export",
     });
+    const exportCharacterProfilesById = (await resolveCharacterMacroData(app.db, charIds)).profilesById;
 
     const getDisplayName = (msg: { role: string; characterId?: string | null }) => {
       if (msg.role === "user") return "User";
@@ -3113,21 +3306,47 @@ export async function chatsRoutes(app: FastifyInstance) {
       return primaryCharName;
     };
     const resolveExportMessageContent = (msg: { content: string; characterId?: string | null }) =>
-      resolvePromptMessageMacros([{ content: msg.content, characterId: msg.characterId }], promptMacroContext)[0]!
-        .content;
+      resolvePromptMessageMacros(
+        [{ content: msg.content, characterId: msg.characterId }],
+        promptMacroContext,
+        exportCharacterProfilesById,
+      )[0]!.content;
+    type ExportMessage = (typeof msgs)[number];
+    type ExportSwipe = Awaited<ReturnType<typeof storage.getSwipes>>[number];
+    const resolveAuthoritativeExportSnapshot = (msg: ExportMessage, swipes: ExportSwipe[]) => {
+      const activeSwipe = swipes.find((swipe) => swipe.index === msg.activeSwipeIndex);
+      const rawExtra = parseExportMetadata(activeSwipe?.extra ?? msg.extra);
+      const portableSwipeExtra = extractPortableConversationSwipeExtra(rawExtra);
+      const characterId = Object.prototype.hasOwnProperty.call(portableSwipeExtra, "swipeCharacterId")
+        ? (portableSwipeExtra.swipeCharacterId as string | null)
+        : msg.characterId;
+      return {
+        content: activeSwipe?.content ?? msg.content,
+        characterId,
+        rawExtra,
+      };
+    };
 
     if (format === "text") {
       const header = `Chat: ${chat.name}\nDate: ${chat.createdAt}\n${"─".repeat(50)}\n`;
-      const body = msgs
-        .map((msg) => {
-          const name = getDisplayName(msg);
-          const ts = msg.createdAt ? new Date(msg.createdAt).toLocaleString() : "";
-          const thinking = includeReasoning ? getExportThinking(parseExportMetadata(msg.extra)) : null;
-          const parts = [`[${name}]${ts ? ` (${ts})` : ""}`, resolveExportMessageContent(msg)];
-          if (thinking) parts.push(`[Thinking]\n${thinking}`);
-          return parts.join("\n");
-        })
-        .join("\n\n");
+      const transcriptMessages: string[] = [];
+      for (const msg of msgs) {
+        const swipes = await storage.getSwipes(msg.id);
+        const activeSnapshot = resolveAuthoritativeExportSnapshot(msg, swipes);
+        const name = getDisplayName({ ...msg, characterId: activeSnapshot.characterId });
+        const ts = msg.createdAt ? new Date(msg.createdAt).toLocaleString() : "";
+        const thinking = includeReasoning ? getExportThinking(activeSnapshot.rawExtra) : null;
+        const parts = [
+          `[${name}]${ts ? ` (${ts})` : ""}`,
+          resolveExportMessageContent({
+            content: activeSnapshot.content,
+            characterId: activeSnapshot.characterId,
+          }),
+        ];
+        if (thinking) parts.push(`[Thinking]\n${thinking}`);
+        transcriptMessages.push(parts.join("\n"));
+      }
+      const body = transcriptMessages.join("\n\n");
 
       return {
         content: header + body,
@@ -3159,38 +3378,70 @@ export async function chatsRoutes(app: FastifyInstance) {
     for (const msg of msgs) {
       const rawMessageExtra = parseExportMetadata(msg.extra);
       const messageExtra = sanitizeJsonlMessageExtra(rawMessageExtra);
-      const thinking = includeReasoning ? getExportThinking(rawMessageExtra) : null;
       const swipes = await storage.getSwipes(msg.id);
-      const activeContent = resolveExportMessageContent(msg);
-      const exportSwipes =
+      const activeSnapshot = resolveAuthoritativeExportSnapshot(msg, swipes);
+      const thinking = includeReasoning ? getExportThinking(activeSnapshot.rawExtra) : null;
+      const messagePortableSwipeExtra = extractPortableConversationSwipeExtra(rawMessageExtra);
+      const messageSwipeCharacterId = Object.prototype.hasOwnProperty.call(
+        messagePortableSwipeExtra,
+        "swipeCharacterId",
+      )
+        ? (messagePortableSwipeExtra.swipeCharacterId as string | null)
+        : msg.characterId;
+      type JsonlExportSwipe = {
+        index: number;
+        content: string;
+        extra: Record<string, unknown>;
+        createdAt?: string | null;
+      };
+      const exportSwipes: JsonlExportSwipe[] =
         swipes.length > 0
-          ? swipes.map((swipe: { index: number; content: string; extra?: unknown; createdAt?: string }) => ({
-              index: swipe.index,
-              content:
-                swipe.index === msg.activeSwipeIndex
-                  ? activeContent
-                  : resolveExportMessageContent({ content: swipe.content, characterId: msg.characterId }),
-              extra:
-                swipe.index === msg.activeSwipeIndex
-                  ? messageExtra
-                  : sanitizeJsonlMessageExtra(parseExportMetadata(swipe.extra)),
-              createdAt: swipe.createdAt,
-            }))
+          ? swipes.map((swipe: { index: number; content: string; extra?: unknown; createdAt?: string }) => {
+              const rawSwipeExtra = parseExportMetadata(swipe.extra);
+              const portableSwipeExtra = extractPortableConversationSwipeExtra(rawSwipeExtra);
+              const sanitizedSwipeExtra = sanitizeJsonlSwipeExtra(rawSwipeExtra, portableSwipeExtra);
+              const swipeCharacterId = Object.prototype.hasOwnProperty.call(portableSwipeExtra, "swipeCharacterId")
+                ? (portableSwipeExtra.swipeCharacterId as string | null)
+                : msg.characterId;
+              return {
+                index: swipe.index,
+                content: resolveExportMessageContent({
+                  content: swipe.content,
+                  characterId: swipeCharacterId,
+                }),
+                extra:
+                  swipe.index === msg.activeSwipeIndex
+                    ? overlayMessageStableExportExtra(sanitizedSwipeExtra, messageExtra)
+                    : sanitizedSwipeExtra,
+                createdAt: swipe.createdAt,
+              };
+            })
           : [
               {
                 index: 0,
-                content: activeContent,
-                extra: messageExtra,
+                content: resolveExportMessageContent({
+                  content: msg.content,
+                  characterId: messageSwipeCharacterId,
+                }),
+                extra: { ...messageExtra, ...messagePortableSwipeExtra },
                 createdAt: msg.createdAt,
               },
             ];
+      const activeExportSwipe = exportSwipes.find((swipe) => swipe.index === msg.activeSwipeIndex);
+      const activeCharacterId = activeSnapshot.characterId;
+      const activeContent =
+        activeExportSwipe?.content ??
+        resolveExportMessageContent({
+          content: activeSnapshot.content,
+          characterId: activeCharacterId,
+        });
       lines.push(
         JSON.stringify({
-          name: getDisplayName(msg),
+          name: getDisplayName({ ...msg, characterId: activeCharacterId }),
           is_user: msg.role === "user",
           is_system: msg.role === "system",
           role: msg.role,
-          character_id: msg.characterId,
+          character_id: activeCharacterId,
           mes: activeContent,
           ...(thinking
             ? {
@@ -3201,9 +3452,9 @@ export async function chatsRoutes(app: FastifyInstance) {
           swipe_id: msg.activeSwipeIndex,
           send_date: msg.createdAt,
           extra: {
-            ...messageExtra,
+            ...(activeExportSwipe?.extra ?? messageExtra),
             marinara_role: msg.role,
-            marinara_character_id: msg.characterId,
+            marinara_character_id: activeCharacterId,
             marinara_swipes: exportSwipes.map((swipe) => ({
               index: swipe.index,
               extra: swipe.extra,
@@ -3348,7 +3599,7 @@ export async function chatsRoutes(app: FastifyInstance) {
 
     const { upToMessageId } = (req.body ?? {}) as { upToMessageId?: string };
 
-    const msgs = await storage.listMessages(req.params.id);
+    const msgs = await storage.listMessagesWithActiveSwipes(req.params.id);
     if (upToMessageId && !msgs.some((msg) => msg.id === upToMessageId)) {
       return reply.status(404).send({ error: "Cutoff message not found in source chat" });
     }
@@ -3401,17 +3652,21 @@ export async function chatsRoutes(app: FastifyInstance) {
 
     for (const msg of msgs) {
       const swipes = await storage.getSwipes(msg.id);
-      const messageExtra = sanitizeBranchedMessageExtra(parseExportMetadata(msg.extra));
+      const rawMessageExtra = parseExportMetadata(msg.extra);
+      const messageExtra = sanitizeBranchedMessageExtraBase(rawMessageExtra);
       const activeSwipeIndex =
         Number.isInteger(msg.activeSwipeIndex) && msg.activeSwipeIndex >= 0 ? msg.activeSwipeIndex : 0;
       const copiedSwipes =
         swipes.length > 0
           ? swipes.map((swipe: { index: number; content: string; extra?: unknown; createdAt?: string | null }) => {
               const swipeExtra = sanitizeBranchedMessageExtra(parseExportMetadata(swipe.extra));
-              const extra = swipe.index === activeSwipeIndex ? { ...swipeExtra, ...messageExtra } : swipeExtra;
+              const extra =
+                swipe.index === activeSwipeIndex
+                  ? overlayMessageStableExportExtra(swipeExtra, messageExtra)
+                  : swipeExtra;
               return {
                 index: swipe.index,
-                content: swipe.index === activeSwipeIndex ? msg.content : swipe.content,
+                content: swipe.content,
                 extra,
                 createdAt: swipe.createdAt ?? null,
               };
@@ -3420,16 +3675,20 @@ export async function chatsRoutes(app: FastifyInstance) {
               {
                 index: 0,
                 content: msg.content,
-                extra: messageExtra,
+                extra: { ...messageExtra, ...extractPortableConversationSwipeExtra(rawMessageExtra) },
                 createdAt: msg.createdAt as string,
               },
             ];
       const activeSwipe = copiedSwipes.find((swipe) => swipe.index === activeSwipeIndex) ?? copiedSwipes[0];
       const copiedActiveSwipeIndex = activeSwipe?.index ?? 0;
+      const activeSwipePortable = extractPortableConversationSwipeExtra(activeSwipe?.extra);
+      const copiedCharacterId = Object.prototype.hasOwnProperty.call(activeSwipePortable, "swipeCharacterId")
+        ? (activeSwipePortable.swipeCharacterId as string | null)
+        : msg.characterId;
 
       copiedMessageInputs.push({
         role: msg.role as "user" | "assistant" | "system" | "narrator",
-        characterId: msg.characterId,
+        characterId: copiedCharacterId,
         content: activeSwipe?.content ?? msg.content,
         extra: activeSwipe?.extra ?? messageExtra,
         activeSwipeIndex: copiedActiveSwipeIndex,
@@ -3666,7 +3925,7 @@ export async function chatsRoutes(app: FastifyInstance) {
     // Build conversation context (use contextSize from popover, or a custom range).
     // Hidden-from-AI messages are excluded from summary generation even when
     // they fall inside the selected range.
-    const allMessages = await storage.listMessages(req.params.id);
+    const allMessages = await storage.listMessagesWithActiveSwipes(req.params.id);
     let selectedRangeStartIndex: number | undefined;
     let selectedRangeEndIndex: number | undefined;
     const selectedMessages = hasRange

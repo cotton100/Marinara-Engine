@@ -1,5 +1,15 @@
-import type { AgentContext, LorebookEntry } from "@marinara-engine/shared";
+import type { AgentContext, Lorebook, LorebookEntry } from "@marinara-engine/shared";
 import { logger } from "../../lib/logger.js";
+import {
+  filterLorebookEntriesForPromptContext,
+  type LorebookPromptContext,
+} from "../../services/lorebook/keyword-scanner.js";
+import {
+  filterAccessibleLorebooks,
+  lorebookEntryMatchesCharacterWriteScope,
+  lorebookIsWritableInAccessContext,
+  type LorebookAccessContext,
+} from "../../services/lorebook/access-context.js";
 import { createLorebooksStorage } from "../../services/storage/lorebooks.storage.js";
 
 export interface LorebookKeeperSettings {
@@ -24,6 +34,31 @@ type LorebookKeeperMessage = {
   characterId?: string | null;
 };
 
+export function applyLorebookKeeperRunMemoryScope(args: {
+  baseMemory: Record<string, unknown>;
+  accessContext: LorebookAccessContext;
+  newEntryCharacterFilterIds?: readonly string[];
+  targetLorebookId: string | null;
+  targetLorebookName: string | null;
+  existingEntries: readonly ExistingLorebookEntrySummary[];
+}): Record<string, unknown> {
+  const memory: Record<string, unknown> = {
+    ...args.baseMemory,
+    _lorebookAccessContext: args.accessContext,
+    _lorebookKeeperTargetLorebookId: args.targetLorebookId,
+    _lorebookKeeperTargetLorebookName: args.targetLorebookName,
+  };
+  delete memory._newLorebookEntryCharacterFilterIds;
+  if (args.newEntryCharacterFilterIds !== undefined) {
+    memory._newLorebookEntryCharacterFilterIds = [...args.newEntryCharacterFilterIds];
+  }
+  delete memory._existingLorebookEntries;
+  if (args.existingEntries.length > 0) {
+    memory._existingLorebookEntries = [...args.existingEntries];
+  }
+  return memory;
+}
+
 const MAX_READ_BEHIND_MESSAGES = 100;
 
 function normalizeNonNegativeInteger(value: unknown, fallback: number, max: number): number {
@@ -32,6 +67,10 @@ function normalizeNonNegativeInteger(value: unknown, fallback: number, max: numb
 }
 
 function isEnabledLorebook(value: unknown): boolean {
+  return value === true || value === "true";
+}
+
+function isTruthyFlag(value: unknown): boolean {
   return value === true || value === "true";
 }
 
@@ -62,39 +101,19 @@ export function getLorebookKeeperSettings(chatMeta: Record<string, unknown>): Lo
 
 export async function resolveLorebookKeeperTarget(args: {
   lorebooksStore: LorebooksStore;
-  chatId: string;
-  characterIds: string[];
-  personaId?: string | null;
-  activeLorebookIds: string[];
+  accessContext: LorebookAccessContext;
   preferredTargetLorebookId: string | null;
 }): Promise<{
   writableLorebookIds: string[];
   targetLorebookId: string | null;
   targetLorebookName: string | null;
 }> {
-  const { lorebooksStore, chatId, characterIds, personaId, activeLorebookIds, preferredTargetLorebookId } = args;
-  const allBooks = (await lorebooksStore.list()) as unknown as Array<{
-    id: string;
-    name?: string | null;
-    enabled?: unknown;
-    characterId?: string | null;
-    characterIds?: string[] | null;
-    personaId?: string | null;
-    personaIds?: string[] | null;
-    chatId?: string | null;
-  }>;
-
-  const relevantBooks = allBooks.filter((book) => {
-    if (preferredTargetLorebookId && book.id === preferredTargetLorebookId) return true;
-    if (!isEnabledLorebook(book.enabled)) return false;
-    if (activeLorebookIds.includes(book.id)) return true;
-    if (book.characterIds?.some((characterId) => characterIds.includes(characterId))) return true;
-    if (book.characterId && characterIds.includes(book.characterId)) return true;
-    if (personaId && book.personaIds?.includes(personaId)) return true;
-    if (book.personaId && book.personaId === personaId) return true;
-    if (book.chatId && book.chatId === chatId) return true;
-    return false;
-  });
+  const { lorebooksStore, accessContext, preferredTargetLorebookId } = args;
+  const allBooks = (await lorebooksStore.list()) as unknown as Lorebook[];
+  const accessibleBooks = filterAccessibleLorebooks(allBooks, accessContext, { requireEnabled: false });
+  const relevantBooks = accessibleBooks.filter(
+    (book) => isEnabledLorebook(book.enabled) || (!!preferredTargetLorebookId && book.id === preferredTargetLorebookId),
+  );
 
   const uniqueBooks = [...new Map(relevantBooks.map((book) => [book.id, book])).values()];
   uniqueBooks.sort((left, right) => {
@@ -102,8 +121,8 @@ export async function resolveLorebookKeeperTarget(args: {
     const rightPreferred = preferredTargetLorebookId && right.id === preferredTargetLorebookId ? 0 : 1;
     if (leftPreferred !== rightPreferred) return leftPreferred - rightPreferred;
 
-    const leftChatScoped = left.chatId === chatId ? 0 : 1;
-    const rightChatScoped = right.chatId === chatId ? 0 : 1;
+    const leftChatScoped = left.chatId === accessContext.chatId ? 0 : 1;
+    const rightChatScoped = right.chatId === accessContext.chatId ? 0 : 1;
     return leftChatScoped - rightChatScoped;
   });
 
@@ -120,16 +139,14 @@ export async function resolveLorebookKeeperTarget(args: {
 export async function loadLorebookKeeperExistingEntries(
   lorebooksStore: LorebooksStore,
   targetLorebookId: string | null,
+  lorebookPromptContext?: LorebookPromptContext,
 ): Promise<ExistingLorebookEntrySummary[]> {
   if (!targetLorebookId) return [];
 
-  const entries = (await lorebooksStore.listEntries(targetLorebookId)) as Array<{
-    id?: string | null;
-    name?: string | null;
-    content?: string | null;
-    keys?: string[] | null;
-    locked?: unknown;
-  }>;
+  const rawEntries = (await lorebooksStore.listEntries(targetLorebookId)) as LorebookEntry[];
+  const entries = lorebookPromptContext
+    ? filterLorebookEntriesForPromptContext(rawEntries, lorebookPromptContext)
+    : rawEntries;
 
   return entries
     .filter((entry) => typeof entry.name === "string" && entry.name.trim().length > 0)
@@ -138,7 +155,7 @@ export async function loadLorebookKeeperExistingEntries(
       name: entry.name!.trim(),
       content: typeof entry.content === "string" ? entry.content : "",
       keys: Array.isArray(entry.keys) ? entry.keys.filter((key) => typeof key === "string") : [],
-      locked: entry.locked === true || entry.locked === "true",
+      locked: isTruthyFlag(entry.locked),
     }));
 }
 
@@ -352,12 +369,42 @@ export async function persistLorebookKeeperUpdates(args: {
   writableLorebookIds: string[] | null;
   updates: Array<Record<string, unknown>>;
   revectorizeEntry?: (entry: LorebookEntry) => Promise<void>;
+  lorebookPromptContext?: LorebookPromptContext;
+  newEntryCharacterFilterIds?: string[];
+  accessContext?: LorebookAccessContext;
+  allowCreateTarget?: boolean;
 }): Promise<string | null> {
-  const { lorebooksStore, chatId, chatName, preferredTargetLorebookId, writableLorebookIds, updates, revectorizeEntry } =
-    args;
+  const {
+    lorebooksStore,
+    chatId,
+    chatName,
+    preferredTargetLorebookId,
+    writableLorebookIds,
+    updates,
+    revectorizeEntry,
+    lorebookPromptContext,
+    newEntryCharacterFilterIds,
+    accessContext,
+    allowCreateTarget = true,
+  } = args;
 
-  let targetLorebookId = preferredTargetLorebookId ?? writableLorebookIds?.[0] ?? null;
+  const requestedTargetIds = Array.from(
+    new Set([preferredTargetLorebookId, ...(writableLorebookIds ?? [])].filter((id): id is string => !!id)),
+  );
+  let targetLorebookId: string | null = null;
+  for (const candidateId of requestedTargetIds) {
+    if (!accessContext) {
+      targetLorebookId = candidateId;
+      break;
+    }
+    const candidate = (await lorebooksStore.getById(candidateId)) as unknown as Lorebook | null;
+    if (candidate && lorebookIsWritableInAccessContext(candidate, accessContext)) {
+      targetLorebookId = candidateId;
+      break;
+    }
+  }
   if (!targetLorebookId) {
+    if (!allowCreateTarget) return null;
     const created = await lorebooksStore.create({
       name: `Auto-generated (${chatName || chatId})`,
       description: "Automatically created by the Lorebook Keeper agent",
@@ -372,14 +419,16 @@ export async function persistLorebookKeeperUpdates(args: {
 
   if (!targetLorebookId) return null;
 
-  const existingEntries = (await lorebooksStore.listEntries(targetLorebookId)) as unknown as Array<{
-    id: string;
-    name?: string | null;
-    content?: string | null;
-    keys?: string[] | null;
-    tag?: string | null;
-    locked?: unknown;
-  }>;
+  const rawExistingEntries = (await lorebooksStore.listEntries(targetLorebookId)) as LorebookEntry[];
+  const promptVisibleEntries = lorebookPromptContext
+    ? filterLorebookEntriesForPromptContext(rawExistingEntries, lorebookPromptContext)
+    : rawExistingEntries;
+  const existingEntries =
+    newEntryCharacterFilterIds === undefined
+      ? promptVisibleEntries
+      : promptVisibleEntries.filter((entry) =>
+          lorebookEntryMatchesCharacterWriteScope(entry, newEntryCharacterFilterIds),
+        );
   const entryByName = new Map<string, (typeof existingEntries)[number]>();
   for (const entry of existingEntries) {
     const name = typeof entry.name === "string" ? entry.name.trim().toLowerCase() : "";
@@ -395,7 +444,7 @@ export async function persistLorebookKeeperUpdates(args: {
     const tag = readKeeperUpdateTag(update);
     const existing = entryByName.get(rawName.toLowerCase());
 
-    if (existing && (existing.locked === true || existing.locked === "true")) {
+    if (existing && isTruthyFlag(existing.locked)) {
       continue;
     }
 
@@ -440,9 +489,15 @@ export async function persistLorebookKeeperUpdates(args: {
       keys,
       tag,
       enabled: true,
+      ...(newEntryCharacterFilterIds?.length
+        ? {
+            characterFilterMode: "include",
+            characterFilterIds: Array.from(new Set(newEntryCharacterFilterIds)),
+          }
+        : {}),
     });
     if (created && typeof created === "object" && "id" in created) {
-      const createdEntry = created as { id: string; name?: string | null; locked?: unknown };
+      const createdEntry = created as unknown as LorebookEntry;
       entryByName.set(rawName.toLowerCase(), {
         ...createdEntry,
         name: createdEntry.name ?? rawName,

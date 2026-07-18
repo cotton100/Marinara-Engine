@@ -2,7 +2,18 @@ import { stripGenerationGuideInstruction, type GenerationGuideSource } from "@ma
 
 export type GenerationReplayGuideSource = GenerationGuideSource;
 
+export type ConversationScopeReplay =
+  | { mode: "merged" }
+  | { mode: "focused"; characterId: string }
+  | { mode: "restricted"; characterIds: string[] };
+
+export type ConversationScopeReplayInspection =
+  | { kind: "absent" }
+  | { kind: "valid"; scope: ConversationScopeReplay }
+  | { kind: "invalid" };
+
 export interface GenerationReplay {
+  conversationScope?: ConversationScopeReplay;
   impersonate?: true;
   userMessage?: string | null;
   generationGuide?: string;
@@ -15,6 +26,7 @@ export interface GenerationReplay {
 }
 
 export interface GenerationReplayInput {
+  conversationScope?: unknown;
   userMessage?: string | null;
   impersonate?: boolean;
   generationGuide?: string | null;
@@ -46,8 +58,80 @@ function asNarrativeDirectorMode(value: unknown): "natural" | "random" | null {
   return value === "natural" || value === "random" ? value : null;
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, allowedKeys: readonly string[]): boolean {
+  const allowed = new Set(allowedKeys);
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function normalizeConversationScopeReplay(value: unknown): ConversationScopeReplay | null {
+  if (!isPlainRecord(value)) return null;
+  if (value.mode === "merged") {
+    return hasExactKeys(value, ["mode"]) ? { mode: "merged" } : null;
+  }
+  if (value.mode === "focused") {
+    if (!hasExactKeys(value, ["mode", "characterId"])) return null;
+    const characterId = asTrimmedNonEmptyString(value.characterId);
+    return characterId ? { mode: "focused", characterId } : null;
+  }
+  if (value.mode === "restricted") {
+    if (!hasExactKeys(value, ["mode", "characterIds"]) || !Array.isArray(value.characterIds)) return null;
+    const seen = new Set<string>();
+    const characterIds: string[] = [];
+    for (const rawId of value.characterIds) {
+      const characterId = asTrimmedNonEmptyString(rawId);
+      if (!characterId) return null;
+      if (seen.has(characterId)) continue;
+      seen.add(characterId);
+      characterIds.push(characterId);
+    }
+    return characterIds.length >= 2 ? { mode: "restricted", characterIds } : null;
+  }
+  return null;
+}
+
+export function inspectConversationScopeReplay(rawGenerationReplay: unknown): ConversationScopeReplayInspection {
+  if (rawGenerationReplay === undefined || rawGenerationReplay === null) return { kind: "absent" };
+  if (!isPlainRecord(rawGenerationReplay)) return { kind: "invalid" };
+  if (!Object.prototype.hasOwnProperty.call(rawGenerationReplay, "conversationScope")) return { kind: "absent" };
+  const scope = normalizeConversationScopeReplay(rawGenerationReplay.conversationScope);
+  return scope ? { kind: "valid", scope } : { kind: "invalid" };
+}
+
+/**
+ * Keep only the two swipe-owned fields that are safe and necessary when a
+ * Conversation message is branched or round-tripped through JSONL. Prompt
+ * caches, provider metadata, and the rest of generationReplay stay local.
+ */
+export function extractPortableConversationSwipeExtra(rawExtra: unknown): Record<string, unknown> {
+  if (!isPlainRecord(rawExtra)) return {};
+
+  const portable: Record<string, unknown> = {};
+  const scopeInspection = inspectConversationScopeReplay(rawExtra.generationReplay);
+  if (scopeInspection.kind === "valid") {
+    portable.generationReplay = { conversationScope: scopeInspection.scope };
+  }
+
+  if (Object.prototype.hasOwnProperty.call(rawExtra, "swipeCharacterId")) {
+    if (rawExtra.swipeCharacterId === null) {
+      portable.swipeCharacterId = null;
+    } else {
+      const characterId = asTrimmedNonEmptyString(rawExtra.swipeCharacterId);
+      if (characterId) portable.swipeCharacterId = characterId;
+    }
+  }
+
+  return portable;
+}
+
 export function buildGenerationReplay(input: GenerationReplayInput): GenerationReplay | null {
   const replay: GenerationReplay = {};
+  const conversationScope = normalizeConversationScopeReplay(input.conversationScope);
+  if (conversationScope) replay.conversationScope = conversationScope;
+
   const guide = asNonEmptyString(input.generationGuide);
   const guideSource = asGuideSource(input.generationGuideSource);
 
@@ -83,6 +167,7 @@ export function normalizeGenerationReplay(value: unknown): GenerationReplay | nu
 
   const raw = value as Record<string, unknown>;
   return buildGenerationReplay({
+    conversationScope: raw.conversationScope,
     userMessage: asNonEmptyString(raw.userMessage),
     impersonate: raw.impersonate === true,
     generationGuide: asNonEmptyString(raw.generationGuide),

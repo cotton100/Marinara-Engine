@@ -6,7 +6,7 @@
 // so the character naturally "remembers" what's happening elsewhere.
 // ──────────────────────────────────────────────
 
-import { eq } from "../../db/file-query.js";
+import { eq, inArray } from "../../db/file-query.js";
 import type { DB } from "../../db/connection.js";
 import { chats, messages } from "../../db/schema/index.js";
 import { createCharactersStorage } from "../storage/characters.storage.js";
@@ -17,6 +17,7 @@ import {
   isSameZonedLogicalDay,
 } from "./timezone.js";
 import { escapeXmlText } from "../prompt/prompt-escaping.js";
+import { overlayActiveSwipesForMessages } from "../storage/message-swipe-authority.js";
 
 // ── Temporal keyword patterns ──
 // Maps regex patterns in the user's message to time windows to pull from.
@@ -53,7 +54,11 @@ function defaultWindow(now = new Date()): { start: Date; end: Date } {
  * Detect temporal keywords in a user message and return
  * all matching time windows (plus the default 1h window).
  */
-function detectTimeWindows(userMessage: string, now = new Date(), timeZone?: string): Array<{ start: Date; end: Date }> {
+function detectTimeWindows(
+  userMessage: string,
+  now = new Date(),
+  timeZone?: string,
+): Array<{ start: Date; end: Date }> {
   const windows: Array<{ start: Date; end: Date }> = [defaultWindow(now)];
   for (const { pattern, getWindow } of TEMPORAL_PATTERNS) {
     if (pattern.test(userMessage)) {
@@ -97,7 +102,8 @@ interface MessageRow {
   characterId: string | null;
   content: string;
   createdAt: string;
-  extra?: unknown;
+  extra: unknown;
+  activeSwipeIndex: number;
 }
 
 function parseMessageExtra(extra: unknown): Record<string, unknown> {
@@ -227,13 +233,9 @@ export async function buildAwarenessBlock(
     { chatName: string; members: string[]; userName: string; messages: MessageRow[] }
   >();
 
-  for (const chat of siblingChats) {
-    const charIds: string[] = JSON.parse(chat.characterIds);
-    const memberNames = charIds.map((id) => characterNames.get(id) ?? "Unknown");
-    const chatUserName = resolveChatPersonaName(chat);
-    memberNames.push(chatUserName);
-
-    const rows = (await db
+  const siblingChatIds = siblingChats.map((chat) => chat.id);
+  const resolvedRows = await db.transaction(async (tx) => {
+    const rows = (await tx
       .select({
         id: messages.id,
         chatId: messages.chatId,
@@ -242,10 +244,27 @@ export async function buildAwarenessBlock(
         content: messages.content,
         createdAt: messages.createdAt,
         extra: messages.extra,
+        activeSwipeIndex: messages.activeSwipeIndex,
       })
       .from(messages)
-      .where(eq(messages.chatId, chat.id))
+      .where(inArray(messages.chatId, siblingChatIds))
       .orderBy(messages.createdAt)) as MessageRow[];
+    return overlayActiveSwipesForMessages(tx, rows);
+  });
+  const rowsByChatId = new Map<string, MessageRow[]>();
+  for (const row of resolvedRows) {
+    const existing = rowsByChatId.get(row.chatId) ?? [];
+    existing.push(row);
+    rowsByChatId.set(row.chatId, existing);
+  }
+
+  for (const chat of siblingChats) {
+    const charIds: string[] = JSON.parse(chat.characterIds);
+    const memberNames = charIds.map((id) => characterNames.get(id) ?? "Unknown");
+    const chatUserName = resolveChatPersonaName(chat);
+    memberNames.push(chatUserName);
+
+    const rows = rowsByChatId.get(chat.id) ?? [];
     const filteredRows = rows.filter((row) => !isMessageHiddenFromAI(row) && isWithinRequestedWindow(row.createdAt));
 
     if (filteredRows.length > 0) {

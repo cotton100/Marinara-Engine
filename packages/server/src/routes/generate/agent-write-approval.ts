@@ -1,4 +1,6 @@
 import type { AgentWriteApprovalEnvelope, AgentWriteApprovalProposal } from "@marinara-engine/shared";
+import type { LorebookAccessContext } from "../../services/lorebook/access-context.js";
+import type { LorebookPromptContext } from "../../services/lorebook/keyword-scanner.js";
 import { mergeLorebookKeeperUpdateContent } from "./lorebook-keeper-utils.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -172,7 +174,30 @@ export function buildLorebookWriteApprovalProposal(args: {
   preferredTargetLorebookId: string | null;
   writableLorebookIds: string[] | null;
   existingEntries?: Array<{ name?: string | null; content?: string | null }>;
+  lorebookPromptContext?: LorebookPromptContext;
+  newEntryCharacterFilterIds?: string[];
+  accessContext?: LorebookAccessContext;
+  allowCreateTarget?: boolean;
 }): AgentWriteApprovalProposal {
+  const lorebookPromptContext = args.lorebookPromptContext
+    ? {
+        activeCharacterIds: [...args.lorebookPromptContext.activeCharacterIds],
+        activeCharacterTags: [...args.lorebookPromptContext.activeCharacterTags],
+        generationTriggers: [...args.lorebookPromptContext.generationTriggers],
+      }
+    : undefined;
+  const accessContext = args.accessContext
+    ? {
+        ...args.accessContext,
+        activeCharacterIds: [...args.accessContext.activeCharacterIds],
+        activeCharacterTags: [...args.accessContext.activeCharacterTags],
+        generationTriggers: [...args.accessContext.generationTriggers],
+        characterIds: [...args.accessContext.characterIds],
+        activeLorebookIds: [...args.accessContext.activeLorebookIds],
+        excludedLorebookIds: [...args.accessContext.excludedLorebookIds],
+        excludedSourceAgentIds: [...args.accessContext.excludedSourceAgentIds],
+      }
+    : undefined;
   return {
     kind: "lorebook_update",
     chatId: args.chatId,
@@ -184,6 +209,10 @@ export function buildLorebookWriteApprovalProposal(args: {
       preferredTargetLorebookId: args.preferredTargetLorebookId,
       writableLorebookIds: args.writableLorebookIds,
       updates: args.updates,
+      ...(lorebookPromptContext ? { lorebookPromptContext } : {}),
+      ...(args.newEntryCharacterFilterIds ? { newEntryCharacterFilterIds: [...args.newEntryCharacterFilterIds] } : {}),
+      ...(accessContext ? { accessContext } : {}),
+      ...(args.allowCreateTarget !== undefined ? { allowCreateTarget: args.allowCreateTarget } : {}),
     },
     canRegenerate: !!args.agentType,
     createdAt: new Date().toISOString(),

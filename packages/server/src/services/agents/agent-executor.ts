@@ -178,7 +178,12 @@ export function buildAgentPromptMacroContext(
   options: { escapeValues?: boolean } = {},
 ): MacroContext {
   const characters = context.characters.map((character) => character.name.trim()).filter(Boolean);
-  const firstCharacter = context.characters[0] ?? null;
+  const primaryCharacter =
+    (context.primaryCharacterId
+      ? context.characters.find((character) => character.id === context.primaryCharacterId)
+      : undefined) ??
+    context.characters[0] ??
+    null;
   const latestUserMessage = findLatestUserMessage(context);
   const value = (entry: string | null | undefined) => renderAgentMacroValue(entry, options);
 
@@ -200,16 +205,16 @@ export function buildAgentPromptMacroContext(
       systemPrompt: value(character.systemPrompt),
       postHistoryInstructions: value(character.postHistoryInstructions),
     })),
-    characterFields: firstCharacter
+    characterFields: primaryCharacter
       ? {
-          description: value(firstCharacter.description),
-          personality: value(firstCharacter.personality),
-          backstory: value(firstCharacter.backstory),
-          appearance: value(firstCharacter.appearance),
-          scenario: value(firstCharacter.scenario),
-          example: value(firstCharacter.mesExample),
-          systemPrompt: value(firstCharacter.systemPrompt),
-          postHistoryInstructions: value(firstCharacter.postHistoryInstructions),
+          description: value(primaryCharacter.description),
+          personality: value(primaryCharacter.personality),
+          backstory: value(primaryCharacter.backstory),
+          appearance: value(primaryCharacter.appearance),
+          scenario: value(primaryCharacter.scenario),
+          example: value(primaryCharacter.mesExample),
+          systemPrompt: value(primaryCharacter.systemPrompt),
+          postHistoryInstructions: value(primaryCharacter.postHistoryInstructions),
         }
       : undefined,
     personaFields: context.persona
@@ -347,7 +352,9 @@ export function compactGameStateForAgentContext(gameState: unknown, agentTypes: 
   const presentCharacters = compactPresentCharactersForHiddenFields(gameState.presentCharacters, hiddenFields);
   const playerStats = compactQuestPlayerStatsForContext(gameState.playerStats, agentTypes);
   const visibleFieldLocks = omitHiddenFieldLocksForContext(gameState.fieldLocks, hiddenFields);
-  const fieldLocks = shouldIncludeQuestContext(agentTypes) ? visibleFieldLocks : omitQuestFieldLocksForContext(visibleFieldLocks);
+  const fieldLocks = shouldIncludeQuestContext(agentTypes)
+    ? visibleFieldLocks
+    : omitQuestFieldLocksForContext(visibleFieldLocks);
 
   if (
     presentCharacters === gameState.presentCharacters &&
@@ -1093,7 +1100,10 @@ export async function executeAgentBatch(
             responseText += chunk;
           }
         : undefined,
-      signal: agentCallSignal(context.signal, configs.some((config) => config.type === "illustrator") ? "illustrator" : undefined),
+      signal: agentCallSignal(
+        context.signal,
+        configs.some((config) => config.type === "illustrator") ? "illustrator" : undefined,
+      ),
     });
 
     // chatComplete also accumulates content, but streaming via onToken is
@@ -1975,7 +1985,9 @@ function buildCommittedTrackerStateContext(
   contextAgentTypes: string[],
   options: { includeMessageIds?: boolean },
 ): string | null {
-  const gs = msg.gameState ? (compactGameStateForAgentContext(msg.gameState, contextAgentTypes) as typeof msg.gameState) : null;
+  const gs = msg.gameState
+    ? (compactGameStateForAgentContext(msg.gameState, contextAgentTypes) as typeof msg.gameState)
+    : null;
   if (!gs) return null;
 
   const trackerSummary: Record<string, unknown> = {};
@@ -2157,7 +2169,9 @@ function buildLoreBlock(context: AgentContext): string {
       if (char.rpgStats?.enabled) {
         const pools = normalizeRpgStatPools(char.rpgStats);
         if (pools.length > 0) {
-          parts.push(`Configured RPG pools: ${pools.map((pool) => `${pool.name}: ${pool.value}/${pool.max}`).join(", ")}`);
+          parts.push(
+            `Configured RPG pools: ${pools.map((pool) => `${pool.name}: ${pool.value}/${pool.max}`).join(", ")}`,
+          );
         }
         if (Array.isArray(char.rpgStats.attributes) && char.rpgStats.attributes.length > 0) {
           parts.push(

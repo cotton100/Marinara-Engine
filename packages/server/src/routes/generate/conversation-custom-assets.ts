@@ -174,6 +174,8 @@ export function uniqueEmojiNames(names: Array<string | null | undefined>): strin
 export async function appendConversationCustomAssetAdvertisements(args: {
   chatMode: string;
   mentionedCharacterNames: string[] | undefined;
+  /** Stable, preflight-validated responders. Null keeps legacy name/target behavior. */
+  scopedCharacterIds?: readonly string[] | null;
   promptTargetCharacterId: string | null | undefined;
   charInfo: ConversationAssetCharacter[];
   personaId: string | null | undefined;
@@ -201,17 +203,24 @@ export async function appendConversationCustomAssetAdvertisements(args: {
       .map((name: string) => normalizeTextForMatch(name))
       .filter((name: string) => name.length > 0),
   );
-  const scopedResponders = args.promptTargetCharacterId
-    ? args.charInfo.filter((character) => character.id === args.promptTargetCharacterId)
-    : mentionedNames.size > 0
-      ? args.charInfo.filter((character) => mentionedNames.has(normalizeTextForMatch(character.name)))
+  const hasStableScope = Array.isArray(args.scopedCharacterIds);
+  const stableScopeIds = new Set(hasStableScope ? args.scopedCharacterIds : []);
+  const scopedResponders = hasStableScope
+    ? args.charInfo.filter((character) => stableScopeIds.has(character.id))
+    : args.promptTargetCharacterId
+      ? args.charInfo.filter((character) => character.id === args.promptTargetCharacterId)
+      : mentionedNames.size > 0
+        ? args.charInfo.filter((character) => mentionedNames.has(normalizeTextForMatch(character.name)))
+        : args.charInfo;
+  const effectiveResponders = hasStableScope
+    ? scopedResponders
+    : scopedResponders.length > 0
+      ? scopedResponders
       : args.charInfo;
-  const respondingConversationChars = (scopedResponders.length > 0 ? scopedResponders : args.charInfo).map(
-    (character) => ({
-      charId: character.id,
-      name: character.name,
-    }),
-  );
+  const respondingConversationChars = effectiveResponders.map((character) => ({
+    charId: character.id,
+    name: character.name,
+  }));
 
   const [globalEmojiRows, globalStickerRows, personaAssetRows] = await Promise.all([
     args.customEmojisStore.list(),

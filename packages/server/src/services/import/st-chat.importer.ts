@@ -11,6 +11,7 @@ import {
   parseTrustedTimestamp,
   type TimestampOverrides,
 } from "./import-timestamps.js";
+import { extractPortableConversationSwipeExtra } from "../../routes/generate/generation-replay.js";
 
 interface STChatHeader {
   user_name?: string;
@@ -170,11 +171,13 @@ const INTERNAL_EXTRA_KEYS = new Set([
   "generationInfo",
   "generationReplay",
   "lorebookScan",
+  "swipeCharacterId",
 ]);
 
-function normalizeImportedExtra(raw: unknown): Record<string, unknown> {
+function normalizeImportedExtra(raw: unknown, allowedCharacterIds?: ReadonlySet<string>): Record<string, unknown> {
   if (!isRecord(raw)) return {};
 
+  const portable = extractPortableConversationSwipeExtra(raw);
   const extra = { ...raw };
   const displayText = typeof extra.display_text === "string" ? extra.display_text : null;
   delete extra.display_text;
@@ -187,6 +190,14 @@ function normalizeImportedExtra(raw: unknown): Record<string, unknown> {
 
   if (typeof extra.displayText !== "string" && displayText) {
     extra.displayText = displayText;
+  }
+
+  if (portable.generationReplay) extra.generationReplay = portable.generationReplay;
+  if (
+    portable.swipeCharacterId === null ||
+    (typeof portable.swipeCharacterId === "string" && allowedCharacterIds?.has(portable.swipeCharacterId))
+  ) {
+    extra.swipeCharacterId = portable.swipeCharacterId;
   }
 
   return extra;
@@ -209,7 +220,10 @@ function normalizeSwipeIndex(raw: unknown, swipeCount: number): number {
   return numeric;
 }
 
-function normalizeMarinaraSwipeMetadata(extra: STChatMessageExtra | undefined) {
+function normalizeMarinaraSwipeMetadata(
+  extra: STChatMessageExtra | undefined,
+  allowedCharacterIds: ReadonlySet<string>,
+) {
   const rawSwipes = Array.isArray(extra?.marinara_swipes) ? extra.marinara_swipes : [];
   const byIndex = new Map<
     number,
@@ -231,7 +245,7 @@ function normalizeMarinaraSwipeMetadata(extra: STChatMessageExtra | undefined) {
           : undefined,
     );
     byIndex.set(index, {
-      extra: normalizeImportedExtra(rawSwipe.extra),
+      extra: normalizeImportedExtra(rawSwipe.extra, allowedCharacterIds),
       createdAt,
     });
   }
@@ -310,6 +324,7 @@ export async function importSTChat(jsonlContent: string, db: DB, opts?: ImportST
       if (cid && !characterIds.includes(cid)) characterIds.push(cid);
     }
   }
+  const allowedImportedCharacterIds = new Set(characterIds);
 
   const messageTimestamps: string[] = [];
   const parsedMsgInputs: ParsedSTChatMessageInput[] = [];
@@ -324,7 +339,7 @@ export async function importSTChat(jsonlContent: string, db: DB, opts?: ImportST
         normalizeImportedRole(stMsg.extra?.type) ??
         (stMsg.is_user ? "user" : stMsg.is_system ? "system" : "assistant");
       const rawContent = typeof stMsg.mes === "string" ? stMsg.mes : "";
-      const messageExtra = normalizeImportedExtra(stMsg.extra);
+      const messageExtra = normalizeImportedExtra(stMsg.extra, allowedImportedCharacterIds);
       const exportedThinking =
         normalizeImportedThinking(stMsg.thinking) ??
         normalizeImportedThinking(stMsg.reasoning) ??
@@ -340,12 +355,12 @@ export async function importSTChat(jsonlContent: string, db: DB, opts?: ImportST
       // edit, so prefer `mes` for the active swipe while preserving alternates.
       swipeContents[activeSwipeIndex] = rawContent;
       const content = swipeContents[activeSwipeIndex] ?? rawContent;
-      const swipeMetadata = normalizeMarinaraSwipeMetadata(stMsg.extra);
+      const swipeMetadata = normalizeMarinaraSwipeMetadata(stMsg.extra, allowedImportedCharacterIds);
       const swipes = swipeContents.map((swipeContent, index) => {
         const storedSwipe = swipeMetadata.get(index);
         const swipeExtra =
           index === activeSwipeIndex
-            ? { ...(storedSwipe?.extra ?? {}), ...(storedMessageExtra ?? {}) }
+            ? { ...(storedMessageExtra ?? {}), ...(storedSwipe?.extra ?? {}) }
             : (storedSwipe?.extra ?? {});
         return {
           index,
@@ -358,17 +373,28 @@ export async function importSTChat(jsonlContent: string, db: DB, opts?: ImportST
       // Resolve character ID for this message
       let messageCharacterId: string | null = null;
       if (role === "assistant") {
-        const exportedCharacterId =
+        const rawExportedCharacterId =
           typeof stMsg.character_id === "string"
             ? stMsg.character_id
             : typeof stMsg.extra?.marinara_character_id === "string"
               ? stMsg.extra.marinara_character_id
               : null;
+        const exportedCharacterId =
+          rawExportedCharacterId && allowedImportedCharacterIds.has(rawExportedCharacterId)
+            ? rawExportedCharacterId
+            : null;
         if (opts?.speakerMap && stMsg.name) {
           // Group chat: look up speaker
           messageCharacterId = exportedCharacterId ?? opts.speakerMap[stMsg.name] ?? opts?.characterId ?? null;
         } else {
           messageCharacterId = exportedCharacterId ?? opts?.characterId ?? null;
+        }
+        const activeSwipeCharacterId = swipes[activeSwipeIndex]?.extra?.swipeCharacterId;
+        if (
+          activeSwipeCharacterId === null ||
+          (typeof activeSwipeCharacterId === "string" && allowedImportedCharacterIds.has(activeSwipeCharacterId))
+        ) {
+          messageCharacterId = activeSwipeCharacterId;
         }
       }
 

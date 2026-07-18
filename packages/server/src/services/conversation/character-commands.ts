@@ -40,7 +40,12 @@
 // - [navigate: panel="...", tab="..."]
 // - [fetch: type="character|persona|lorebook|chat|preset", name="..."]
 
-import { normalizeTextForMatch, stripLeadingMessageTimestamps } from "@marinara-engine/shared";
+import {
+  decodeEncodedSpeakerTags,
+  normalizeTextForMatch,
+  parseSpeakerTags,
+  stripLeadingMessageTimestamps,
+} from "@marinara-engine/shared";
 
 import { stripConversationPromptTimestamps } from "./transcript-sanitize.js";
 import {
@@ -1011,8 +1016,7 @@ function parseCreatePresetBlock(raw: string): CreatePresetCommand | null {
             data.displayMode === "auto" || data.displayMode === "buttons" || data.displayMode === "listbox"
               ? data.displayMode
               : undefined,
-          optionSort:
-            data.optionSort === "manual" || data.optionSort === "alphabetical" ? data.optionSort : undefined,
+          optionSort: data.optionSort === "manual" || data.optionSort === "alphabetical" ? data.optionSort : undefined,
         };
       })
       .filter((choiceBlock): choiceBlock is CreatePresetChoiceBlockCommand => choiceBlock !== null);
@@ -1429,19 +1433,23 @@ export function parseCharacterCommands(content: string): {
     .replace(FETCH_RE, "")
     .replace(/\n{3,}/g, "\n\n") // collapse excessive newlines left by removals
     .trim();
-  cleanContent = stripBracketJsonCommandBlocks(cleanContent, "suggestions").replace(/\n{3,}/g, "\n\n").trim();
-  cleanContent = stripBracketJsonCommandBlocks(cleanContent, "plan").replace(/\n{3,}/g, "\n\n").trim();
+  cleanContent = stripBracketJsonCommandBlocks(cleanContent, "suggestions")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  cleanContent = stripBracketJsonCommandBlocks(cleanContent, "plan")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
   return { cleanContent, commands };
 }
 
 /**
  * Parse character commands from a merged group response, attributing each command
- * to the character whose `Name:` line-prefixed segment it appears in.
+ * to the character whose `<speaker="Name">` or `Name:` segment it appears in.
  *
  * Conversation-mode group chats use "merged" generation: a single response carries
- * multiple characters' turns, each introduced by a `CharacterName: ` line prefix
- * (the same format the client splits on for display — see parseNamePrefixFormat).
+ * multiple characters' turns, using the same tagged or line-prefixed formats
+ * that the client splits for display.
  * The base parseCharacterCommands() attributes every command to one character, so a
  * command emitted by, say, the third character (e.g. `[selfie]`) is wrongly executed
  * for the first. This segments the response the same way and matches each parsed
@@ -1449,8 +1457,10 @@ export function parseCharacterCommands(content: string): {
  *
  * The authoritative command list and cleaned content come from a single whole-response
  * parse, so no command is dropped or reordered even if one spans a name boundary;
- * only the attribution is layered on. Commands with no matching segment fall back
- * to `fallbackCharacterId`. Text ABOVE the first recognised name prefix is credited
+ * only the attribution is layered on. Commands with no speaker prefix fall back
+ * to `fallbackCharacterId`; commands under an unknown or ambiguous speaker prefix
+ * receive null attribution so callers can fail closed. Text ABOVE the first
+ * recognised name prefix is credited
  * to the first named section's speaker (models park reply-opening commands like a
  * `[react:]` header there, and crediting the generation-primary character instead
  * deterministically mis-attributed every such command to the chat's first
@@ -1458,15 +1468,29 @@ export function parseCharacterCommands(content: string): {
  */
 export function parseCharacterCommandsBySpeaker(
   content: string,
-  knownCharacters: ReadonlyArray<{ id: string; name: string }>,
+  knownCharacters: ReadonlyArray<{ id: string; name: string; aliases?: readonly string[] }>,
   fallbackCharacterId: string | null,
-): { commands: CharacterCommand[]; commandCharacterIds: (string | null)[]; cleanContent: string } {
+): {
+  commands: CharacterCommand[];
+  commandCharacterIds: (string | null)[];
+  cleanContent: string;
+  hasExplicitSpeakerStructure: boolean;
+} {
   const base = parseCharacterCommands(content);
 
-  const nameToId = new Map<string, string>();
+  const nameClaims = new Map<string, Set<string>>();
   for (const character of knownCharacters) {
-    const key = normalizeTextForMatch(character.name);
-    if (key && !nameToId.has(key)) nameToId.set(key, character.id);
+    for (const candidate of [character.name, ...(character.aliases ?? [])]) {
+      const key = normalizeTextForMatch(candidate);
+      if (!key) continue;
+      const claims = nameClaims.get(key) ?? new Set<string>();
+      claims.add(character.id);
+      nameClaims.set(key, claims);
+    }
+  }
+  const nameToId = new Map<string, string | null>();
+  for (const [key, claims] of nameClaims) {
+    nameToId.set(key, claims.size === 1 ? ([...claims][0] ?? null) : null);
   }
 
   // Segment the response by leading "Name: " line prefixes, mirroring the client's
@@ -1478,41 +1502,123 @@ export function parseCharacterCommandsBySpeaker(
   // parse above, and the strip never touches [command:] tokens.)
   const attributionContent = stripLeadingMessageTimestamps(content);
   const segments: Array<{ characterId: string | null; text: string; leading?: boolean }> = [];
-  let currentId: string | null = fallbackCharacterId;
-  let inLeadingRegion = true;
-  let currentLines: string[] = [];
-  const flush = () => {
-    if (currentLines.length > 0) {
+  const taggedSegments = parseSpeakerTags(attributionContent, new Set(nameToId.keys()));
+  const hasSpeakerTagLikeOpener = /<\s*speaker\b/i.test(decodeEncodedSpeakerTags(attributionContent));
+  let hasExplicitSpeakerStructure = taggedSegments !== null || hasSpeakerTagLikeOpener;
+  if (taggedSegments) {
+    for (const segment of taggedSegments) {
       segments.push({
-        characterId: currentId,
-        text: currentLines.join("\n"),
-        ...(inLeadingRegion ? { leading: true } : {}),
+        characterId: segment.speaker ? (nameToId.get(normalizeTextForMatch(segment.speaker)) ?? null) : null,
+        text: segment.text,
       });
     }
-    currentLines = [];
-  };
-  for (const line of attributionContent.split("\n")) {
-    const colonIdx = line.indexOf(": ");
-    if (colonIdx > 0) {
-      const mappedId = nameToId.get(normalizeTextForMatch(line.slice(0, colonIdx)));
-      if (mappedId) {
-        flush();
-        inLeadingRegion = false;
-        currentId = mappedId;
-        currentLines = [line.slice(colonIdx + 2)];
-        continue;
+  } else if (hasSpeakerTagLikeOpener) {
+    // A model-emitted speaker opener without a complete matching tag is still an
+    // explicit attribution attempt. Treat all commands in it as unattributed;
+    // falling back to the generation envelope could execute another speaker's
+    // character-scoped effect as the focused character.
+    segments.push({ characterId: null, text: attributionContent });
+  } else {
+    let currentId: string | null = fallbackCharacterId;
+    let inLeadingRegion = true;
+    let currentLines: string[] = [];
+    const flush = () => {
+      if (currentLines.length > 0) {
+        segments.push({
+          characterId: currentId,
+          text: currentLines.join("\n"),
+          ...(inLeadingRegion ? { leading: true } : {}),
+        });
       }
-    }
-    currentLines.push(line);
-  }
-  flush();
+      currentLines = [];
+    };
+    const nonSpeakerFieldLabels = new Set(
+      [
+        "mood",
+        "status",
+        "time",
+        "date",
+        "location",
+        "scene",
+        "weather",
+        "action",
+        "thought",
+        "thoughts",
+        "emotion",
+        "expression",
+        "outfit",
+        "appearance",
+        "분위기",
+        "상태",
+        "시간",
+        "날짜",
+        "장소",
+        "장면",
+        "행동",
+        "생각",
+        "감정",
+        "표정",
+        "복장",
+        "날씨",
+      ].map(normalizeTextForMatch),
+    );
+    const lines = attributionContent.split("\n");
+    const prefixByLine = lines.map((line) => {
+      const colonIdx = line.indexOf(": ");
+      if (colonIdx <= 0) return null;
+      const rawPrefix = line.slice(0, colonIdx).trim();
+      const prefixKey = normalizeTextForMatch(rawPrefix);
+      const isKnownPrefix = nameToId.has(prefixKey);
+      const isUnknownCandidate =
+        rawPrefix.length > 0 &&
+        rawPrefix.length <= 120 &&
+        !rawPrefix.startsWith("[") &&
+        !rawPrefix.startsWith("<") &&
+        !nonSpeakerFieldLabels.has(prefixKey);
+      return {
+        prefixKey,
+        prefixedText: line.slice(colonIdx + 2),
+        isKnownPrefix,
+        isUnknownCandidate,
+      };
+    });
 
-  // Credit the leading region (above the first name prefix) to the speaker whose
-  // section it opens, not the generation-primary character.
-  const firstNamed = segments.find((segment) => !segment.leading);
-  if (firstNamed) {
-    for (const segment of segments) {
-      if (segment.leading) segment.characterId = firstNamed.characterId;
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      const line = lines[lineIndex]!;
+      const prefix = prefixByLine[lineIndex];
+      if (prefix) {
+        let isUnknownSpeakerLikePrefix = false;
+        if (!prefix.isKnownPrefix && prefix.isUnknownCandidate) {
+          const candidateBlock = [prefix.prefixedText];
+          for (let nextIndex = lineIndex + 1; nextIndex < lines.length; nextIndex++) {
+            const nextPrefix = prefixByLine[nextIndex];
+            if (nextPrefix?.isKnownPrefix || nextPrefix?.isUnknownCandidate) break;
+            candidateBlock.push(lines[nextIndex]!);
+          }
+          isUnknownSpeakerLikePrefix = parseCharacterCommands(candidateBlock.join("\n")).commands.length > 0;
+        }
+
+        if (prefix.isKnownPrefix || isUnknownSpeakerLikePrefix) {
+          hasExplicitSpeakerStructure = true;
+          const mappedId = prefix.isKnownPrefix ? (nameToId.get(prefix.prefixKey) ?? null) : null;
+          flush();
+          inLeadingRegion = false;
+          currentId = mappedId;
+          currentLines = [prefix.prefixedText];
+          continue;
+        }
+      }
+      currentLines.push(line);
+    }
+    flush();
+
+    // Credit the leading region (above the first name prefix) to the speaker whose
+    // section it opens, not the generation-primary character.
+    const firstNamed = segments.find((segment) => !segment.leading);
+    if (firstNamed) {
+      for (const segment of segments) {
+        if (segment.leading) segment.characterId = firstNamed.characterId;
+      }
     }
   }
 
@@ -1531,10 +1637,15 @@ export function parseCharacterCommandsBySpeaker(
   const commandCharacterIds = base.commands.map((command) => {
     const queue = attributionQueue.get(JSON.stringify(command));
     const matched = queue?.shift();
-    return matched === undefined ? fallbackCharacterId : matched;
+    return matched === undefined ? (hasExplicitSpeakerStructure ? null : fallbackCharacterId) : matched;
   });
 
-  return { commands: base.commands, commandCharacterIds, cleanContent: base.cleanContent };
+  return {
+    commands: base.commands,
+    commandCharacterIds,
+    cleanContent: base.cleanContent,
+    hasExplicitSpeakerStructure,
+  };
 }
 
 /** Parse Roleplay-only direct-message commands without enabling the wider Conversation command set. */

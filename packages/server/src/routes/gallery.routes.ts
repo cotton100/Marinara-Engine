@@ -446,7 +446,7 @@ export async function galleryRoutes(app: FastifyInstance) {
     const personaIds = new Set<string>();
     if (chat.personaId) personaIds.add(chat.personaId);
 
-    const messages = await chats.listMessages(chat.id);
+    const messages = await chats.listMessagesWithActiveSwipes(chat.id);
     for (const message of messages) {
       if (typeof message.characterId === "string" && message.characterId.trim()) {
         characterIds.add(message.characterId);
@@ -532,7 +532,7 @@ export async function galleryRoutes(app: FastifyInstance) {
       Math.max(videoRuntime.minDurationSeconds, Math.trunc(input.durationSeconds ?? fallbackDurationSeconds)),
     );
     const aspectRatio = input.aspectRatio ?? videoRuntime.activeDefaults.aspectRatio;
-    const messages = await chats.listMessages(input.chatId);
+    const messages = await chats.listMessagesWithActiveSwipes(input.chatId);
     const characterNames = await collectChatSceneCharacterNames(chat);
     const promptDraft = await loadGameVideoPrompt({
       promptOverridesStorage,

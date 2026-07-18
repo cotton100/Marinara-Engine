@@ -28,6 +28,9 @@ import {
 import { LOCAL_SIDECAR_MODEL } from "../../services/llm/local-sidecar.js";
 import { sidecarModelService } from "../../services/sidecar/sidecar-model.service.js";
 import { wrapContent } from "../../services/prompt/format-engine.js";
+import type { ConversationScopeReplayInspection } from "./generation-replay.js";
+
+export type { ConversationScopeReplay, ConversationScopeReplayInspection } from "./generation-replay.js";
 
 export type SimpleMessage = {
   role: "system" | "user" | "assistant";
@@ -924,6 +927,158 @@ export function resolveActiveCharacterIds(
   return characterIds;
 }
 
+export function resolveNonConversationLifecycleCharacterFallback(input: {
+  chatMode: string | null | undefined;
+  explicitTargetCharacterId?: string | null;
+  attributedCharacterId?: string | null;
+}): string | null {
+  if (input.explicitTargetCharacterId) return input.explicitTargetCharacterId;
+  if (input.chatMode === "conversation") return null;
+  return input.attributedCharacterId || null;
+}
+
+export type ConversationScopeLifecycle = "initial" | "regenerate" | "continue";
+
+export type ConversationScopeErrorCode =
+  | "invalid_explicit_target"
+  | "invalid_mention"
+  | "ambiguous_mention"
+  | "conflicting_scope"
+  | "invalid_replay"
+  | "stale_replay_scope"
+  | "lifecycle_retarget_forbidden";
+
+export type ConversationScopeResolution =
+  | { kind: "not_applicable" }
+  | { kind: "merged"; mentionedCharacterIds: string[] }
+  | {
+      kind: "focused";
+      targetCharacterId: string;
+      source: "explicit" | "mention" | "replay";
+    }
+  | {
+      kind: "restricted";
+      allowedCharacterIds: string[];
+      source: "mentions" | "replay";
+    }
+  | { kind: "invalid"; code: ConversationScopeErrorCode };
+
+export type ConversationScopeResolverInput = {
+  chatMode: string | null | undefined;
+  isGroupChat: boolean;
+  impersonate: boolean;
+  activeCharacters: ReadonlyArray<{ id: string; name: string }>;
+  lifecycle: ConversationScopeLifecycle;
+  explicitTargetCharacterId?: string | null;
+  mentionedCharacterNames: readonly string[];
+  replay: ConversationScopeReplayInspection;
+};
+
+function invalidConversationScope(code: ConversationScopeErrorCode): ConversationScopeResolution {
+  return { kind: "invalid", code };
+}
+
+function canonicalizeCharacterIds(activeIds: readonly string[], ids: ReadonlySet<string>): string[] {
+  return activeIds.filter((id) => ids.has(id));
+}
+
+function haveSameCharacterIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((id, index) => id === right[index]);
+}
+
+/**
+ * Resolve one authoritative response scope for a Conversation group.
+ *
+ * Display names are accepted only as request-time lookup keys. Stable character
+ * IDs remain authoritative, duplicate normalized names are ambiguous, and a
+ * lifecycle replay can be restored but never retargeted or widened.
+ */
+export function resolveConversationScope(input: ConversationScopeResolverInput): ConversationScopeResolution {
+  if (input.chatMode !== "conversation" || !input.isGroupChat || input.impersonate) {
+    return { kind: "not_applicable" };
+  }
+
+  const activeIds = Array.from(
+    new Set(input.activeCharacters.map((character) => character.id).filter((id) => id.length > 0)),
+  );
+  const activeIdSet = new Set(activeIds);
+  const normalizedNameToIds = new Map<string, Set<string>>();
+  for (const character of input.activeCharacters) {
+    if (!activeIdSet.has(character.id)) continue;
+    const normalizedName = normalizeTextForMatch(character.name);
+    if (!normalizedName) continue;
+    const ids = normalizedNameToIds.get(normalizedName) ?? new Set<string>();
+    ids.add(character.id);
+    normalizedNameToIds.set(normalizedName, ids);
+  }
+
+  const explicitTargetProvided =
+    input.explicitTargetCharacterId !== undefined && input.explicitTargetCharacterId !== null;
+  const explicitTargetId = explicitTargetProvided ? input.explicitTargetCharacterId! : null;
+  if (explicitTargetProvided && !activeIdSet.has(explicitTargetId!)) {
+    return invalidConversationScope("invalid_explicit_target");
+  }
+
+  const resolvedMentionIds: string[] = [];
+  for (const mentionedName of input.mentionedCharacterNames) {
+    const normalizedName = normalizeTextForMatch(mentionedName);
+    if (!normalizedName) return invalidConversationScope("invalid_mention");
+    const matchingIds = normalizedNameToIds.get(normalizedName);
+    if (!matchingIds?.size) return invalidConversationScope("invalid_mention");
+    if (matchingIds.size !== 1) return invalidConversationScope("ambiguous_mention");
+    resolvedMentionIds.push(matchingIds.values().next().value!);
+  }
+  const canonicalMentionIds = canonicalizeCharacterIds(activeIds, new Set(resolvedMentionIds));
+
+  if (input.lifecycle === "initial") {
+    if (input.replay.kind !== "absent") return invalidConversationScope("invalid_replay");
+    if (explicitTargetId) {
+      if (canonicalMentionIds.some((id) => id !== explicitTargetId)) {
+        return invalidConversationScope("conflicting_scope");
+      }
+      return { kind: "focused", targetCharacterId: explicitTargetId, source: "explicit" };
+    }
+    if (canonicalMentionIds.length === 0) return { kind: "merged", mentionedCharacterIds: [] };
+    if (canonicalMentionIds.length === 1) {
+      return { kind: "focused", targetCharacterId: canonicalMentionIds[0]!, source: "mention" };
+    }
+    return { kind: "restricted", allowedCharacterIds: canonicalMentionIds, source: "mentions" };
+  }
+
+  if (input.replay.kind === "invalid") return invalidConversationScope("invalid_replay");
+  if (activeIds.length === 0) return invalidConversationScope("stale_replay_scope");
+  const requestedNewScope = explicitTargetProvided || input.mentionedCharacterNames.length > 0;
+  if (input.replay.kind === "absent" || input.replay.scope.mode === "merged") {
+    if (requestedNewScope) return invalidConversationScope("lifecycle_retarget_forbidden");
+    return { kind: "merged", mentionedCharacterIds: [] };
+  }
+
+  if (input.replay.scope.mode === "focused") {
+    const replayTargetId = input.replay.scope.characterId;
+    if (!activeIdSet.has(replayTargetId)) return invalidConversationScope("stale_replay_scope");
+    if (explicitTargetProvided && explicitTargetId !== replayTargetId) {
+      return invalidConversationScope("conflicting_scope");
+    }
+    if (canonicalMentionIds.some((id) => id !== replayTargetId)) {
+      return invalidConversationScope("conflicting_scope");
+    }
+    return { kind: "focused", targetCharacterId: replayTargetId, source: "replay" };
+  }
+
+  const replayIdSet = new Set(input.replay.scope.characterIds);
+  if (replayIdSet.size < 2 || Array.from(replayIdSet).some((id) => !id || !activeIdSet.has(id))) {
+    return replayIdSet.size < 2
+      ? invalidConversationScope("invalid_replay")
+      : invalidConversationScope("stale_replay_scope");
+  }
+  const canonicalReplayIds = canonicalizeCharacterIds(activeIds, replayIdSet);
+  if (explicitTargetProvided) return invalidConversationScope("conflicting_scope");
+  if (canonicalMentionIds.length > 0 && !haveSameCharacterIds(canonicalMentionIds, canonicalReplayIds)) {
+    return invalidConversationScope("conflicting_scope");
+  }
+  return { kind: "restricted", allowedCharacterIds: canonicalReplayIds, source: "replay" };
+}
+
 export type GroupGenerationMode = "merged" | "individual";
 
 /**
@@ -966,11 +1121,7 @@ export function resolveVisibleGameStateAnchor(
     const message = messages[index]!;
     const markedSystemAnchor =
       message.role === "system" && parseExtra(message.extra).gameStateAnchor === "checkpoint_restore";
-    if (
-      (message.role !== "assistant" && !markedSystemAnchor) ||
-      typeof message.id !== "string" ||
-      !message.id
-    ) {
+    if ((message.role !== "assistant" && !markedSystemAnchor) || typeof message.id !== "string" || !message.id) {
       continue;
     }
     const swipeIndex =

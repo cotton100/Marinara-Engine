@@ -612,7 +612,7 @@ export async function encounterRoutes(app: FastifyInstance) {
       const spellbookCtx = await loadSpellbookContext(spellbookId);
 
       // Get recent chat messages for history
-      const chatMessages = await chats.listMessages(chatId);
+      const chatMessages = await chats.listMessagesWithActiveSwipes(chatId);
       const depth = settings.historyDepth || 8;
       const recentMsgs: ChatMessage[] = chatMessages.slice(-depth).map((m: any) => ({
         role: (m.role === "narrator" ? "system" : m.role) as "user" | "assistant" | "system",
@@ -706,7 +706,7 @@ export async function encounterRoutes(app: FastifyInstance) {
       const { personaName, personaCtx } = await buildPersonaContext(chars, chat.personaId ?? null, chat.mode);
       const spellbookCtx = await loadSpellbookContext(spellbookId);
 
-      const chatMessages = await chats.listMessages(chatId);
+      const chatMessages = await chats.listMessagesWithActiveSwipes(chatId);
       const depth = settings.historyDepth || 8;
       const recentMsgs: ChatMessage[] = chatMessages.slice(-depth).map((m: any) => ({
         role: (m.role === "narrator" ? "system" : m.role) as "user" | "assistant" | "system",

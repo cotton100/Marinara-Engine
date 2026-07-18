@@ -311,6 +311,22 @@ function normalizeFilterValue(value: string) {
   return value.trim().toLowerCase();
 }
 
+export type LorebookPromptContext = {
+  activeCharacterIds: string[];
+  activeCharacterTags: string[];
+  generationTriggers: string[];
+};
+
+type LorebookContextFilterFields = Pick<
+  LorebookEntry,
+  | "characterFilterMode"
+  | "characterFilterIds"
+  | "characterTagFilterMode"
+  | "characterTagFilters"
+  | "generationTriggerFilterMode"
+  | "generationTriggerFilters"
+>;
+
 function makeValueSet(values: string[] | undefined) {
   return new Set((values ?? []).map(normalizeFilterValue).filter(Boolean));
 }
@@ -327,7 +343,7 @@ function passesValueFilter(
   return normalizedMode === "include" ? hasMatch : !hasMatch;
 }
 
-function passesEntryFilters(entry: LorebookEntry, context: LorebookFilterValueContext) {
+function passesEntryFilters(entry: LorebookContextFilterFields, context: LorebookFilterValueContext) {
   return (
     passesValueFilter(entry.characterFilterMode, entry.characterFilterIds, context.activeCharacterIds) &&
     passesValueFilter(entry.characterTagFilterMode, entry.characterTagFilters, context.activeCharacterTags) &&
@@ -336,7 +352,7 @@ function passesEntryFilters(entry: LorebookEntry, context: LorebookFilterValueCo
 }
 
 export function lorebookEntryPassesContextFilters(
-  entry: LorebookEntry,
+  entry: LorebookContextFilterFields,
   options: { activeCharacterIds?: string[]; activeCharacterTags?: string[]; generationTriggers?: string[] },
 ) {
   return passesEntryFilters(entry, {
@@ -344,6 +360,13 @@ export function lorebookEntryPassesContextFilters(
     activeCharacterTags: makeValueSet(options.activeCharacterTags),
     generationTriggers: makeValueSet(options.generationTriggers?.length ? options.generationTriggers : ["chat"]),
   });
+}
+
+export function filterLorebookEntriesForPromptContext<T extends LorebookContextFilterFields>(
+  entries: readonly T[],
+  context: LorebookPromptContext,
+): T[] {
+  return entries.filter((entry) => lorebookEntryPassesContextFilters(entry, context));
 }
 
 function getAdditionalMatchingText(entry: LorebookEntry, sourceText: Partial<Record<LorebookMatchingSource, string>>) {

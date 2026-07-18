@@ -647,7 +647,7 @@ async function buildOptedInChatContext(
           name: await resolveCharacterName(characters, characterId, characterNameCache),
         })),
       ),
-      chats.listMessagesPaginated(chat.id, NOODLE_CHAT_CONTEXT_MESSAGE_LIMIT),
+      chats.listMessagesPaginatedWithActiveSwipes(chat.id, NOODLE_CHAT_CONTEXT_MESSAGE_LIMIT),
     ]);
     if (messages.length === 0) continue;
     const speakerNameByCharacterId = new Map(characterNames.map((character) => [character.id, character.name]));

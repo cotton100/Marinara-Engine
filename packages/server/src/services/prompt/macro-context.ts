@@ -24,6 +24,7 @@ type PersonaFields = NonNullable<MacroContext["personaFields"]>;
 export interface BuildPromptMacroContextInput {
   db: DB;
   characterIds: string[];
+  primaryCharacterId?: string | null;
   personaName: string;
   personaPhoneticName?: string;
   personaDescription?: string;
@@ -44,6 +45,8 @@ export interface CharacterMacroData {
   profiles: NonNullable<MacroContext["characterProfiles"]>;
   profilesById: Map<string, CharacterMacroProfile>;
   primaryFields?: NonNullable<MacroContext["characterFields"]>;
+  primaryName?: string;
+  primaryPhoneticName?: string;
 }
 
 export type PromptMacroMessage = {
@@ -190,7 +193,11 @@ function parseCharacterData(raw: unknown): CharacterData | null {
   return null;
 }
 
-export async function resolveCharacterMacroData(db: DB, characterIds: string[]): Promise<CharacterMacroData> {
+export async function resolveCharacterMacroData(
+  db: DB,
+  characterIds: string[],
+  primaryCharacterId?: string | null,
+): Promise<CharacterMacroData> {
   if (characterIds.length === 0) return { names: [], phoneticNames: [], profiles: [], profilesById: new Map() };
 
   const chars = createCharactersStorage(db);
@@ -198,7 +205,6 @@ export async function resolveCharacterMacroData(db: DB, characterIds: string[]):
   const phoneticNames: string[] = [];
   const profiles: CharacterMacroData["profiles"] = [];
   const profilesById = new Map<string, CharacterMacroProfile>();
-  let primaryFields: CharacterMacroData["primaryFields"] | undefined;
 
   for (const id of characterIds) {
     const row = await chars.getById(id);
@@ -228,34 +234,48 @@ export async function resolveCharacterMacroData(db: DB, characterIds: string[]):
 
     profiles.push(profile);
     profilesById.set(id, profile);
-
-    if (!primaryFields) {
-      primaryFields = {
-        phoneticName: profile.phoneticName,
-        description: profile.description,
-        personality: profile.personality,
-        backstory: profile.backstory,
-        appearance: profile.appearance,
-        scenario: profile.scenario,
-        example: profile.example,
-        systemPrompt: profile.systemPrompt,
-        postHistoryInstructions: profile.postHistoryInstructions,
-      };
-    }
   }
 
-  return { names, phoneticNames, profiles, profilesById, primaryFields };
+  const primaryProfile =
+    (primaryCharacterId ? profilesById.get(primaryCharacterId) : undefined) ?? profiles[0] ?? undefined;
+  const primaryFields = primaryProfile
+    ? {
+        phoneticName: primaryProfile.phoneticName,
+        description: primaryProfile.description,
+        personality: primaryProfile.personality,
+        backstory: primaryProfile.backstory,
+        appearance: primaryProfile.appearance,
+        scenario: primaryProfile.scenario,
+        example: primaryProfile.example,
+        systemPrompt: primaryProfile.systemPrompt,
+        postHistoryInstructions: primaryProfile.postHistoryInstructions,
+      }
+    : undefined;
+  return {
+    names,
+    phoneticNames,
+    profiles,
+    profilesById,
+    primaryFields,
+    primaryName: primaryProfile?.name,
+    primaryPhoneticName: primaryProfile?.phoneticName,
+  };
 }
 
 export async function buildPromptMacroContext(input: BuildPromptMacroContextInput): Promise<MacroContext> {
-  const characterMacroData = await resolveCharacterMacroData(input.db, input.characterIds);
+  const characterMacroData = await resolveCharacterMacroData(input.db, input.characterIds, input.primaryCharacterId);
   const variables = input.variables ?? {};
 
   return {
     user: input.personaName || "User",
     userPhonetic: input.personaPhoneticName || input.personaFields?.phoneticName || input.personaName || "User",
-    char: characterMacroData.names[0] || "Character",
-    charPhonetic: characterMacroData.phoneticNames[0] || characterMacroData.names[0] || "Character",
+    char: characterMacroData.primaryName || characterMacroData.names[0] || "Character",
+    charPhonetic:
+      characterMacroData.primaryPhoneticName ||
+      characterMacroData.primaryName ||
+      characterMacroData.phoneticNames[0] ||
+      characterMacroData.names[0] ||
+      "Character",
     characters: characterMacroData.names,
     characterProfiles: characterMacroData.profiles,
     variables,
@@ -435,7 +455,9 @@ export async function collectCharacterPostHistoryEntries(
     }).trim();
 
     if (content) {
-      const label = multiCharacter ? `${data.name ?? "Character"} post-history instructions` : "post-history instructions";
+      const label = multiCharacter
+        ? `${data.name ?? "Character"} post-history instructions`
+        : "post-history instructions";
       entries.push({
         content: wrapContent(sanitizePromptLeaf(content, wrapFormat), label, wrapFormat),
         role: "user",
@@ -468,9 +490,7 @@ export function resolveCharacterAdvancedPromptIds(
   const resolved = new Set(characterIds.filter((id) => id && !id.startsWith("npc:")));
   if (chatMode !== "game") return [...resolved];
 
-  const partyIds = Array.isArray(chatMetadata.gamePartyCharacterIds)
-    ? chatMetadata.gamePartyCharacterIds
-    : [];
+  const partyIds = Array.isArray(chatMetadata.gamePartyCharacterIds) ? chatMetadata.gamePartyCharacterIds : [];
   for (const id of partyIds) {
     if (typeof id === "string" && id && !id.startsWith("npc:")) resolved.add(id);
   }

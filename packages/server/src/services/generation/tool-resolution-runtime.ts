@@ -30,6 +30,12 @@ import {
   getZonedDateParts,
   resolveConversationTimeZone,
 } from "../conversation/timezone.js";
+import {
+  filterAccessibleLorebookEntries,
+  lorebookEntryMatchesCharacterWriteScope,
+  lorebookIsWritableInAccessContext,
+  type LorebookAccessContext,
+} from "../lorebook/access-context.js";
 
 type CustomToolsStore = {
   listEnabled(): Promise<
@@ -76,10 +82,13 @@ type ResolveGenerationToolsArgs = {
   resolvedAgents: ResolvedAgent[];
   enabledConfigs: any[];
   promptCharacterIds: string[];
+  primaryCharacterId: string | null;
   personaId: string | null;
   activeLorebookIds: string[];
   excludedLorebookIds: string[];
   excludedSourceAgentIds: string[];
+  lorebookAccessContext: LorebookAccessContext;
+  newLorebookEntryCharacterFilterIds?: string[];
   gameState: unknown;
   gameSpotifyMusicEnabled: boolean;
   agentContext: AgentContext;
@@ -166,10 +175,10 @@ function joinNonEmpty(parts: Array<string | undefined>): string {
 }
 
 function buildCustomToolHiddenContext(args: {
-  requestBody: Record<string, unknown>;
   chatId: string;
   chatMetadata: Record<string, unknown>;
   promptCharacterIds: string[];
+  primaryCharacterId: string | null;
   personaId: string | null;
   agentContext: AgentContext;
   gameState: unknown;
@@ -179,13 +188,9 @@ function buildCustomToolHiddenContext(args: {
     name: character.name,
   }));
   const characterNamesById = new Map(characters.map((character) => [character.id, character.name]));
-  const requestedCharacterId =
-    typeof args.requestBody.forCharacterId === "string" && args.requestBody.forCharacterId.trim()
-      ? args.requestBody.forCharacterId.trim()
-      : null;
   const primaryCharacterId =
-    requestedCharacterId && args.promptCharacterIds.includes(requestedCharacterId)
-      ? requestedCharacterId
+    args.primaryCharacterId && args.promptCharacterIds.includes(args.primaryCharacterId)
+      ? args.primaryCharacterId
       : (args.promptCharacterIds[0] ?? null);
   const characterIds = args.promptCharacterIds;
   const characterNames = characterIds.map((id) => characterNamesById.get(id) ?? id);
@@ -451,7 +456,13 @@ function createLorebookEntryWriter(
   lorebooksStore: LorebooksStore,
   agent: ResolvedAgent,
   agentSettings: Record<string, unknown>,
-  options: { requireApproval: boolean; chatId: string },
+  options: {
+    requireApproval: boolean;
+    chatId: string;
+    accessContext: LorebookAccessContext;
+    newEntryCharacterFilterIds?: string[];
+    entryStateOverrides: Record<string, { enabled?: boolean; ephemeral?: number | null }>;
+  },
 ) {
   const writableLorebookId = resolveAgentWritableLorebookId(agentSettings);
   if (!writableLorebookId) return undefined;
@@ -467,8 +478,24 @@ function createLorebookEntryWriter(
     // When agent write-approval is required, never write inline — surface a proposal
     // envelope (mirroring the structured lorebook_update gate) so the user approves
     // the write before it touches the lorebook DB.
+    const targetLorebook = await lorebooksStore.getById(writableLorebookId);
+    if (!targetLorebook || !lorebookIsWritableInAccessContext(targetLorebook, options.accessContext)) {
+      return { error: "Selected lorebook is not available in this character context." };
+    }
+
+    const promptVisibleEntries = filterAccessibleLorebookEntries(
+      await lorebooksStore.listEntries(writableLorebookId),
+      options.accessContext,
+      options.entryStateOverrides,
+    );
+    const existingEntries =
+      options.newEntryCharacterFilterIds === undefined
+        ? promptVisibleEntries
+        : promptVisibleEntries.filter((candidate) =>
+            lorebookEntryMatchesCharacterWriteScope(candidate, options.newEntryCharacterFilterIds!),
+          );
+
     if (options.requireApproval) {
-      const existingEntries = await lorebooksStore.listEntries(writableLorebookId).catch(() => []);
       return {
         requiresApproval: true,
         approval: buildLorebookWriteApprovalProposal({
@@ -489,16 +516,18 @@ function createLorebookEntryWriter(
           preferredTargetLorebookId: writableLorebookId,
           writableLorebookIds: [writableLorebookId],
           existingEntries,
+          ...(options.newEntryCharacterFilterIds !== undefined
+            ? {
+                lorebookPromptContext: options.accessContext,
+                newEntryCharacterFilterIds: options.newEntryCharacterFilterIds,
+                accessContext: options.accessContext,
+                allowCreateTarget: false,
+              }
+            : {}),
         }),
       };
     }
 
-    const targetLorebook = await lorebooksStore.getById(writableLorebookId);
-    if (!targetLorebook) {
-      return { error: "Selected lorebook is no longer available.", lorebookId: writableLorebookId };
-    }
-
-    const existingEntries = await lorebooksStore.listEntries(writableLorebookId);
     const normalizedName = entry.name.trim().toLocaleLowerCase();
     const existing = existingEntries.find(
       (candidate: any) =>
@@ -520,6 +549,12 @@ function createLorebookEntryWriter(
         position: 0,
         depth: 4,
         role: "system",
+        ...(options.newEntryCharacterFilterIds?.length
+          ? {
+              characterFilterMode: "include",
+              characterFilterIds: [...options.newEntryCharacterFilterIds],
+            }
+          : {}),
       });
       return {
         applied: true,
@@ -617,10 +652,13 @@ export async function resolveGenerationTools({
   resolvedAgents,
   enabledConfigs,
   promptCharacterIds,
+  primaryCharacterId,
   personaId,
   activeLorebookIds,
   excludedLorebookIds,
   excludedSourceAgentIds,
+  lorebookAccessContext,
+  newLorebookEntryCharacterFilterIds,
   gameState,
   gameSpotifyMusicEnabled,
   agentContext,
@@ -712,8 +750,13 @@ export async function resolveGenerationTools({
       excludedLorebookIds,
       excludedSourceAgentIds,
     });
+    const accessibleEntries = filterAccessibleLorebookEntries(
+      entries,
+      lorebookAccessContext,
+      parseExtra(chatMetadata.entryStateOverrides) as Record<string, { enabled?: boolean; ephemeral?: number | null }>,
+    );
     const normalizedQuery = query.toLowerCase();
-    return entries
+    return accessibleEntries
       .filter((entry: any) => {
         const nameMatch = typeof entry.name === "string" && entry.name.toLowerCase().includes(normalizedQuery);
         const contentMatch = typeof entry.content === "string" && entry.content.toLowerCase().includes(normalizedQuery);
@@ -779,10 +822,10 @@ export async function resolveGenerationTools({
   const baseToolExecutionContext: ToolExecutionContext = {
     gameState: gameState ? (gameState as Record<string, unknown>) : undefined,
     hiddenContext: buildCustomToolHiddenContext({
-      requestBody,
       chatId,
       chatMetadata,
       promptCharacterIds,
+      primaryCharacterId,
       personaId,
       agentContext,
       gameState,
@@ -834,6 +877,12 @@ export async function resolveGenerationTools({
     const saveLorebookEntry = createLorebookEntryWriter(lorebooksStore, agent, agentSettings, {
       requireApproval: agentWriteApprovalRequired(chatMetadata),
       chatId,
+      accessContext: lorebookAccessContext,
+      newEntryCharacterFilterIds: newLorebookEntryCharacterFilterIds,
+      entryStateOverrides: parseExtra(chatMetadata.entryStateOverrides) as Record<
+        string,
+        { enabled?: boolean; ephemeral?: number | null }
+      >,
     });
     const replaceChatMessageContentForAgent = customAgentHasCapability(agentSettings, "edit_messages")
       ? replaceChatMessageContent

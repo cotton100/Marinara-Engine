@@ -687,7 +687,7 @@ async function fetchChatContent(command: FetchCommand, args: Parameters<typeof h
   if (!found) return "";
 
   const parts = [`Chat: ${found.name}`, `Mode: ${found.mode}`];
-  const recentMsgs = await args.stores.chats.listMessagesPaginated(found.id, 20);
+  const recentMsgs = await args.stores.chats.listMessagesPaginatedWithActiveSwipes(found.id, 20);
   if (recentMsgs.length > 0) {
     parts.push(`Recent Messages (${recentMsgs.length}):`);
     for (const msg of recentMsgs) {

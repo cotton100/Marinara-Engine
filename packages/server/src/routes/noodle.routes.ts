@@ -3,7 +3,7 @@
 // ──────────────────────────────────────────────
 import type { FastifyInstance } from "fastify";
 import { existsSync, readFileSync } from "fs";
-import { basename, dirname, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import { z } from "zod";
 import {
@@ -110,9 +110,15 @@ import { normalizeNoodleImagePrompt } from "../services/noodle/noodle-image-prom
 import { normalizeNoodleHandle } from "../services/noodle/noodle-handle.js";
 import { resolveNoodleAvatarCropAfterProfileUpdate } from "../services/noodle/noodle-profile-avatar.js";
 import {
+  deleteOwnedNoodlePostImage,
+  NOODLE_OWNED_IMAGE_DELETION_CAPABILITY,
+  NoodleOwnedImageDeletionError,
+} from "../services/noodle/noodle-owned-image-deletion.js";
+import {
   isNoodleProfileGenerated,
   noodleAccountsNeedingProfiles,
 } from "../services/noodle/noodle-profile-selection.js";
+import { DATA_DIR } from "../utils/data-dir.js";
 
 const NOODLE_ROUTE_DIR = dirname(fileURLToPath(import.meta.url));
 const CLIENT_PUBLIC_DIR = resolve(NOODLE_ROUTE_DIR, "../../../client/public");
@@ -1345,6 +1351,10 @@ export async function noodleRoutes(app: FastifyInstance) {
     return bootstrapVisibleNoodle(noodle, characters);
   });
 
+  app.get("/image-deletion/capabilities", async () => {
+    return NOODLE_OWNED_IMAGE_DELETION_CAPABILITY;
+  });
+
   app.put("/settings", async (req, reply) => {
     const parsed = noodleSettingsUpdateSchema.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
@@ -1514,6 +1524,26 @@ export async function noodleRoutes(app: FastifyInstance) {
       }
     }
     return post;
+  });
+
+  app.delete("/posts/:id/image", async (req, reply) => {
+    const { id } = req.params as { id: string };
+    try {
+      return await deleteOwnedNoodlePostImage({
+        db: app.db,
+        postId: id,
+        galleryRoot: join(DATA_DIR, "gallery"),
+      });
+    } catch (error) {
+      if (error instanceof NoodleOwnedImageDeletionError) {
+        return reply.code(error.statusCode).send({ error: error.message, code: error.code });
+      }
+      logger.error(error, "[noodle] Failed to delete owned generated image for post %s", id);
+      return reply.code(500).send({
+        error: "The Noodle image could not be deleted safely.",
+        code: "delete-failed",
+      });
+    }
   });
 
   app.delete("/posts/:id", async (req, reply) => {

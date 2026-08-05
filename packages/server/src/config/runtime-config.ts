@@ -531,6 +531,10 @@ export function isExternalExtensionsEnvEnabled() {
   return isEnabledFlag(process.env.ENABLE_EXTERNAL_EXTENSIONS);
 }
 
+export function isNoodleOwnedImageDeletionEnabled() {
+  return isEnabledFlag(process.env.ENABLE_NOODLE_OWNED_IMAGE_DELETION);
+}
+
 export function isSidecarRuntimeInstallEnabled() {
   return isEnabledFlag(process.env.SIDECAR_RUNTIME_INSTALL_ENABLED);
 }

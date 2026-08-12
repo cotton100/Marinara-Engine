@@ -33,7 +33,9 @@ import {
 } from "./stores/ui.store";
 import { useSidecarStore } from "./stores/sidecar.store";
 import { useDialogStore } from "./stores/dialog.store";
+import { useChatStore } from "./stores/chat.store";
 import { api } from "./lib/api-client";
+import { getHashlessAppUrl, parseAppDeepLinkHash } from "./lib/app-deep-link";
 import { forceRefreshSpa } from "./lib/browser-runtime";
 import {
   getCssColorFallback,
@@ -506,6 +508,27 @@ export function App() {
   const [whatsNewOpen, setWhatsNewOpen] = useState(false);
   const [whatsNewResolved, setWhatsNewResolved] = useState(false);
   const handleWhatsNewResolved = useCallback(() => setWhatsNewResolved(true), []);
+
+  useEffect(() => {
+    const openDeepLink = () => {
+      const deepLink = parseAppDeepLinkHash(window.location.hash);
+      if (!deepLink) return;
+
+      if (deepLink.type === "chat") {
+        useUIStore.getState().closeAllDetails();
+        useChatStore.getState().setActiveChatId(deepLink.chatId);
+      } else {
+        useChatStore.getState().setActiveChatId(null);
+        useUIStore.getState().openNoodle();
+      }
+
+      window.history.replaceState(window.history.state, "", getHashlessAppUrl(window.location));
+    };
+
+    openDeepLink();
+    window.addEventListener("hashchange", openDeepLink);
+    return () => window.removeEventListener("hashchange", openDeepLink);
+  }, []);
 
   useEffect(() => {
     setCustomNotificationSoundUrl(customNotificationSound?.url ?? null);

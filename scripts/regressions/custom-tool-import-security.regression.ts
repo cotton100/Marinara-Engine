@@ -132,9 +132,14 @@ assert.equal(localWebhookExport.includeHiddenContext, true, "local hidden-contex
 const storageRoot = await mkdtemp(join(tmpdir(), "marinara-custom-tool-security-"));
 const previousDataDir = process.env.DATA_DIR;
 const previousFileStorageDir = process.env.FILE_STORAGE_DIR;
+const previousAdminSecret = process.env.ADMIN_SECRET;
+// owo: the profile import write path is a coordination operator action and
+// requires the admin secret. Mirrors profile-asset-mutation-gate.
+const ADMIN_SECRET = "custom-tool-import-security-regression-secret";
 try {
   process.env.DATA_DIR = storageRoot;
   process.env.FILE_STORAGE_DIR = join(storageRoot, "storage");
+  process.env.ADMIN_SECRET = ADMIN_SECRET;
   const [
     { getDB, closeDB },
     { customTools },
@@ -198,6 +203,7 @@ try {
     const importResponse = await app.inject({
       method: "POST",
       url: "/api/backup/import-profile",
+      headers: { "x-admin-secret": ADMIN_SECRET },
       payload: {
         type: "marinara_profile",
         version: 1,
@@ -231,6 +237,8 @@ try {
   else process.env.DATA_DIR = previousDataDir;
   if (previousFileStorageDir === undefined) delete process.env.FILE_STORAGE_DIR;
   else process.env.FILE_STORAGE_DIR = previousFileStorageDir;
+  if (previousAdminSecret === undefined) delete process.env.ADMIN_SECRET;
+  else process.env.ADMIN_SECRET = previousAdminSecret;
   await rm(storageRoot, { recursive: true, force: true });
 }
 

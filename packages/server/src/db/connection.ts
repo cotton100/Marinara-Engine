@@ -31,6 +31,21 @@ export async function flushDB() {
   await fileStore?.flush();
 }
 
+/**
+ * Coordination-critical durability barrier. Unlike the legacy best-effort
+ * flush, this initializes storage if necessary and rejects when the runtime
+ * cannot prove file and directory fsync completion.
+ */
+export async function flushDBStrict() {
+  const db = await getDB();
+  await db._fileStore.flushStrict();
+}
+
+export async function isDBStrictDurabilitySupported() {
+  const db = await getDB();
+  return db._fileStore.isStrictDurabilitySupported();
+}
+
 export async function closeDB() {
   const activePromise = dbPromise;
   if (!activePromise) {

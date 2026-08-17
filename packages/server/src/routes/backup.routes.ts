@@ -18,6 +18,7 @@ import { migrateLegacyNoodleAccountRow } from "../db/noodle-platform-migration.j
 import { migrateLegacyNoodlePostAccessRow } from "../db/noodle-access-migration.js";
 import { getFileTableConfig, isFileTable, type AnyFileTable } from "../db/file-schema.js";
 import * as schema from "../db/schema/index.js";
+import { eq } from "../db/file-query.js";
 import { createCharactersStorage } from "../services/storage/characters.storage.js";
 import { createLorebooksStorage } from "../services/storage/lorebooks.storage.js";
 import { createPromptsStorage } from "../services/storage/prompts.storage.js";
@@ -33,7 +34,7 @@ import { getDataDir } from "../utils/data-dir.js";
 import { getFileStorageDir } from "../config/runtime-config.js";
 import { normalizeTimestampOverrides } from "../services/import/import-timestamps.js";
 import { flushDB, type DB } from "../db/connection.js";
-import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
+import { requireCoordinationAdminAccess, requirePrivilegedAccess } from "../middleware/privileged-gate.js";
 import { BACKUP_RATE_LIMIT } from "../middleware/rate-limit.js";
 import { assertInsideDir } from "../utils/security.js";
 import { logger } from "../lib/logger.js";
@@ -42,18 +43,37 @@ import { ENCRYPTED_WEBHOOK_PREFIX, encryptCustomToolWebhookUrl } from "../utils/
 import {
   ProfileImportAssetValidationError,
   cleanupStagedProfileAssets,
+  preparedProfileAssetRollbackDurabilityPaths,
+  prepareStagedProfileAssetRollback,
+  promotedProfileAssetDurabilityPaths,
   promoteStagedProfileAssets,
+  rolledBackProfileAssetDurabilityPaths,
   rollbackPromotedProfileAssets,
   stageProfileImportAssets,
   type ProfileImportAssetInput,
   type ProfileImportAssetStream,
   type StagedProfileImportAssets,
 } from "../services/import/profile-import-assets.js";
+import {
+  runWithDetachedProfileAssetMutation,
+  runWithProfileAssetMaintenanceExclusive,
+  runWithProfileAssetMutation,
+} from "../services/import/profile-asset-mutation-gate.js";
 import { ProfileImportRequestError } from "../services/import/profile-import-errors.js";
 import { planProfileNoodleImport, type ProfileNoodleImportWarning } from "../services/import/profile-import-noodle.js";
 import { getCapabilityService } from "../services/capability-packages/capability-service-registry.service.js";
+import { clearAllChatActivity } from "../services/conversation/autonomous.service.js";
 import { computePersonalExtensionHash } from "../services/extensions/personal-extension-hash.js";
 import { personalServerExtensionRuntime } from "../services/extensions/personal-server-extension-runtime.js";
+import {
+  cmbStorageRequiresRecoveryBeforeProfileRestore,
+  listCmbStorageExtensionIdsForProfileRestore,
+} from "../services/extensions/personal-extension-coordination-admin.service.js";
+import { getPersonalExtensionCoordinationEventService } from "../services/extensions/personal-extension-coordination-events.service.js";
+import {
+  PERSONAL_EXTENSION_COORDINATION_PROCESS_BOOT_ID,
+  runPersonalExtensionCoordinationRestoreExclusive,
+} from "../services/extensions/personal-extension-coordination-kernel.service.js";
 import {
   AUTOMATIC_BACKUP_FILENAME,
   automaticBackupArchiveFilename,
@@ -62,6 +82,160 @@ import {
   parseAutomaticBackupRetentionCount,
   pruneAutomaticBackupFiles,
 } from "../services/backup/automatic-backup-retention.js";
+
+// Coordination rows contain transient authority state. They are deliberately
+// absent from generic profile export/import until the operator-only restore
+// workflow can rebuild a fenced inactive state instead of replaying it.
+const PROFILE_FILE_BACKED_TABLE_EXCLUSIONS = new Set([
+  "personal_extension_coordination",
+  "personal_extension_operation_journal",
+]);
+export function filterProfileFileBackedTables<TTableName extends string>(tableNames: readonly TTableName[]) {
+  return tableNames.filter((tableName) => !PROFILE_FILE_BACKED_TABLE_EXCLUSIONS.has(tableName));
+}
+export const PROFILE_FILE_BACKED_TABLES = filterProfileFileBackedTables(FILE_BACKED_TABLES);
+
+/**
+ * A profile restore rewrites CMB config (app_settings) and protected lorebook
+ * rows outside the coordination guard. Doing that under a live writer would
+ * roll a durable `mutation-ambiguous` marker back to "ready" while the journal
+ * still says the batch is dispatching — an undetectable corruption. Restores
+ * therefore run only against fully idle coordination state.
+ */
+export class ProfileImportCoordinationBlockedError extends Error {
+  readonly code = "coordination-transition-blocked";
+  constructor(readonly extensionIds: string[]) {
+    super("Personal extension coordination must be idle before a profile restore");
+    this.name = "ProfileImportCoordinationBlockedError";
+  }
+}
+
+export class ProfileImportCoordinationUnavailableError extends Error {
+  readonly code = "coordination-unavailable";
+  constructor() {
+    super("Strict coordination durability is unavailable for this profile restore");
+    this.name = "ProfileImportCoordinationUnavailableError";
+  }
+}
+
+export async function assertCoordinationIdleForRestore(tx: DB) {
+  const rows = await tx.select().from(schema.personalExtensionCoordination);
+  const blocking = rows.filter(
+    (row) =>
+      row.mode !== "inactive" ||
+      row.leaseTokenDigest !== null ||
+      row.holderSessionId !== null ||
+      row.handoffRequestId !== null ||
+      String(row.activeOperations ?? "[]") !== "[]",
+  );
+  // An idle row is not enough. Earlier builds, interrupted migrations or
+  // externally inconsistent data may contain `inactive` plus an unresolved
+  // journal describing a batch that may have written data. A restore over that
+  // state would swap the config back to a clean "ready" and erase the durable
+  // `mutation-ambiguous` marker that is the only remaining evidence.
+  const recoveryExtensionIds: string[] = [];
+  const legacyCmbExtensionIds = await listCmbStorageExtensionIdsForProfileRestore(tx);
+  const cmbExtensionIds = new Set([...rows.map((row) => String(row.extensionId)), ...legacyCmbExtensionIds]);
+  const unresolved = [];
+  for (const extensionId of cmbExtensionIds) {
+    const journals = await tx
+      .select()
+      .from(schema.personalExtensionOperationJournal)
+      .where(eq(schema.personalExtensionOperationJournal.extensionId, extensionId));
+    unresolved.push(...journals.filter((journal) => journal.phase !== "final"));
+  }
+  for (const extensionId of cmbExtensionIds) {
+    if (await cmbStorageRequiresRecoveryBeforeProfileRestore(tx, extensionId)) {
+      recoveryExtensionIds.push(extensionId);
+    }
+  }
+  if (blocking.length > 0 || unresolved.length > 0 || recoveryExtensionIds.length > 0) {
+    const extensionIds = [
+      ...new Set([
+        ...blocking.map((row) => String(row.extensionId)),
+        ...unresolved.map((journal) => String(journal.extensionId)),
+        ...recoveryExtensionIds,
+      ]),
+    ];
+    throw new ProfileImportCoordinationBlockedError(extensionIds);
+  }
+  return rows;
+}
+
+type ProfileRestoreCoordinationBarrier = {
+  extensionId: string;
+  contentHash: string;
+  fence: number;
+  configRevision: number;
+  protectedLorebookRegistry: string;
+};
+
+function restoreBarrierFromRow(row: typeof schema.personalExtensionCoordination.$inferSelect) {
+  if (!Number.isSafeInteger(row.fence) || row.fence < 0 || row.fence >= Number.MAX_SAFE_INTEGER) {
+    throw new ProfileImportCoordinationBlockedError([row.extensionId]);
+  }
+  return {
+    extensionId: row.extensionId,
+    contentHash: row.contentHash,
+    fence: row.fence,
+    configRevision: row.configRevision,
+    protectedLorebookRegistry: row.protectedLorebookRegistry,
+  } satisfies ProfileRestoreCoordinationBarrier;
+}
+
+async function assertCoordinationRestoreBarrier(tx: DB, barriers: readonly ProfileRestoreCoordinationBarrier[]) {
+  const rows = await tx.select().from(schema.personalExtensionCoordination);
+  const byExtensionId = new Map(rows.map((row) => [row.extensionId, row]));
+  const exact =
+    rows.length === barriers.length &&
+    barriers.every((barrier) => {
+      const row = byExtensionId.get(barrier.extensionId);
+      return (
+        row?.mode === "restoring" &&
+        row.serverBootId === PERSONAL_EXTENSION_COORDINATION_PROCESS_BOOT_ID &&
+        row.contentHash === barrier.contentHash &&
+        row.fence === barrier.fence + 1 &&
+        row.configRevision === barrier.configRevision &&
+        row.protectedLorebookRegistry === barrier.protectedLorebookRegistry &&
+        row.leaseTokenDigest === null &&
+        row.holderSessionId === null &&
+        row.expiresAt === null &&
+        row.handoffRequestId === null &&
+        row.handoffRequester === null &&
+        row.handoffDeadlineAt === null &&
+        row.activeOperations === "[]"
+      );
+    });
+  if (!exact) throw new ProfileImportCoordinationBlockedError(barriers.map((barrier) => barrier.extensionId));
+  return rows;
+}
+
+async function preserveBlockedRestoreState(db: DB, barriers: readonly ProfileRestoreCoordinationBarrier[]) {
+  if (barriers.length === 0) return;
+  await db.transaction(async (tx) => {
+    await assertCoordinationRestoreBarrier(tx, barriers);
+    const blockedAt = new Date().toISOString();
+    for (const barrier of barriers) {
+      await tx
+        .update(schema.personalExtensionCoordination)
+        .set({
+          mode: "blocked",
+          fence: barrier.fence + 1,
+          serverBootId: PERSONAL_EXTENSION_COORDINATION_PROCESS_BOOT_ID,
+          leaseTokenDigest: null,
+          holderSessionId: null,
+          expiresAt: null,
+          handoffRequestId: null,
+          handoffRequester: null,
+          handoffDeadlineAt: null,
+          activeOperations: "[]",
+          updatedAt: blockedAt,
+        })
+        .where(eq(schema.personalExtensionCoordination.extensionId, barrier.extensionId));
+    }
+    await tx._fileStore.flushStrict();
+  });
+}
 
 /** Directories inside DATA_DIR that should be included in every backup. */
 const BACKUP_DIRS = [
@@ -578,7 +752,7 @@ const profileTableObjects = new Map<string, AnyFileTable>();
 for (const candidate of Object.values(schema)) {
   if (!isFileTable(candidate)) continue;
   const tableName = schemaTableName(candidate);
-  if (tableName && FILE_BACKED_TABLES.includes(tableName as (typeof FILE_BACKED_TABLES)[number])) {
+  if (tableName && PROFILE_FILE_BACKED_TABLES.includes(tableName as (typeof PROFILE_FILE_BACKED_TABLES)[number])) {
     profileTableObjects.set(tableName, candidate);
   }
 }
@@ -762,7 +936,7 @@ export function buildProfileUpdateSet(tableName: string, cleanRow: Record<string
 async function buildProfileTableSnapshot(app: FastifyInstance): Promise<ProfileTableSnapshots> {
   const tables: ProfileTableSnapshots = {};
 
-  for (const tableName of FILE_BACKED_TABLES) {
+  for (const tableName of PROFILE_FILE_BACKED_TABLES) {
     const table = profileTableObjects.get(tableName);
     if (!table) continue;
     const rows = (await app.db.select().from(table as any)) as Array<Record<string, unknown>>;
@@ -1056,7 +1230,7 @@ function previewProfileStorageSnapshotStats(
   warnings: ProfileImportWarning[],
 ) {
   const tableCounts: Record<string, number> = {};
-  for (const tableName of FILE_BACKED_TABLES) {
+  for (const tableName of PROFILE_FILE_BACKED_TABLES) {
     const rows = snapshot.tables[tableName];
     tableCounts[tableName] = Array.isArray(rows) ? rows.length : 0;
   }
@@ -1113,7 +1287,7 @@ function previewLegacyProfileImportStats(
 }
 
 function countProfileStorageSnapshotItems(snapshot: ProfileStorageSnapshot) {
-  const tableRows = FILE_BACKED_TABLES.reduce((count, tableName) => {
+  const tableRows = PROFILE_FILE_BACKED_TABLES.reduce((count, tableName) => {
     const rows = snapshot.tables[tableName];
     return count + (Array.isArray(rows) ? rows.length : 0);
   }, 0);
@@ -1128,7 +1302,7 @@ function countLegacyProfileImportItems(data: Record<string, any>) {
 }
 
 function validateProfileStorageTableInputs(snapshot: ProfileStorageSnapshot) {
-  for (const tableName of FILE_BACKED_TABLES) {
+  for (const tableName of PROFILE_FILE_BACKED_TABLES) {
     const rows = snapshot.tables[tableName];
     if (rows === undefined) continue;
     if (!Array.isArray(rows)) {
@@ -1210,101 +1384,273 @@ async function importProfileStorageSnapshot(
     });
   };
 
-  return withProfileImportLifecycleLock(async () => {
-    let files = 0;
-    let committed = false;
-    let rollbackFailed = false;
-    try {
-      await app.db.transaction(async (tx) => {
-        const plannedSnapshot = await planProfileNoodleImport(
-          tx,
-          snapshot,
-          warnings as Parameters<typeof planProfileNoodleImport>[2],
-        );
-        const connectionPlans = await planProfileApiConnectionImports(tx, plannedSnapshot.tables.api_connections ?? []);
-        addProfileImportSecurityWarnings(warnings, buildProfileImportSecuritySummary(plannedSnapshot, connectionPlans));
-        for (const tableName of FILE_BACKED_TABLES) {
-          const table = profileTableObjects.get(tableName);
-          const rows = plannedSnapshot.tables[tableName];
-          if (!table || !Array.isArray(rows) || rows.length === 0) {
-            tableCounts[tableName] = 0;
-            continue;
-          }
-
-          emit("tables", `Importing ${tableName.replace(/_/g, " ")}`);
-          for (const [rowIndex, row] of rows.entries()) {
-            let cleanRow = { ...row };
-            // A pre-rename snapshot carries `visibility`/`publicAccountId`. Inserting it raw
-            // lets the column default fill `platform: "noodle"`, putting a restored NoodleR
-            // account and its posts on the Noodle timeline.
-            if (tableName === "noodle_accounts") cleanRow = migrateLegacyNoodleAccountRow(cleanRow);
-            if (tableName === "noodle_posts") cleanRow = migrateLegacyNoodlePostAccessRow(cleanRow);
-            if (tableName === "api_connections") {
-              const connectionPlan = connectionPlans[rowIndex];
-              if (!connectionPlan) {
-                throw new ProfileImportRequestError("Profile import could not plan an imported API connection.");
-              }
-              cleanRow = connectionPlan.row;
-            }
-            if (tableName === "installed_extensions") cleanRow = quarantineProfilePersonalExtensionRow(cleanRow);
-            if (tableName === "custom_tools") cleanRow = quarantineProfileCustomToolRow(cleanRow);
-            if (tableName === "mari_instructions") cleanRow = quarantineProfileMariInstructionRow(cleanRow);
-            if (tableName === "custom_themes") cleanRow = quarantineProfileThemeRow(cleanRow);
-            const insert = tx.insert(table as any).values(cleanRow as any) as any;
-            const conflictTarget = schemaPrimaryKeyColumn(table);
-            if (conflictTarget) {
-              // Exported secrets are redacted. The table-specific update set preserves
-              // agent/tool secrets, while the connection plan above retains a credential
-              // only when its provider and destination still match.
-              await insert.onConflictDoUpdate({
-                target: conflictTarget,
-                set: buildProfileUpdateSet(tableName, cleanRow),
+  // Acquire/upgrade the asset gate before the profile lifecycle queue. Two
+  // concurrent import requests both arrive through the shared HTTP gate; if a
+  // lifecycle waiter retained its shared slot, the lifecycle owner could never
+  // drain readers to enter maintenance.
+  //
+  // The Noodle capability package writes reserve rows and media from its own
+  // scheduler, outside the process-wide asset gate, so its pause is held for
+  // the whole restore. It is taken before the maintenance upgrade: a pause
+  // waits for in-flight Noodle work, and that work must still be able to win
+  // a shared admission instead of queueing behind our exclusive request.
+  return withOptionalNoodleAutoPostPaused(() =>
+    runWithProfileAssetMaintenanceExclusive(() =>
+      withProfileImportLifecycleLock(async () => {
+        // Lock order is asset maintenance -> profile lifecycle -> coordination
+        // restore -> file transaction lane.
+        const outcome = await runPersonalExtensionCoordinationRestoreExclusive(() =>
+          app.db._fileStore.runExclusiveTransactions(async () => {
+            let files = 0;
+            let barriers: ProfileRestoreCoordinationBarrier[] = [];
+            let restoringStarted = false;
+            let dataPhaseCompleted = false;
+            let committed = false;
+            let rollbackFailed = false;
+            try {
+              // Phase A: close every coordination mutation admission in memory, then
+              // durably publish `restoring` before the first profile/asset mutation.
+              barriers = await app.db.transaction(async (tx) => {
+                const coordinationRows = await assertCoordinationIdleForRestore(tx);
+                if (coordinationRows.length > 0 && !tx._fileStore.isStrictDurabilitySupported()) {
+                  throw new ProfileImportCoordinationUnavailableError();
+                }
+                const admitted = coordinationRows.map(restoreBarrierFromRow);
+                if (admitted.length > 0) {
+                  const restoringAt = new Date().toISOString();
+                  for (const row of coordinationRows) {
+                    await tx
+                      .update(schema.personalExtensionCoordination)
+                      .set({
+                        mode: "restoring",
+                        fence: Number(row.fence ?? 0) + 1,
+                        serverBootId: PERSONAL_EXTENSION_COORDINATION_PROCESS_BOOT_ID,
+                        leaseTokenDigest: null,
+                        holderSessionId: null,
+                        expiresAt: null,
+                        handoffRequestId: null,
+                        handoffRequester: null,
+                        handoffDeadlineAt: null,
+                        activeOperations: "[]",
+                        updatedAt: restoringAt,
+                      })
+                      .where(eq(schema.personalExtensionCoordination.extensionId, String(row.extensionId)));
+                  }
+                  await tx._fileStore.flushStrict();
+                }
+                return admitted;
               });
-            } else {
-              await insert;
-            }
-            completedItems++;
-            tableCounts[tableName] = (tableCounts[tableName] ?? 0) + 1;
-            emit("tables", `Importing ${tableName.replace(/_/g, " ")}`);
-          }
-        }
+              restoringStarted = barriers.length > 0;
 
-        await promoteStagedProfileAssets(stagedAssets);
-        for (const asset of stagedAssets.assets) {
-          files++;
-          completedItems++;
-          emit("files", `Restoring ${asset.path}`, files);
-        }
-        await flushDB();
-      });
-      committed = true;
-      if ((tableCounts.installed_extensions ?? 0) > 0) {
-        await personalServerExtensionRuntime.reloadAll();
-      }
-      return buildProfileImportStats(tableCounts, files);
-    } catch (error) {
-      try {
-        await rollbackPromotedProfileAssets(stagedAssets);
-      } catch (rollbackError) {
-        rollbackFailed = true;
-        logger.error(
-          rollbackError,
-          "[backup] Asset rollback failed; preserving recovery files at %s",
-          stagedAssets.rootDir,
-        );
-        throw new AggregateError([error, rollbackError], "Profile import and asset rollback both failed");
-      }
-      throw error;
-    } finally {
-      if (!rollbackFailed) {
-        try {
-          await cleanupStagedProfileAssets(stagedAssets);
-        } catch (cleanupError) {
-          if (committed) logger.warn(cleanupError, "[backup] Failed to remove profile import staging files");
-        }
-      }
-    }
-  });
+              // Phase B: restore all profile rows and promoted assets while the
+              // durable coordination state remains `restoring`.
+              await app.db.transaction(async (tx) => {
+                if (barriers.length > 0) await assertCoordinationRestoreBarrier(tx, barriers);
+                const plannedSnapshot = await planProfileNoodleImport(
+                  tx,
+                  snapshot,
+                  warnings as Parameters<typeof planProfileNoodleImport>[2],
+                );
+                const connectionPlans = await planProfileApiConnectionImports(
+                  tx,
+                  plannedSnapshot.tables.api_connections ?? [],
+                );
+                addProfileImportSecurityWarnings(
+                  warnings,
+                  buildProfileImportSecuritySummary(plannedSnapshot, connectionPlans),
+                );
+                for (const tableName of PROFILE_FILE_BACKED_TABLES) {
+                  const table = profileTableObjects.get(tableName);
+                  const rows = plannedSnapshot.tables[tableName];
+                  if (!table || !Array.isArray(rows) || rows.length === 0) {
+                    tableCounts[tableName] = 0;
+                    continue;
+                  }
+
+                  emit("tables", `Importing ${tableName.replace(/_/g, " ")}`);
+                  for (const [rowIndex, row] of rows.entries()) {
+                    let cleanRow = { ...row };
+                    // A pre-rename snapshot carries `visibility`/`publicAccountId`. Inserting it raw
+                    // lets the column default fill `platform: "noodle"`, putting a restored NoodleR
+                    // account and its posts on the Noodle timeline.
+                    if (tableName === "noodle_accounts") cleanRow = migrateLegacyNoodleAccountRow(cleanRow);
+                    if (tableName === "noodle_posts") cleanRow = migrateLegacyNoodlePostAccessRow(cleanRow);
+                    if (tableName === "api_connections") {
+                      const connectionPlan = connectionPlans[rowIndex];
+                      if (!connectionPlan) {
+                        throw new ProfileImportRequestError(
+                          "Profile import could not plan an imported API connection.",
+                        );
+                      }
+                      cleanRow = connectionPlan.row;
+                    }
+                    if (tableName === "installed_extensions")
+                      cleanRow = quarantineProfilePersonalExtensionRow(cleanRow);
+                    if (tableName === "custom_tools") cleanRow = quarantineProfileCustomToolRow(cleanRow);
+                    if (tableName === "mari_instructions") cleanRow = quarantineProfileMariInstructionRow(cleanRow);
+                    if (tableName === "custom_themes") cleanRow = quarantineProfileThemeRow(cleanRow);
+                    const insert = tx.insert(table as any).values(cleanRow as any) as any;
+                    const conflictTarget = schemaPrimaryKeyColumn(table);
+                    if (conflictTarget) {
+                      // Exported secrets are redacted. The table-specific update set preserves
+                      // agent/tool secrets, while the connection plan above retains a credential
+                      // only when its provider and destination still match.
+                      await insert.onConflictDoUpdate({
+                        target: conflictTarget,
+                        set: buildProfileUpdateSet(tableName, cleanRow),
+                      });
+                    } else {
+                      await insert;
+                    }
+                    completedItems++;
+                    tableCounts[tableName] = (tableCounts[tableName] ?? 0) + 1;
+                    emit("tables", `Importing ${tableName.replace(/_/g, " ")}`);
+                  }
+                }
+
+                await prepareStagedProfileAssetRollback(stagedAssets);
+                if (barriers.length > 0) {
+                  const rollbackDurabilityPaths = preparedProfileAssetRollbackDurabilityPaths(stagedAssets);
+                  await tx._fileStore.flushPathsStrict(
+                    rollbackDurabilityPaths.files,
+                    rollbackDurabilityPaths.directories,
+                  );
+                }
+                await promoteStagedProfileAssets(stagedAssets);
+                for (const asset of stagedAssets.assets) {
+                  files++;
+                  completedItems++;
+                  emit("files", `Restoring ${asset.path}`, files);
+                }
+
+                if (barriers.length > 0) {
+                  const assetDurabilityPaths = promotedProfileAssetDurabilityPaths(stagedAssets);
+                  await tx._fileStore.flushPathsStrict(assetDurabilityPaths.files, assetDurabilityPaths.directories);
+                  // Make the complete restored image durable while every authority row
+                  // is still `restoring`. Phase C cannot expose `inactive` before this
+                  // barrier has succeeded.
+                  await tx._fileStore.flushStrict();
+                } else {
+                  // Preserve the legacy best-effort behavior for profiles that have
+                  // never enabled coordination, including Windows runtimes without a
+                  // directory-fsync primitive.
+                  await flushDB();
+                }
+              });
+              dataPhaseCompleted = true;
+
+              // Phase C: recheck the exact barrier in a fresh rollback domain. If this
+              // strict release fails, its transaction snapshot is `restoring`, while
+              // Phase B's complete data image is already durable.
+              if (barriers.length > 0) {
+                await app.db.transaction(async (tx) => {
+                  await assertCoordinationRestoreBarrier(tx, barriers);
+                  const completedAt = new Date().toISOString();
+                  const restoreBootId = randomUUID();
+                  for (const barrier of barriers) {
+                    await tx
+                      .update(schema.personalExtensionCoordination)
+                      .set({
+                        mode: "inactive",
+                        fence: barrier.fence + 1,
+                        serverBootId: restoreBootId,
+                        leaseTokenDigest: null,
+                        holderSessionId: null,
+                        expiresAt: null,
+                        handoffRequestId: null,
+                        handoffRequester: null,
+                        handoffDeadlineAt: null,
+                        activeOperations: "[]",
+                        updatedAt: completedAt,
+                      })
+                      .where(eq(schema.personalExtensionCoordination.extensionId, barrier.extensionId));
+                  }
+                  await tx._fileStore.flushStrict();
+                });
+              }
+              committed = true;
+              if (barriers.length > 0) {
+                const eventService = getPersonalExtensionCoordinationEventService(app.db);
+                for (const { extensionId } of barriers) {
+                  try {
+                    eventService.resetExtensionRuntime(extensionId);
+                  } catch {
+                    // Epoch rotation is a wake-up/cleanup hint. The strict fence and
+                    // boot-id transition above is the authority boundary, so a broken
+                    // subscriber must not turn a durable restore into a false failure.
+                    logger.warn(
+                      "[backup] Coordination event reset failed after profile restore; polling fallback remains active",
+                    );
+                  }
+                }
+              }
+              return {
+                imported: buildProfileImportStats(tableCounts, files),
+                reloadPersonalExtensions: (tableCounts.installed_extensions ?? 0) > 0,
+              };
+            } catch (error) {
+              if (committed) throw error;
+              const failures: unknown[] = [error];
+              if (restoringStarted) {
+                try {
+                  await preserveBlockedRestoreState(app.db, barriers);
+                } catch (blockError) {
+                  failures.push(blockError);
+                  logger.error(
+                    blockError,
+                    "[backup] Failed to persist blocked coordination state after profile restore failure",
+                  );
+                  // The previously durable `restoring` row remains the fail-closed
+                  // fallback if this secondary strict transition cannot be proved.
+                }
+              }
+              if (!dataPhaseCompleted) {
+                try {
+                  await rollbackPromotedProfileAssets(stagedAssets);
+                  if (restoringStarted && stagedAssets.assets.length > 0) {
+                    const rollbackDurabilityPaths = rolledBackProfileAssetDurabilityPaths(stagedAssets);
+                    await app.db._fileStore.flushPathsStrict(
+                      rollbackDurabilityPaths.files,
+                      rollbackDurabilityPaths.directories,
+                    );
+                  }
+                } catch (rollbackError) {
+                  rollbackFailed = true;
+                  failures.push(rollbackError);
+                  logger.error(
+                    rollbackError,
+                    "[backup] Asset rollback failed; preserving recovery files at %s",
+                    stagedAssets.rootDir,
+                  );
+                }
+              }
+              if (failures.length > 1) throw new AggregateError(failures, "Profile import recovery was incomplete");
+              throw error;
+            } finally {
+              if (!rollbackFailed) {
+                try {
+                  await cleanupStagedProfileAssets(stagedAssets);
+                } catch (cleanupError) {
+                  if (committed) logger.warn(cleanupError, "[backup] Failed to remove profile import staging files");
+                }
+              }
+            }
+          }),
+        ).catch((error) => {
+          // Phase B can already be durable when Phase C fails. Process-memory
+          // activity from the pre-restore profile is invalid on every exit path.
+          clearAllChatActivity();
+          throw error;
+        });
+        // Runtime reload may disable invalid extensions through the ordinary
+        // lifecycle guard, so it must run only after the coordination gate is
+        // released. Asset maintenance still excludes profile file writers.
+        clearAllChatActivity();
+        if (outcome.reloadPersonalExtensions) await personalServerExtensionRuntime.reloadAll();
+        return outcome.imported;
+      }),
+    ),
+  );
 }
 
 async function buildProfileExportEnvelope(
@@ -1494,7 +1840,7 @@ async function buildProfileArchiveSources(
   const tablesDir = join(workingDir, "profile-tables");
   await mkdir(tablesDir, { recursive: true });
 
-  for (const tableName of FILE_BACKED_TABLES) {
+  for (const tableName of PROFILE_FILE_BACKED_TABLES) {
     const table = profileTableObjects.get(tableName);
     if (!table) continue;
     const rows = (await app.db.select().from(table as any)) as Array<Record<string, unknown>>;
@@ -2712,7 +3058,7 @@ async function hydrateProfileArchiveStorageSnapshot(
 
   const tables: ProfileTableSnapshots = {};
   let memoryWarningLogged = false;
-  for (const tableName of FILE_BACKED_TABLES) {
+  for (const tableName of PROFILE_FILE_BACKED_TABLES) {
     const descriptor = archiveSnapshot.tables[tableName];
     if (!descriptor) {
       tables[tableName] = [];
@@ -3267,37 +3613,47 @@ export async function backupRoutes(app: FastifyInstance) {
     if (automaticBackupRunning) return;
     automaticBackupRunning = true;
     try {
-      const settings = await loadAutomaticBackupSettings();
-      if (!settings.enabled) return;
-      const lastBackupMs = settings.lastBackupAt ? Date.parse(settings.lastBackupAt) : Number.NaN;
-      const due =
-        force ||
-        !Number.isFinite(lastBackupMs) ||
-        Date.now() - lastBackupMs >= automaticBackupPeriodMs(settings.frequency);
-      if (!due) return;
+      // Timer and queueMicrotask callers are detached from any request that
+      // scheduled them, so they must acquire a fresh shared admission. Keep the
+      // settings read, archive snapshot, and final RMW update in one window.
+      await runWithDetachedProfileAssetMutation(async () => {
+        try {
+          const settings = await loadAutomaticBackupSettings();
+          if (!settings.enabled) return;
+          const lastBackupMs = settings.lastBackupAt ? Date.parse(settings.lastBackupAt) : Number.NaN;
+          const due =
+            force ||
+            !Number.isFinite(lastBackupMs) ||
+            Date.now() - lastBackupMs >= automaticBackupPeriodMs(settings.frequency);
+          if (!due) return;
 
-      const { removedBackups, omittedEntries } = await withAutomaticBackupLifecycleLock(() =>
-        writeAutomaticBackup(app, settings.retentionCount),
-      );
-      const current = await loadAutomaticBackupSettings();
-      await saveAutomaticBackupSettings({
-        ...current,
-        lastBackupAt: new Date().toISOString(),
-        lastError: null,
-        lastOmittedEntries: omittedEntries,
+          const { removedBackups, omittedEntries } = await withAutomaticBackupLifecycleLock(() =>
+            writeAutomaticBackup(app, settings.retentionCount),
+          );
+          const current = await loadAutomaticBackupSettings();
+          await saveAutomaticBackupSettings({
+            ...current,
+            lastBackupAt: new Date().toISOString(),
+            lastError: null,
+            lastOmittedEntries: omittedEntries,
+          });
+          if (omittedEntries.length > 0) {
+            logger.warn(
+              "[backup] Automatic backup completed with %d omitted file(s); see RESTORE.txt in the archive",
+              omittedEntries.length,
+            );
+          }
+          logger.info(
+            "[backup] Automatic backup completed; pruned %d expired automatic archive(s)",
+            removedBackups.length,
+          );
+        } catch (error) {
+          const current = await loadAutomaticBackupSettings();
+          const message = getBackupErrorMessage(error, "Automatic backup failed");
+          await saveAutomaticBackupSettings({ ...current, lastError: message });
+          logger.error(error, "[backup] Automatic backup failed");
+        }
       });
-      if (omittedEntries.length > 0) {
-        logger.warn(
-          "[backup] Automatic backup completed with %d omitted file(s); see RESTORE.txt in the archive",
-          omittedEntries.length,
-        );
-      }
-      logger.info("[backup] Automatic backup completed; pruned %d expired automatic archive(s)", removedBackups.length);
-    } catch (error) {
-      const current = await loadAutomaticBackupSettings();
-      const message = getBackupErrorMessage(error, "Automatic backup failed");
-      await saveAutomaticBackupSettings({ ...current, lastError: message });
-      logger.error(error, "[backup] Automatic backup failed");
     } finally {
       automaticBackupRunning = false;
     }
@@ -3559,42 +3915,53 @@ export async function backupRoutes(app: FastifyInstance) {
   // ── Profile Export ──
   // Native keeps the original profile JSON shape; ZIP is offered when JSON gets too large.
   app.get<{ Querystring: { format?: ExportFormat } }>("/export-profile", async (req, reply) => {
-    if (!requirePrivilegedAccess(req, reply, { feature: "Profile export" })) return;
+    return runWithProfileAssetMutation(async () => {
+      if (!requirePrivilegedAccess(req, reply, { feature: "Profile export" })) return;
 
-    try {
-      if (req.query.format === "compatible") {
-        const zip = await buildCompatibleProfileZip(app);
-        const buffer = zip.toBuffer();
-        return reply
-          .header("Content-Type", "application/zip")
-          .header("Content-Disposition", `attachment; filename="marinara-compatible-export.zip"`)
-          .header("Content-Length", buffer.length.toString())
-          .send(buffer);
-      }
+      try {
+        if (req.query.format === "compatible") {
+          const zip = await buildCompatibleProfileZip(app);
+          const buffer = zip.toBuffer();
+          return reply
+            .header("Content-Type", "application/zip")
+            .header("Content-Disposition", `attachment; filename="marinara-compatible-export.zip"`)
+            .header("Content-Length", buffer.length.toString())
+            .send(buffer);
+        }
 
-      if (req.query.format === "zip") {
-        return await sendNativeProfileZipExport(app, reply);
-      }
+        if (req.query.format === "zip") {
+          return await sendNativeProfileZipExport(app, reply);
+        }
 
-      return await sendNativeProfileJsonExport(app, reply);
-    } catch (err) {
-      if (err instanceof ProfileArchiveTooLargeError) {
-        return reply.status(413).send({
-          error: "Profile ZIP export is too large",
-          message: err.message,
-        });
+        return await sendNativeProfileJsonExport(app, reply);
+      } catch (err) {
+        if (err instanceof ProfileArchiveTooLargeError) {
+          return reply.status(413).send({
+            error: "Profile ZIP export is too large",
+            message: err.message,
+          });
+        }
+        return sendBackupRouteError(reply, err, "Profile export");
       }
-      return sendBackupRouteError(reply, err, "Profile export");
-    }
+    });
   });
 
   // ── Profile Import ──
   // Accepts a profile JSON envelope or profile ZIP archive and creates all entities.
   app.post("/import-profile", { bodyLimit: PROFILE_IMPORT_BODY_LIMIT_BYTES }, async (req, reply) => {
-    if (!requirePrivilegedAccess(req, reply, { feature: "Profile import" })) return;
-
     const wantsProgressStream = String(req.headers.accept ?? "").includes("text/event-stream");
     const previewOnly = (req.query as { preview?: unknown } | undefined)?.preview === "true";
+
+    // A profile restore rewrites coordination-protected CMB config and lorebooks,
+    // so the write path is an operator action, not an ordinary same-origin
+    // privileged call — regardless of whether coordination rows exist yet, since
+    // an archive can introduce them. Preview writes nothing and keeps the
+    // ordinary gate so inspecting an archive does not require the admin secret.
+    if (previewOnly) {
+      if (!requirePrivilegedAccess(req, reply, { feature: "Profile import preview" })) return;
+    } else if (!requireCoordinationAdminAccess(req, reply, { feature: "Profile import" })) {
+      return;
+    }
     const expectedFingerprint =
       typeof req.headers["x-profile-preview-fingerprint"] === "string"
         ? req.headers["x-profile-preview-fingerprint"].trim()
@@ -4113,6 +4480,11 @@ export async function backupRoutes(app: FastifyInstance) {
       } catch (err) {
         if (wantsProgressStream) {
           const message = getBackupErrorMessage(err, "Profile import failed. Check the server logs for details.");
+          const coordinationCode =
+            err instanceof ProfileImportCoordinationBlockedError ||
+            err instanceof ProfileImportCoordinationUnavailableError
+              ? err.code
+              : undefined;
           if (!(err instanceof ProfileImportRequestError)) {
             const logError = err instanceof Error ? err : new Error(message);
             logger.error(logError, "[backup] Profile import failed");
@@ -4122,10 +4494,23 @@ export async function backupRoutes(app: FastifyInstance) {
             data: {
               error: err instanceof ProfileImportRequestError ? "Invalid profile export" : "Profile import failed",
               message,
+              ...(coordinationCode ? { code: coordinationCode } : {}),
             },
           });
           reply.raw.end();
           return;
+        }
+        if (err instanceof ProfileImportCoordinationBlockedError) {
+          return reply.status(409).send({
+            code: err.code,
+            error: "Personal extension coordination must be deactivated before restoring a profile.",
+          });
+        }
+        if (err instanceof ProfileImportCoordinationUnavailableError) {
+          return reply.status(503).send({
+            code: err.code,
+            error: "Strict durability is unavailable for a coordinated profile restore.",
+          });
         }
         if (err instanceof ProfileImportRequestError) {
           return sendProfileImportRequestError(reply, err);

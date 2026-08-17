@@ -197,9 +197,8 @@ function parsePathParts(rel: string): { category: string; subcategory: string } 
   };
 }
 
-/** Scan the entire game-assets tree and build the manifest. */
-export function buildAssetManifest(): AssetManifest {
-  ensureAssetDirs();
+/** Read the current asset trees without mutating user files or cache state. */
+function scanAssetManifest(): AssetManifest {
   const assets: Record<string, AssetEntry> = {};
   const byCategory: Record<string, AssetEntry[]> = {};
 
@@ -252,9 +251,14 @@ export function buildAssetManifest(): AssetManifest {
     byCategory,
   };
 
-  // Persist to disk for quick reload
-  writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2), "utf-8");
+  return manifest;
+}
 
+/** Scan the entire game-assets tree and durably refresh the derived cache. */
+export function buildAssetManifest(): AssetManifest {
+  ensureAssetDirs();
+  const manifest = scanAssetManifest();
+  writeFileSync(MANIFEST_PATH, JSON.stringify(manifest, null, 2), "utf-8");
   return manifest;
 }
 
@@ -267,5 +271,8 @@ export function getAssetManifest(): AssetManifest {
       // Corrupt file — rebuild
     }
   }
-  return buildAssetManifest();
+  // GET/read callers must stay side-effect free. Startup and every supported
+  // asset mutation explicitly rebuild the persisted cache; a missing/corrupt
+  // cache can still be served from a read-only in-memory scan.
+  return scanAssetManifest();
 }

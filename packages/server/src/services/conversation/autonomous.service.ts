@@ -515,3 +515,8 @@ export function checkCharacterExchange(
 export function clearChatActivity(chatId: string): void {
   activityStates.delete(chatId);
 }
+
+/** A profile restore attempt can replace the chat timeline behind every ID. */
+export function clearAllChatActivity(): void {
+  activityStates.clear();
+}

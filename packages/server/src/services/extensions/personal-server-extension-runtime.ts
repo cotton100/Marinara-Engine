@@ -4,6 +4,7 @@ import type { DB } from "../../db/connection.js";
 import { logger } from "../../lib/logger.js";
 import { createAppSettingsStorage } from "../storage/app-settings.storage.js";
 import { createPersonalExtensionSettingsStorage } from "./personal-extension-settings.service.js";
+import { getPersonalExtensionCoordinationService } from "./personal-extension-coordination.service.js";
 import { createPersonalExtensionsStorage } from "./personal-extension-storage.service.js";
 import {
   canExecutePersonalExtension,
@@ -274,14 +275,17 @@ export class PersonalServerExtensionRuntime {
 
   private async handleStorageMessage(extension: PersonalExtension, active: ActiveExtension, message: RunnerMessage) {
     if (!this.db || !message.requestId) return;
-    const settings = createPersonalExtensionSettingsStorage(createAppSettingsStorage(this.db));
+    const settings = createPersonalExtensionSettingsStorage(createAppSettingsStorage(this.db), {
+      db: this.db,
+      coordination: getPersonalExtensionCoordinationService(this.db),
+    });
     try {
       let value: unknown;
       if (message.action === "get") value = await settings.get(extension.id);
-      else if (message.action === "patch")
-        value = await settings.patch(extension.id, message.payload as Record<string, unknown>);
-      else if (message.action === "delete") {
-        await settings.remove(extension.id);
+      else if (message.action === "patch") {
+        value = await settings.patchLegacy(extension.id, message.payload as Record<string, unknown>);
+      } else if (message.action === "delete") {
+        await settings.removeLegacy(extension.id);
         value = {};
       } else {
         throw new Error("Unknown storage action");

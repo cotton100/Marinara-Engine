@@ -5821,9 +5821,12 @@ assert.match(backupRoutesSource, /PROFILE_ARCHIVE_CENTRAL_DIRECTORY_LIMIT_BYTES 
 assert.match(backupRoutesSource, /PROFILE_ARCHIVE_ENTRY_COUNT_LIMIT = 8_192/u);
 assert.match(serverAppSource, /const clientIndex = resolve\(clientDist, "index\.html"\)/u);
 assert.match(serverAppSource, /if \(existsSync\(clientIndex\)\)/u);
+// owo: the settings read sits inside a detached profile-asset admission
+// (runWithDetachedProfileAssetMutation) so timer-driven backups cannot race a
+// profile restore; the re-entrancy guard ordering pinned here is unchanged.
 assert.match(
   backupRoutesSource,
-  /if \(automaticBackupRunning\) return;\s*automaticBackupRunning = true;\s*try \{\s*const settings = await loadAutomaticBackupSettings\(\);/u,
+  /if \(automaticBackupRunning\) return;\s*automaticBackupRunning = true;\s*try \{\s*(?:\/\/[^\n]*\n\s*)*(?:await runWithDetachedProfileAssetMutation\(async \(\) => \{\s*try \{\s*)?const settings = await loadAutomaticBackupSettings\(\);/u,
 );
 assert.match(
   backupRoutesSource,

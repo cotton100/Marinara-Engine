@@ -915,6 +915,96 @@ try {
   await ttlDispatchingTakeoverFixture.cleanup();
 }
 
+const handoffDispatchingTakeoverFixture = await createFixture();
+try {
+  const lease = await handoffDispatchingTakeoverFixture.kernel.acquireLease({
+    extensionId: EXTENSION_ID,
+    holderSessionId: HOLDER,
+    serverBootId: BOOT_ID,
+    contentHash: CONTENT_HASH,
+  });
+  const operation = await handoffDispatchingTakeoverFixture.kernel.beginOperation({
+    ...authority(lease),
+    kind: "mutation",
+    targetEnsembleId: ENSEMBLE_ID,
+    requestedDeadlineMs: 1_000,
+  });
+  const context = { ...authority(lease), operationHandle: operation.operationHandle };
+  await writeConfig(handoffDispatchingTakeoverFixture, context, 0, ["mutation-ambiguous"]);
+  await expectCode(
+    mutateLorebook(handoffDispatchingTakeoverFixture, context, 0, async () => {
+      throw new Error("simulated handoff post-dispatch failure before data commit");
+    }),
+    "coordination-unavailable",
+  );
+  await handoffDispatchingTakeoverFixture.kernel.endOperation({
+    ...authority(lease),
+    operationHandle: operation.operationHandle,
+    disposition: "aborted",
+  });
+
+  const requester = "coordination-journal-handoff-dispatching-requester";
+  const handoff = await handoffDispatchingTakeoverFixture.kernel.requestHandoff({
+    extensionId: EXTENSION_ID,
+    holderSessionId: requester,
+    serverBootId: BOOT_ID,
+    contentHash: CONTENT_HASH,
+  });
+  assert.equal(handoff.status, "draining");
+  assert.equal(handoff.remainingMs, 0, "the orphan journal is not an active draining operation");
+
+  const journalBeforeTakeover = await journalFor(handoffDispatchingTakeoverFixture, operation.operationHandle);
+  assert.equal(journalBeforeTakeover.phase, "dispatching");
+  const markerBeforeTakeover = (
+    await handoffDispatchingTakeoverFixture.db
+      .select()
+      .from(appSettings)
+      .where(eq(appSettings.key, STORAGE_SETTING_KEY))
+  )[0]!.value;
+  const rowBeforeTakeover = await coordinationRow(handoffDispatchingTakeoverFixture);
+
+  handoffDispatchingTakeoverFixture.advance(45_001);
+  await expectCode(
+    handoffDispatchingTakeoverFixture.kernel.acquireLease({
+      extensionId: EXTENSION_ID,
+      holderSessionId: requester,
+      serverBootId: BOOT_ID,
+      contentHash: CONTENT_HASH,
+    }),
+    "coordination-transition-blocked",
+  );
+
+  const blocked = await coordinationRow(handoffDispatchingTakeoverFixture);
+  assert.equal(blocked.mode, "blocked", "handoff takeover must not acquire around dispatching recovery evidence");
+  assert.equal(blocked.fence, rowBeforeTakeover.fence + 1, "handoff blocking advances the fence exactly once");
+  assert.equal(blocked.serverBootId, BOOT_ID);
+  assert.equal(blocked.contentHash, CONTENT_HASH);
+  assert.equal(blocked.leaseTokenDigest, null);
+  assert.equal(blocked.holderSessionId, null);
+  assert.equal(blocked.expiresAt, null);
+  assert.equal(blocked.handoffRequestId, null);
+  assert.equal(blocked.handoffRequester, null);
+  assert.equal(blocked.handoffDeadlineAt, null);
+  assert.equal(blocked.activeOperations, "[]");
+  assert.deepEqual(
+    await journalFor(handoffDispatchingTakeoverFixture, operation.operationHandle),
+    journalBeforeTakeover,
+    "handoff blocking must preserve exact dispatching recovery evidence",
+  );
+  assert.equal(
+    (
+      await handoffDispatchingTakeoverFixture.db
+        .select()
+        .from(appSettings)
+        .where(eq(appSettings.key, STORAGE_SETTING_KEY))
+    )[0]!.value,
+    markerBeforeTakeover,
+    "handoff blocking must preserve the manual recovery marker",
+  );
+} finally {
+  await handoffDispatchingTakeoverFixture.cleanup();
+}
+
 const fixture = await createFixture();
 try {
   const lease = await fixture.kernel.acquireLease({

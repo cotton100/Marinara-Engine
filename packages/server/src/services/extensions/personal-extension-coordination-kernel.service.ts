@@ -2075,6 +2075,40 @@ export function createPersonalExtensionCoordinationKernel(
     return committed.response;
   };
 
+  const blockAcquireTransition = async (
+    tx: DB,
+    row: PersonalExtensionCoordinationRow,
+    wallMs: number,
+  ) => {
+    const fence = nextFence(row.fence);
+    await tx
+      .update(personalExtensionCoordination)
+      .set({
+        mode: "blocked",
+        serverBootId,
+        fence,
+        leaseTokenDigest: null,
+        holderSessionId: null,
+        expiresAt: null,
+        handoffRequestId: null,
+        handoffRequester: null,
+        handoffDeadlineAt: null,
+        activeOperations: "[]",
+        updatedAt: new Date(wallMs).toISOString(),
+      })
+      .where(eq(personalExtensionCoordination.extensionId, row.extensionId));
+    return fence;
+  };
+
+  const blockAcquireIfJournalUnresolved = async (
+    tx: DB,
+    row: PersonalExtensionCoordinationRow,
+    wallMs: number,
+  ) => {
+    if ((await readUnresolvedOperationJournals(tx, row.extensionId)).length === 0) return null;
+    return blockAcquireTransition(tx, row, wallMs);
+  };
+
   const acquireLease = async (input: PersonalExtensionLeaseAcquireInput): Promise<PersonalExtensionLeaseGrant> => {
     requireIdentifier(input.holderSessionId);
     const committed = await runStrictMutation(
@@ -2092,23 +2126,7 @@ export function createPersonalExtensionCoordinationKernel(
           }
           const hasUnresolvedJournal = (await readUnresolvedOperationJournals(tx, input.extensionId)).length > 0;
           if (hasPersistedOperations || hasUnresolvedJournal) {
-            const fence = nextFence(row.fence);
-            await tx
-              .update(personalExtensionCoordination)
-              .set({
-                mode: "blocked",
-                serverBootId,
-                fence,
-                leaseTokenDigest: null,
-                holderSessionId: null,
-                expiresAt: null,
-                handoffRequestId: null,
-                handoffRequester: null,
-                handoffDeadlineAt: null,
-                activeOperations: "[]",
-                updatedAt: new Date(wallMs).toISOString(),
-              })
-              .where(eq(personalExtensionCoordination.extensionId, input.extensionId));
+            const fence = await blockAcquireTransition(tx, row, wallMs);
             return { blocked: true as const, fence };
           }
         }
@@ -2151,6 +2169,8 @@ export function createPersonalExtensionCoordinationKernel(
             // acquire is the only fallback and advances the fence exactly once.
             fence = nextFence(row.fence);
           }
+          const blockedFence = await blockAcquireIfJournalUnresolved(tx, row, wallMs);
+          if (blockedFence !== null) return { blocked: true as const, fence: blockedFence };
         } else {
           if (isLeaseLive(row, monotonicMs)) throw kernelError("lease-held");
           const { kept, reapedOperations } = reapExpiredOperations(
@@ -2165,26 +2185,8 @@ export function createPersonalExtensionCoordinationKernel(
             throw kernelError("operations-active");
           }
           await clearSafelyReapedPreparedJournals(tx, input.extensionId, reapedOperations);
-          if ((await readUnresolvedOperationJournals(tx, input.extensionId)).length > 0) {
-            const blockedFence = nextFence(row.fence);
-            await tx
-              .update(personalExtensionCoordination)
-              .set({
-                mode: "blocked",
-                serverBootId,
-                fence: blockedFence,
-                leaseTokenDigest: null,
-                holderSessionId: null,
-                expiresAt: null,
-                handoffRequestId: null,
-                handoffRequester: null,
-                handoffDeadlineAt: null,
-                activeOperations: "[]",
-                updatedAt: new Date(wallMs).toISOString(),
-              })
-              .where(eq(personalExtensionCoordination.extensionId, input.extensionId));
-            return { blocked: true as const, fence: blockedFence };
-          }
+          const blockedFence = await blockAcquireIfJournalUnresolved(tx, row, wallMs);
+          if (blockedFence !== null) return { blocked: true as const, fence: blockedFence };
           fence = nextFence(row.fence);
         }
 

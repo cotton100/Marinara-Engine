@@ -23,6 +23,7 @@ import { isTtsLocalUrlsEnabled } from "../config/runtime-config.js";
 import { safeFetch } from "../utils/security.js";
 import { logger } from "../lib/logger.js";
 import { buildAssetManifest, GAME_ASSETS_DIR } from "../services/game/asset-manifest.service.js";
+import { runWithDetachedProfileAssetMutation } from "../services/import/profile-asset-mutation-gate.js";
 
 // OpenAI built-in voices used as fallback when the provider has no /audio/voices endpoint
 const OPENAI_FALLBACK_VOICES = ["alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"];
@@ -156,11 +157,11 @@ function scheduleGameAssetManifestRebuild(): void {
   if (gameAssetManifestRebuildTimer) clearTimeout(gameAssetManifestRebuildTimer);
   gameAssetManifestRebuildTimer = setTimeout(() => {
     gameAssetManifestRebuildTimer = null;
-    try {
+    void runWithDetachedProfileAssetMutation(async () => {
       buildAssetManifest();
-    } catch (error) {
+    }).catch((error) => {
       logger.error(error, "Failed to rebuild the game asset manifest after generating audio");
-    }
+    });
   }, 500);
   gameAssetManifestRebuildTimer.unref();
 }
@@ -749,9 +750,7 @@ export async function fetchElevenLabsVoiceOptions(
 
     if (!res.ok) {
       const detail = readProviderErrorDetail(await res.text().catch(() => ""));
-      throw new Error(
-        `ElevenLabs voices request failed (${res.status})${detail ? `: ${detail}` : ""}`,
-      );
+      throw new Error(`ElevenLabs voices request failed (${res.status})${detail ? `: ${detail}` : ""}`);
     }
 
     const data = await res.json();
@@ -1090,9 +1089,7 @@ export async function ttsRoutes(app: FastifyInstance) {
       : cfg.source === "openai" && openAiModelSupportsSpeechInstructions(model)
         ? buildSpeechInstructions({ speaker, tone })
         : undefined;
-    const pocketTtsForm = useOfficialPocketTtsSpeech
-      ? buildOfficialPocketTtsForm(providerText, requestVoice)
-      : null;
+    const pocketTtsForm = useOfficialPocketTtsSpeech ? buildOfficialPocketTtsForm(providerText, requestVoice) : null;
 
     let providerRes: Response;
     try {

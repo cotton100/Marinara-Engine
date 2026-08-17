@@ -78,18 +78,20 @@ assert.match(settingsPanelSource, /settings\.externalExtensions\.warning/u);
 assert.match(clientInjectorSource, /iframe\.setAttribute\("sandbox", "allow-scripts"\)/u);
 assert.doesNotMatch(clientInjectorSource, /allow-same-origin/u);
 assert.match(clientInjectorSource, /event\.origin !== "null"/u);
-assert.match(clientInjectorSource, /extension\.executionMode === "full-page"/u);
-assert.match(clientInjectorSource, /document\.createElement\("script"\)/u);
-assert.match(clientInjectorSource, /__marinaraRunFullPageExtension/u);
-assert.match(clientInjectorSource, /activeFullPageExtensions\.get\(identity\.id\)/u);
-assert.match(clientInjectorSource, /identity\.contentHash !== active\.contentHash/u);
-assert.match(clientInjectorSource, /const stale = activeFullPageExtensions\.get\(identity\.id\) !== active/u);
+assert.match(clientInjectorSource, /executionMode === "full-page"/u);
+assert.doesNotMatch(clientInjectorSource, /document\.createElement\("script"\)/u);
+assert.doesNotMatch(clientInjectorSource, /__marinaraRunFullPageExtension/u);
+assert.match(clientInjectorSource, /import\(\/\* @vite-ignore \*\/ options\.runtimeUrl\)/u);
+assert.match(clientInjectorSource, /runtime\.extensionId !== options\.identity\.id/u);
+assert.match(clientInjectorSource, /runtime\.contentHash !== options\.identity\.contentHash/u);
+assert.match(clientInjectorSource, /hostMapGet\(activeFullPageExtensions, identity\.id\) === active/u);
+assert.match(clientInjectorSource, /pristineObjectFreeze\(api\)/u);
+assert.match(clientInjectorSource, /hostWeakMapSet\(fullPageCoordination, active, coordination\)/u);
+assert.doesNotMatch(clientInjectorSource, /active\.coordination\s*=/u);
+assert.match(clientInjectorSource, /runtimeUrl: approvedFullPageRuntimeUrl\(identity\)/u);
+assert.doesNotMatch(clientInjectorSource, /runtimeUrl: active\.extension\.runtimeUrl/u);
 assert.match(clientInjectorSource, /late cleanup failed/u);
 assert.match(clientInjectorSource, /Full-page extension runtime could not be loaded/u);
-assert.match(
-  clientInjectorSource,
-  /activeFullPageExtensions\.get\(extension\.id\)\?\.script === script[\s\S]*cleanupExtension\(extension\.id\)/u,
-);
 assert.match(clientInjectorSource, /registerPersonalExtensionContribution/u);
 assert.match(clientInjectorSource, /removePersonalExtensionContributions/u);
 assert.match(clientInjectorSource, /message\.contentHash === active\.contentHash/u);
@@ -697,41 +699,142 @@ try {
       marinara.onCleanup(() => delete document.documentElement.dataset.fullPageProof);
     `,
   };
-  let fullPageMain:
-    | ((api: {
-        extension: Readonly<{ id: string; name: string; contentHash: string }>;
-        onCleanup: (cleanup: () => unknown) => void;
-      }) => unknown)
-    | undefined;
-  const fullPageIdentity: Array<{ id: string; name: string; contentHash: string }> = [];
+  const { approvedFullPageRuntimeUrl, loadApprovedFullPageExtensionModule } =
+    await import("../../packages/client/src/components/layout/PersonalExtensionInjector.js");
+  const fullPageIdentity = Object.freeze({
+    id: fullPageExtension.id,
+    name: fullPageExtension.name,
+    contentHash: fullPageExtension.contentHash,
+  });
+  const forgedRuntimeDescriptor = {
+    ...fullPageIdentity,
+    runtimeUrl: "data:text/javascript,export default function malicious(){}",
+  };
+  assert.equal(
+    approvedFullPageRuntimeUrl(forgedRuntimeDescriptor),
+    "/api/personal-extensions/legacy-page-demo/page-runtime.js?hash=sha256%3Afull-page-demo",
+    "The host must derive the approved runtime endpoint instead of trusting runtime-list runtimeUrl",
+  );
+
   const fullPageDocument = { documentElement: { dataset: {} as Record<string, string> } };
-  runInNewContext(fullPageExtensionSource(fullPageExtension), {
-    document: fullPageDocument,
-    window: {
-      __marinaraRunFullPageExtension: (
-        identity: { id: string; name: string; contentHash: string },
-        main: typeof fullPageMain,
-      ) => {
-        fullPageIdentity.push(identity);
-        fullPageMain = main;
-      },
-    },
-  });
-  assert.deepEqual(Array.from(fullPageIdentity[0] ? Object.values(fullPageIdentity[0]) : []), [
-    "legacy-page-demo",
-    "Legacy Page Demo",
-    "sha256:full-page-demo",
-  ]);
-  assert.ok(fullPageMain);
   const fullPageCleanups: Array<() => unknown> = [];
-  await fullPageMain({
-    extension: Object.freeze(fullPageIdentity[0]!),
-    onCleanup: (cleanup) => fullPageCleanups.push(cleanup),
-  });
-  assert.equal(fullPageDocument.documentElement.dataset.fullPageProof, "legacy-page-demo");
-  assert.equal(fullPageCleanups.length, 1);
-  fullPageCleanups[0]!();
-  assert.equal(fullPageDocument.documentElement.dataset.fullPageProof, undefined);
+  const approvedCoordinationFacade = Object.freeze({ marker: "approved-cmb-facade" });
+  let dispatcherCalls = 0;
+  let interceptedCoordinationFacade: unknown = null;
+  const hostileWindow = {
+    __marinaraRunFullPageExtension: (_identity: unknown, main: (api: { coordination?: unknown }) => unknown) => {
+      dispatcherCalls += 1;
+      return (api: { coordination?: unknown }) => {
+        interceptedCoordinationFacade = api.coordination;
+        return main(api);
+      };
+    },
+  };
+  const globals = globalThis as typeof globalThis & { document?: unknown; window?: unknown };
+  const previousDocument = Object.getOwnPropertyDescriptor(globals, "document");
+  const previousWindow = Object.getOwnPropertyDescriptor(globals, "window");
+  try {
+    Object.defineProperty(globals, "document", { configurable: true, value: fullPageDocument });
+    Object.defineProperty(globals, "window", { configurable: true, value: hostileWindow });
+    const moduleSource = fullPageExtensionSource(fullPageExtension);
+    assert.match(moduleSource, /export const extensionId = "legacy-page-demo"/u);
+    assert.doesNotMatch(moduleSource, /extensionName/u);
+    assert.match(moduleSource, /export default async function main\(marinara\)/u);
+    assert.doesNotMatch(moduleSource, /__marinaraRunFullPageExtension/u);
+    const moduleUrl = `data:text/javascript;base64,${Buffer.from(moduleSource).toString("base64")}`;
+    const current = { value: true };
+    const ready = await loadApprovedFullPageExtensionModule({
+      runtimeUrl: moduleUrl,
+      identity: fullPageIdentity,
+      isCurrent: () => current.value,
+      createApi: () => ({
+        extension: fullPageIdentity,
+        coordination: approvedCoordinationFacade,
+        onCleanup: (cleanup: () => unknown) => fullPageCleanups.push(cleanup),
+      }),
+      registerCleanup: (cleanup) => fullPageCleanups.push(cleanup),
+      onLateCleanupError: (error) => {
+        throw error;
+      },
+    });
+    assert.equal(ready, true);
+    assert.equal(fullPageDocument.documentElement.dataset.fullPageProof, "legacy-page-demo");
+    assert.equal(fullPageCleanups.length, 1);
+    fullPageCleanups[0]!();
+    assert.equal(fullPageDocument.documentElement.dataset.fullPageProof, undefined);
+
+    const renamedIdentity = Object.freeze({ ...fullPageIdentity, name: "Renamed Page Demo" });
+    let renamedApiName: string | null = null;
+    const renamedCleanups: Array<() => unknown> = [];
+    const renamedReady = await loadApprovedFullPageExtensionModule({
+      runtimeUrl: moduleUrl,
+      identity: renamedIdentity,
+      isCurrent: () => true,
+      createApi: () => {
+        renamedApiName = renamedIdentity.name;
+        return {
+          extension: renamedIdentity,
+          coordination: approvedCoordinationFacade,
+          onCleanup: (cleanup: () => unknown) => renamedCleanups.push(cleanup),
+        };
+      },
+      registerCleanup: (cleanup) => renamedCleanups.push(cleanup),
+      onLateCleanupError: (error) => {
+        throw error;
+      },
+    });
+    assert.equal(renamedReady, true, "A display-name-only change must survive the native ESM module cache");
+    assert.equal(renamedApiName, "Renamed Page Demo");
+    assert.equal(renamedCleanups.length, 1);
+    renamedCleanups[0]!();
+
+    let mismatchedApiIssued = false;
+    const mismatchedSource = fullPageExtensionSource({
+      ...fullPageExtension,
+      contentHash: "sha256:stale-full-page-demo",
+    });
+    await assert.rejects(
+      loadApprovedFullPageExtensionModule({
+        runtimeUrl: `data:text/javascript;base64,${Buffer.from(mismatchedSource).toString("base64")}`,
+        identity: fullPageIdentity,
+        isCurrent: () => true,
+        createApi: () => {
+          mismatchedApiIssued = true;
+          return {};
+        },
+        registerCleanup: () => undefined,
+        onLateCleanupError: () => undefined,
+      }),
+      /identity did not match/u,
+    );
+    assert.equal(mismatchedApiIssued, false, "A stale module hash must fail before the host issues an API");
+
+    let removedApiIssued = false;
+    const removedResult = await loadApprovedFullPageExtensionModule({
+      runtimeUrl: "data:text/javascript,throw%20new%20Error(%27late-load%27)",
+      identity: fullPageIdentity,
+      isCurrent: () => false,
+      createApi: () => {
+        removedApiIssued = true;
+        return {};
+      },
+      registerCleanup: () => undefined,
+      onLateCleanupError: () => undefined,
+    });
+    assert.equal(removedResult, false, "A removed runtime's late import failure must close quietly");
+    assert.equal(removedApiIssued, false);
+  } finally {
+    if (previousDocument) Object.defineProperty(globals, "document", previousDocument);
+    else Reflect.deleteProperty(globals, "document");
+    if (previousWindow) Object.defineProperty(globals, "window", previousWindow);
+    else Reflect.deleteProperty(globals, "window");
+  }
+  assert.equal(dispatcherCalls, 0, "An earlier full-page dispatcher hook must never run");
+  assert.equal(
+    interceptedCoordinationFacade,
+    null,
+    "An earlier full-page extension must not observe a later extension's coordination facade",
+  );
 
   const { createPersonalExtensionRecordContext } =
     await import("../../packages/server/src/routes/personal-extensions.routes.js");

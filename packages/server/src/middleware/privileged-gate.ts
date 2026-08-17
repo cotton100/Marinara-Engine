@@ -53,14 +53,34 @@ export function requirePrivilegedAccess(
   if (!getAdminSecret()) {
     reply.status(403).send({
       error: "ADMIN_SECRET is required for privileged APIs",
-      message:
-        "Set ADMIN_SECRET=<secret> in the server .env and send the same value in the X-Admin-Secret header.",
+      message: "Set ADMIN_SECRET=<secret> in the server .env and send the same value in the X-Admin-Secret header.",
     });
     return false;
   }
 
   if (!isAdminAuthorized(request)) {
     reply.status(403).send({ error: "Invalid or missing X-Admin-Secret header" });
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Coordination activation and recovery are never exempt from the exact admin
+ * secret, even when the surrounding host, Basic Auth, or network policy has
+ * already accepted a request. Keep the normal privileged gate first so this
+ * helper adds to, rather than replaces, the existing request protections.
+ */
+export function requireCoordinationAdminAccess(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  options: { loopbackOnly?: boolean; trustedNetwork?: boolean; feature?: string } = {},
+): boolean {
+  if (!requirePrivilegedAccess(request, reply, options)) return false;
+
+  if (!isAdminAuthorized(request)) {
+    reply.status(403).send({ error: "Coordination admin authorization required" });
     return false;
   }
 

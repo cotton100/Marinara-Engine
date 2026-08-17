@@ -41,12 +41,19 @@ assert.ok(protectNoodlerGeneratedIdentity("portrait of @janedoe", "open", linked
 
 // NoodleR media is only reachable through the access-checked endpoint namespace.
 assert.equal(noodlerPostMediaUrl("post123"), "/api/noodle/noodler/posts/post123/media");
-assert.equal(readNoodlerMediaPath({ metadata: { noodlerMediaPath: "noodler-media/acc/img.png" } }), "noodler-media/acc/img.png");
+assert.equal(
+  readNoodlerMediaPath({ metadata: { noodlerMediaPath: "noodler-media/acc/img.png" } }),
+  "noodler-media/acc/img.png",
+);
 assert.equal(readNoodlerMediaPath({ metadata: { noodlerMediaPath: "some/other/img.png" } }), null);
 assert.equal(readNoodlerMediaPath({ metadata: {} }), null);
 // Traversal and non-namespaced paths never resolve to an on-disk file.
 assert.equal(resolveNoodlerMediaAbsolutePath("noodler-media/../../etc/passwd"), null);
 assert.equal(resolveNoodlerMediaAbsolutePath("gallery/chat/img.png"), null);
-assert.ok(resolveNoodlerMediaAbsolutePath("noodler-media/acc/img.png")?.endsWith("noodler-media/acc/img.png"));
+assert.ok(
+  resolveNoodlerMediaAbsolutePath("noodler-media/acc/img.png")
+    ?.replace(/\\/g, "/")
+    .endsWith("noodler-media/acc/img.png"),
+);
 
 process.stdout.write("Noodle autopost image regression passed.\n");

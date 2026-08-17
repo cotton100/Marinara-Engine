@@ -72,11 +72,23 @@ type TableSnapshotManifest = {
   tables: Record<string, number>;
 };
 
+type FileDurabilityMode = "best-effort" | "strict";
+
 type FileTransactionContext = {
   snapshots: Map<string, Row[]>;
   dirtyTables: Set<string>;
   flushed: boolean;
+  strictFlushed: boolean;
 };
+
+export class FileNativeStrictDurabilityUnsupportedError extends Error {
+  readonly code = "FILE_STORAGE_STRICT_DURABILITY_UNSUPPORTED";
+
+  constructor(message = "Strict file-storage durability is not supported by this runtime") {
+    super(message);
+    this.name = "FileNativeStrictDurabilityUnsupportedError";
+  }
+}
 
 export type QuarantinedStorageTable = {
   table: string;
@@ -88,6 +100,10 @@ export type QuarantinedStorageTable = {
 
 export type FileNativeStoreController = {
   flush: () => Promise<void>;
+  flushStrict: () => Promise<void>;
+  flushPathsStrict: (filePaths: readonly string[], directoryPaths: readonly string[]) => Promise<void>;
+  runExclusiveTransactions: <T>(operation: () => Promise<T>) => Promise<T>;
+  isStrictDurabilitySupported: () => boolean;
   close: () => Promise<void>;
   rootDir: string;
   getQuarantinedTables: () => QuarantinedStorageTable[];
@@ -107,6 +123,14 @@ export type FileNativeDB = {
 
 export type FileNativeStoreTestHooks = {
   beforeTableWrite?: (table: string, serializedRows: string) => Promise<void> | void;
+  afterTableRead?: (table: string) => Promise<void> | void;
+  fileOperations?: {
+    writeFile?: (path: string, content: string) => Promise<void>;
+    copyFile?: (from: string, to: string) => Promise<void>;
+    rename?: (from: string, to: string) => Promise<void>;
+    flushFile?: (path: string) => Promise<void>;
+    flushDirectory?: (path: string) => Promise<void>;
+  };
 };
 
 type SelectFromBuilder<TProjection extends Projection | undefined> = {
@@ -220,6 +244,8 @@ export const FILE_BACKED_TABLES = [
   "chat_presets",
   "prompt_overrides",
   "installed_extensions",
+  "personal_extension_coordination",
+  "personal_extension_operation_journal",
   "library_folders",
 ] as const;
 
@@ -407,7 +433,18 @@ function warnFlushFailure(kind: "file" | "directory", path: string, err: unknown
   );
 }
 
-async function flushFile(path: string) {
+async function flushFile(path: string, durability: FileDurabilityMode, testHooks?: FileNativeStoreTestHooks) {
+  const injectedFlush = testHooks?.fileOperations?.flushFile;
+  if (injectedFlush) {
+    try {
+      await injectedFlush(path);
+    } catch (err) {
+      if (durability === "strict") throw err;
+      warnFlushFailure("file", path, err);
+    }
+    return;
+  }
+
   let handle: import("node:fs/promises").FileHandle | null = null;
   try {
     // Windows FlushFileBuffers requires a writable file handle. Opening the
@@ -416,6 +453,7 @@ async function flushFile(path: string) {
     handle = await open(path, "r+");
     await handle.sync();
   } catch (err) {
+    if (durability === "strict") throw err;
     // Best effort only. Some mobile filesystems reject fsync for app data.
     warnFlushFailure("file", path, err);
   } finally {
@@ -429,10 +467,26 @@ async function flushFile(path: string) {
   }
 }
 
-async function flushDirectory(path: string) {
+async function flushDirectory(path: string, durability: FileDurabilityMode, testHooks?: FileNativeStoreTestHooks) {
+  const injectedFlush = testHooks?.fileOperations?.flushDirectory;
+  if (injectedFlush) {
+    try {
+      await injectedFlush(path);
+    } catch (err) {
+      if (durability === "strict") throw err;
+      warnFlushFailure("directory", path, err);
+    }
+    return;
+  }
+
   if (isWindows) {
     // Node cannot open/flush directory handles on Windows. File handles are
     // still flushed above; the directory metadata flush remains POSIX-only.
+    if (durability === "strict") {
+      throw new FileNativeStrictDurabilityUnsupportedError(
+        "Strict file-storage durability requires directory fsync, which Node does not support on Windows",
+      );
+    }
     return;
   }
 
@@ -441,6 +495,7 @@ async function flushDirectory(path: string) {
     handle = await open(path, "r");
     await handle.sync();
   } catch (err) {
+    if (durability === "strict") throw err;
     // Directory fsync is best effort across filesystems/platforms.
     warnFlushFailure("directory", path, err);
   } finally {
@@ -479,10 +534,23 @@ function looksNulFilled(path: string): boolean {
   }
 }
 
-async function atomicWriteFile(path: string, content: string, options: { refreshBackup?: boolean } = {}) {
+async function atomicWriteFile(
+  path: string,
+  content: string,
+  options: {
+    refreshBackup?: boolean;
+    durability?: FileDurabilityMode;
+    testHooks?: FileNativeStoreTestHooks;
+  } = {},
+) {
   mkdirSync(dirname(path), { recursive: true });
   const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}`;
   const refreshBackup = options.refreshBackup ?? true;
+  const durability = options.durability ?? "best-effort";
+  const fileOperations = options.testHooks?.fileOperations;
+  const copy = fileOperations?.copyFile ?? copyFile;
+  const move = fileOperations?.rename ?? rename;
+  const write = fileOperations?.writeFile ?? writeFile;
   try {
     // Refresh the .bak via tmp + fsync + rename so a hard crash mid-write
     // can't leave both main and backup zero-filled (NTFS allocates blocks
@@ -498,16 +566,17 @@ async function atomicWriteFile(path: string, content: string, options: { refresh
       const bakPath = `${path}.bak`;
       const bakTmpPath = `${bakPath}.tmp-${process.pid}-${Date.now()}`;
       try {
-        await copyFile(path, bakTmpPath);
-        await flushFile(bakTmpPath);
-        await rename(bakTmpPath, bakPath);
-        await flushDirectory(dirname(bakPath));
+        await copy(path, bakTmpPath);
+        await flushFile(bakTmpPath, durability, options.testHooks);
+        await move(bakTmpPath, bakPath);
+        await flushDirectory(dirname(bakPath), durability, options.testHooks);
       } catch (err) {
         try {
           if (existsSync(bakTmpPath)) await unlink(bakTmpPath);
         } catch {
           /* ignore */
         }
+        if (durability === "strict") throw err;
         logger.error(
           err,
           "[file-storage] Failed to refresh backup durably; backup may be stale and unusable for crash recovery (path=%s)",
@@ -515,10 +584,10 @@ async function atomicWriteFile(path: string, content: string, options: { refresh
         );
       }
     }
-    await writeFile(tmpPath, content);
-    await flushFile(tmpPath);
-    await rename(tmpPath, path);
-    await flushDirectory(dirname(path));
+    await write(tmpPath, content);
+    await flushFile(tmpPath, durability, options.testHooks);
+    await move(tmpPath, path);
+    await flushDirectory(dirname(path), durability, options.testHooks);
   } catch (err) {
     try {
       if (existsSync(tmpPath)) await unlink(tmpPath);
@@ -920,6 +989,10 @@ function executable<T>(operation: () => T | Promise<T>): Executable<T> {
 class FileTableStore {
   private tables = new Map<string, Row[]>();
   private dirtyTables = new Set<string>();
+  // A best-effort flush may have written a snapshot without proving fsync.
+  // Keep those tables pending until a strict barrier rewrites and durably
+  // flushes them; ordinary autosave/close semantics remain unchanged.
+  private strictPendingTables = new Set<string>();
   private backupRecoveredPaths = new Set<string>();
   private dirty = false;
   private activeFlush: Promise<void> | null = null;
@@ -932,7 +1005,11 @@ class FileTableStore {
   // async call paths wait for the transaction to finish and are therefore never
   // captured by (or reverted with) its rollback snapshots.
   private readonly txContext = new AsyncLocalStorage<FileTransactionContext>();
+  private readonly exclusiveTransactionsContext = new AsyncLocalStorage<boolean>();
   private transactionQueue: Promise<void> = Promise.resolve();
+  private exclusiveTransactionSequenceRequests = 0;
+  private exclusiveTransactionSequenceBarrier: Promise<void> | null = null;
+  private releaseExclusiveTransactionSequenceBarrier: (() => void) | null = null;
   private activeTransactionCount = 0;
   private transactionIdleWaiters = new Set<() => void>();
   private pendingTransactionFlush = false;
@@ -978,23 +1055,27 @@ class FileTableStore {
       return await fn(tx);
     }
 
-    let releaseTransaction!: () => void;
-    const previousTransaction = this.transactionQueue;
-    this.transactionQueue = new Promise<void>((resolve) => {
-      releaseTransaction = resolve;
-    });
-    await previousTransaction;
-    if (this.activeFlush) await this.activeFlush;
+    const ownsExclusiveLane = this.exclusiveTransactionsContext.getStore() === true;
+    let releaseTransaction = () => {};
+    if (!ownsExclusiveLane) {
+      const previousTransaction = this.transactionQueue;
+      this.transactionQueue = new Promise<void>((resolve) => {
+        releaseTransaction = resolve;
+      });
+      await previousTransaction;
+      if (this.activeFlush) await this.activeFlush;
+      this.activeTransactionCount++;
+    }
 
     const ctx: FileTransactionContext = {
       snapshots: new Map<string, Row[]>(),
       dirtyTables: new Set<string>(),
       flushed: false,
+      strictFlushed: false,
     };
     const dirtySnapshot = this.dirty;
     const dirtyTablesSnapshot = new Set(this.dirtyTables);
-    this.activeTransactionCount++;
-
+    const strictPendingTablesSnapshot = new Set(this.strictPendingTables);
     try {
       const result = await this.txContext.run(ctx, () => fn(tx));
       // Flush on commit only for tables whose durability the caller reasons about across a
@@ -1011,16 +1092,61 @@ class FileTableStore {
       }
       this.dirty = dirtySnapshot;
       this.dirtyTables = dirtyTablesSnapshot;
+      this.strictPendingTables = strictPendingTablesSnapshot;
       if (ctx.flushed) {
         this.dirty = true;
-        for (const tableName of ctx.dirtyTables) this.dirtyTables.add(tableName);
+        for (const tableName of ctx.dirtyTables) {
+          this.dirtyTables.add(tableName);
+          this.strictPendingTables.add(tableName);
+        }
         try {
-          await this.txContext.run(ctx, () => this.flush(true, true));
+          await this.txContext.run(ctx, () =>
+            ctx.strictFlushed ? this.flush(true, true, "strict") : this.flush(true, true),
+          );
         } catch (rollbackError) {
           throw new AggregateError([err, rollbackError], "File-storage transaction and durable rollback both failed");
         }
       }
       throw err;
+    } finally {
+      if (!ownsExclusiveLane) {
+        this.activeTransactionCount--;
+        if (this.activeTransactionCount === 0) {
+          for (const resolve of this.transactionIdleWaiters) resolve();
+          this.transactionIdleWaiters.clear();
+        }
+        releaseTransaction();
+        if (this.pendingTransactionFlush) {
+          this.pendingTransactionFlush = false;
+          void this.flush();
+        }
+      }
+    }
+  }
+
+  async runExclusiveTransactions<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.txContext.getStore()) {
+      throw new Error("An exclusive transaction sequence cannot begin inside a file-storage transaction");
+    }
+    if (this.exclusiveTransactionsContext.getStore()) return operation();
+
+    this.exclusiveTransactionSequenceRequests++;
+    if (this.exclusiveTransactionSequenceRequests === 1) {
+      this.exclusiveTransactionSequenceBarrier = new Promise<void>((resolve) => {
+        this.releaseExclusiveTransactionSequenceBarrier = resolve;
+      });
+    }
+
+    let releaseTransaction!: () => void;
+    const previousTransaction = this.transactionQueue;
+    this.transactionQueue = new Promise<void>((resolve) => {
+      releaseTransaction = resolve;
+    });
+    await previousTransaction;
+    if (this.activeFlush) await this.activeFlush;
+    this.activeTransactionCount++;
+    try {
+      return await this.exclusiveTransactionsContext.run(true, operation);
     } finally {
       this.activeTransactionCount--;
       if (this.activeTransactionCount === 0) {
@@ -1032,6 +1158,13 @@ class FileTableStore {
         this.pendingTransactionFlush = false;
         void this.flush();
       }
+      this.exclusiveTransactionSequenceRequests--;
+      if (this.exclusiveTransactionSequenceRequests === 0) {
+        const releaseBarrier = this.releaseExclusiveTransactionSequenceBarrier;
+        this.exclusiveTransactionSequenceBarrier = null;
+        this.releaseExclusiveTransactionSequenceBarrier = null;
+        releaseBarrier?.();
+      }
     }
   }
 
@@ -1040,9 +1173,38 @@ class FileTableStore {
     await new Promise<void>((resolve) => this.transactionIdleWaiters.add(resolve));
   }
 
-  private async waitForWritableTurn(): Promise<void> {
-    if (this.activeTransactionCount > 0 && !this.txContext.getStore()) {
-      await this.waitForTransactions();
+  private currentExclusiveSequenceBarrier(): Promise<void> | null {
+    // A transaction that already owns the lane must be allowed to finish even
+    // if an exclusive sequence was requested behind it. Otherwise the sequence
+    // waits for the transaction while the transaction waits for the sequence.
+    if (this.txContext.getStore() || this.exclusiveTransactionsContext.getStore()) return null;
+    return this.exclusiveTransactionSequenceBarrier;
+  }
+
+  async runWhenReadable<T>(operation: () => T): Promise<T> {
+    for (;;) {
+      const barrier = this.currentExclusiveSequenceBarrier();
+      if (!barrier) return operation();
+      await barrier;
+    }
+  }
+
+  async notifyTableRead(table: string): Promise<void> {
+    await this.testHooks?.afterTableRead?.(table);
+  }
+
+  private async runWhenWritable<T>(operation: () => T): Promise<T> {
+    for (;;) {
+      const exclusiveBarrier = this.currentExclusiveSequenceBarrier();
+      if (exclusiveBarrier) {
+        await exclusiveBarrier;
+        continue;
+      }
+      if (this.activeTransactionCount > 0 && !this.txContext.getStore()) {
+        await this.waitForTransactions();
+        continue;
+      }
+      return operation();
     }
   }
 
@@ -1075,36 +1237,37 @@ class FileTableStore {
     return {
       values: (rows) => {
         const runInsert = (onConflict?: { target: unknown; set: Row }) =>
-          executable(async () => {
-            await this.waitForWritableTurn();
-            const conflictColumns = normalizeConflictTargets(onConflict?.target);
-            const inputRows = Array.isArray(rows) ? rows : [rows];
-            const target = this.rows(meta.name);
-            const nextRows = target.map(cloneRow);
-            for (const input of inputRows) {
-              const row = prepareInsertRow(meta, input);
-              const conflictKeys =
-                conflictColumns.length > 0 ? conflictColumns : meta.primaryKey ? [meta.primaryKey] : [];
-              const duplicateIndex = onConflict ? findMatchingRowIndex(nextRows, row, conflictKeys) : -1;
-              if (onConflict && duplicateIndex !== -1) {
-                const existing = nextRows[duplicateIndex]!;
-                const ctx = this.contextForRow(meta, existing);
-                const candidate = cloneRow(existing);
-                for (const [key, value] of Object.entries(onConflict.set)) {
-                  const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
-                  candidate[column?.key ?? key] = resolveValue(value, ctx);
+          executable(() =>
+            this.runWhenWritable(() => {
+              const conflictColumns = normalizeConflictTargets(onConflict?.target);
+              const inputRows = Array.isArray(rows) ? rows : [rows];
+              const target = this.rows(meta.name);
+              const nextRows = target.map(cloneRow);
+              for (const input of inputRows) {
+                const row = prepareInsertRow(meta, input);
+                const conflictKeys =
+                  conflictColumns.length > 0 ? conflictColumns : meta.primaryKey ? [meta.primaryKey] : [];
+                const duplicateIndex = onConflict ? findMatchingRowIndex(nextRows, row, conflictKeys) : -1;
+                if (onConflict && duplicateIndex !== -1) {
+                  const existing = nextRows[duplicateIndex]!;
+                  const ctx = this.contextForRow(meta, existing);
+                  const candidate = cloneRow(existing);
+                  for (const [key, value] of Object.entries(onConflict.set)) {
+                    const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
+                    candidate[column?.key ?? key] = resolveValue(value, ctx);
+                  }
+                  assertUniqueRow(meta, nextRows, candidate, duplicateIndex);
+                  nextRows[duplicateIndex] = candidate;
+                } else {
+                  assertUniqueRow(meta, nextRows, row);
+                  nextRows.push(row);
                 }
-                assertUniqueRow(meta, nextRows, candidate, duplicateIndex);
-                nextRows[duplicateIndex] = candidate;
-              } else {
-                assertUniqueRow(meta, nextRows, row);
-                nextRows.push(row);
               }
-            }
-            this.recordTxMutation(meta.name);
-            this.tables.set(meta.name, nextRows);
-            this.markDirty(meta.name);
-          });
+              this.recordTxMutation(meta.name);
+              this.tables.set(meta.name, nextRows);
+              this.markDirty(meta.name);
+            }),
+          );
         const builder = runInsert() as InsertValuesBuilder;
         builder.onConflictDoUpdate = (config) => runInsert(config);
         return builder;
@@ -1117,30 +1280,31 @@ class FileTableStore {
     return {
       set: (patch) => {
         const runUpdate = (condition?: Condition) =>
-          executable(async () => {
-            await this.waitForWritableTurn();
-            const target = this.rows(meta.name);
-            const changedIndexes: number[] = [];
-            const nextRows = target.map((row, index) => {
-              const ctx = this.contextForRow(meta, row);
-              if (!evaluateCondition(condition, ctx)) return row;
-              const candidate = cloneRow(row);
-              for (const [key, value] of Object.entries(patch)) {
-                const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
-                candidate[column?.key ?? key] = resolveValue(value, ctx);
+          executable(() =>
+            this.runWhenWritable(() => {
+              const target = this.rows(meta.name);
+              const changedIndexes: number[] = [];
+              const nextRows = target.map((row, index) => {
+                const ctx = this.contextForRow(meta, row);
+                if (!evaluateCondition(condition, ctx)) return row;
+                const candidate = cloneRow(row);
+                for (const [key, value] of Object.entries(patch)) {
+                  const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
+                  candidate[column?.key ?? key] = resolveValue(value, ctx);
+                }
+                changedIndexes.push(index);
+                return candidate;
+              });
+              if (changedIndexes.length > 0) {
+                for (const index of changedIndexes) {
+                  assertUniqueRow(meta, nextRows, nextRows[index]!, index);
+                }
+                this.recordTxMutation(meta.name);
+                this.tables.set(meta.name, nextRows);
+                this.markDirty(meta.name);
               }
-              changedIndexes.push(index);
-              return candidate;
-            });
-            if (changedIndexes.length > 0) {
-              for (const index of changedIndexes) {
-                assertUniqueRow(meta, nextRows, nextRows[index]!, index);
-              }
-              this.recordTxMutation(meta.name);
-              this.tables.set(meta.name, nextRows);
-              this.markDirty(meta.name);
-            }
-          });
+            }),
+          );
         const builder = runUpdate() as UpdateWhereBuilder;
         builder.where = (condition) => runUpdate(condition);
         return builder;
@@ -1151,30 +1315,70 @@ class FileTableStore {
   delete(table: Table): DeleteBuilder {
     const meta = getMeta(table);
     const runDelete = (condition?: Condition) =>
-      executable(async () => {
-        await this.waitForWritableTurn();
-        this.deleteWhere(meta, condition);
-      });
+      executable(() => this.runWhenWritable(() => this.deleteWhere(meta, condition)));
     const builder = runDelete() as DeleteBuilder;
     builder.where = (condition) => runDelete(condition);
     return builder;
   }
 
-  async flush(force = false, throwOnError = false) {
+  isStrictDurabilitySupported() {
+    return !isWindows || typeof this.testHooks?.fileOperations?.flushDirectory === "function";
+  }
+
+  async flushStrict() {
+    if (!this.isStrictDurabilitySupported()) {
+      throw new FileNativeStrictDurabilityUnsupportedError(
+        "Strict file-storage durability requires directory fsync, which Node does not support on Windows",
+      );
+    }
+    await this.flush(true, true, "strict");
+  }
+
+  async flushPathsStrict(filePaths: readonly string[], directoryPaths: readonly string[]) {
+    if (!this.isStrictDurabilitySupported()) {
+      throw new FileNativeStrictDurabilityUnsupportedError(
+        "Strict file-storage durability requires directory fsync, which Node does not support on Windows",
+      );
+    }
+    for (const path of new Set(filePaths)) {
+      await flushFile(path, "strict", this.testHooks);
+    }
+    for (const path of new Set(directoryPaths)) {
+      await flushDirectory(path, "strict", this.testHooks);
+    }
+  }
+
+  async flush(force = false, throwOnError = false, durability: FileDurabilityMode = "best-effort") {
+    if (durability === "strict" && !this.isStrictDurabilitySupported()) {
+      throw new FileNativeStrictDurabilityUnsupportedError(
+        "Strict file-storage durability requires directory fsync, which Node does not support on Windows",
+      );
+    }
     const transactionContext = this.txContext.getStore();
     if (this.activeTransactionCount > 0 && !(force && transactionContext)) {
       this.pendingTransactionFlush = true;
       if (transactionContext) return;
       await this.waitForTransactions();
     }
-    if (transactionContext && force) transactionContext.flushed = true;
+    if (transactionContext && force) {
+      transactionContext.flushed = true;
+      if (durability === "strict") transactionContext.strictFlushed = true;
+    }
     if (this.activeFlush) {
       await this.activeFlush;
-      if (this.dirty || this.dirtyTables.size > 0) await this.flush(force, throwOnError);
-      else if (throwOnError && this.lastFlushError) throw this.lastFlushError;
+      if (this.dirty || this.dirtyTables.size > 0 || (durability === "strict" && this.strictPendingTables.size > 0)) {
+        await this.flush(force, throwOnError, durability);
+      } else if (throwOnError && this.lastFlushError) throw this.lastFlushError;
       return;
     }
-    if (!force && !this.dirty && this.dirtyTables.size === 0) return;
+    if (
+      !force &&
+      !this.dirty &&
+      this.dirtyTables.size === 0 &&
+      (durability !== "strict" || this.strictPendingTables.size === 0)
+    ) {
+      return;
+    }
     this.dirty = false;
     // Snapshot the dirty set and reset it BEFORE the async write. saveFileSnapshots
     // now yields the event loop, so a markDirty() that interleaves during the I/O
@@ -1182,16 +1386,23 @@ class FileTableStore {
     // clear() — the synchronous version had a zero-width window here.
     const dirtyTables = this.dirtyTables;
     this.dirtyTables = new Set();
+    for (const table of dirtyTables) this.strictPendingTables.add(table);
+    const strictPendingTables = durability === "strict" ? this.strictPendingTables : new Set<string>();
+    if (durability === "strict") this.strictPendingTables = new Set();
+    const tablesToPersist = new Set([...dirtyTables, ...strictPendingTables]);
     const flush = (async () => {
       try {
-        await this.saveFileSnapshots(dirtyTables);
+        await this.saveFileSnapshots(tablesToPersist, durability);
         this.lastFlushError = null;
       } catch (err) {
         this.lastFlushError = err;
         this.dirty = true;
         // Re-mark the tables we failed to persist so they retry on the next flush
         // (without clobbering any tables marked dirty during the failed write).
-        for (const table of dirtyTables) this.dirtyTables.add(table);
+        for (const table of tablesToPersist) {
+          this.dirtyTables.add(table);
+          this.strictPendingTables.add(table);
+        }
         logger.error(err, "[file-storage] Failed to persist file-native storage");
       }
     })();
@@ -1242,6 +1453,7 @@ class FileTableStore {
   markDirty(table: string) {
     this.dirty = true;
     this.dirtyTables.add(table);
+    this.strictPendingTables.add(table);
     if (this.debounceTimer) return;
     this.debounceTimer = setTimeout(() => {
       this.debounceTimer = null;
@@ -1411,7 +1623,7 @@ class FileTableStore {
     logger.info({ tables: counts }, `[file-storage] Loaded file-native data from ${this.rootDir}`);
   }
 
-  private async saveFileSnapshots(dirtyTables: Set<string>) {
+  private async saveFileSnapshots(dirtyTables: Set<string>, durability: FileDurabilityMode) {
     mkdirSync(join(this.rootDir, "tables"), { recursive: true });
     const tables: Record<string, number> = {};
 
@@ -1422,7 +1634,11 @@ class FileTableStore {
       if (dirtyTables.has(table) || !existsSync(path)) {
         const serializedRows = JSON.stringify(rows);
         await this.testHooks?.beforeTableWrite?.(table, serializedRows);
-        await atomicWriteFile(path, serializedRows, { refreshBackup: !this.backupRecoveredPaths.has(path) });
+        await atomicWriteFile(path, serializedRows, {
+          refreshBackup: !this.backupRecoveredPaths.has(path),
+          durability,
+          testHooks: this.testHooks,
+        });
       }
     }
 
@@ -1435,6 +1651,8 @@ class FileTableStore {
     const path = manifestPath(this.rootDir);
     await atomicWriteFile(path, JSON.stringify(manifest, null, 2), {
       refreshBackup: !this.backupRecoveredPaths.has(path),
+      durability,
+      testHooks: this.testHooks,
     });
     this.backupRecoveredPaths.clear();
   }
@@ -1491,43 +1709,47 @@ class SelectQuery implements SelectQueryBuilder<any> {
   }
 
   async run() {
-    let contexts = this.store.rows(this.fromMeta.name).map((row) => this.store.contextForRow(this.fromMeta, row));
+    const result = await this.store.runWhenReadable(() => {
+      let contexts = this.store.rows(this.fromMeta.name).map((row) => this.store.contextForRow(this.fromMeta, row));
 
-    for (const join of this.joins) {
-      const joinedContexts: RowContext[] = [];
-      const joinRows = this.store.rows(join.table.name);
-      for (const ctx of contexts) {
-        joinRows.forEach((row) => {
-          const candidate: RowContext = {
-            rows: { ...ctx.rows, [join.table.name]: row },
-            baseTable: ctx.baseTable,
-            joined: true,
-          };
-          if (evaluateCondition(join.condition, candidate)) {
-            joinedContexts.push(candidate);
+      for (const join of this.joins) {
+        const joinedContexts: RowContext[] = [];
+        const joinRows = this.store.rows(join.table.name);
+        for (const ctx of contexts) {
+          joinRows.forEach((row) => {
+            const candidate: RowContext = {
+              rows: { ...ctx.rows, [join.table.name]: row },
+              baseTable: ctx.baseTable,
+              joined: true,
+            };
+            if (evaluateCondition(join.condition, candidate)) {
+              joinedContexts.push(candidate);
+            }
+          });
+        }
+        contexts = joinedContexts;
+      }
+
+      contexts = contexts.filter((ctx) => evaluateCondition(this.condition, ctx));
+
+      if (this.orderings.length > 0) {
+        contexts = [...contexts].sort((left, right) => {
+          for (const ordering of this.orderings) {
+            const leftSpec = orderSpec(ordering, left);
+            const rightSpec = orderSpec(ordering, right);
+            const comparison = compareValues(leftSpec.value, rightSpec.value);
+            if (comparison !== 0) return leftSpec.direction === "desc" ? -comparison : comparison;
           }
+          return 0;
         });
       }
-      contexts = joinedContexts;
-    }
 
-    contexts = contexts.filter((ctx) => evaluateCondition(this.condition, ctx));
-
-    if (this.orderings.length > 0) {
-      contexts = [...contexts].sort((left, right) => {
-        for (const ordering of this.orderings) {
-          const leftSpec = orderSpec(ordering, left);
-          const rightSpec = orderSpec(ordering, right);
-          const comparison = compareValues(leftSpec.value, rightSpec.value);
-          if (comparison !== 0) return leftSpec.direction === "desc" ? -comparison : comparison;
-        }
-        return 0;
-      });
-    }
-
-    if (this.rowOffset > 0) contexts = contexts.slice(this.rowOffset);
-    if (this.rowLimit !== null) contexts = contexts.slice(0, this.rowLimit);
-    return contexts.map((ctx) => projectRow(ctx, this.projection));
+      if (this.rowOffset > 0) contexts = contexts.slice(this.rowOffset);
+      if (this.rowLimit !== null) contexts = contexts.slice(0, this.rowLimit);
+      return contexts.map((ctx) => projectRow(ctx, this.projection));
+    });
+    await this.store.notifyTableRead(this.fromMeta.name);
+    return result;
   }
 
   then<TResult1 = Row[], TResult2 = never>(
@@ -1546,6 +1768,10 @@ export async function createFileNativeDB(testHooks?: FileNativeStoreTestHooks): 
   const controller: FileNativeStoreController = {
     rootDir,
     flush: () => store.flush(true, true),
+    flushStrict: () => store.flushStrict(),
+    flushPathsStrict: (filePaths, directoryPaths) => store.flushPathsStrict(filePaths, directoryPaths),
+    runExclusiveTransactions: (operation) => store.runExclusiveTransactions(operation),
+    isStrictDurabilitySupported: () => store.isStrictDurabilitySupported(),
     close: () => store.close(),
     getQuarantinedTables: () => store.getQuarantinedTables(),
   };

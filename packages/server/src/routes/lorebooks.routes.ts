@@ -1,7 +1,8 @@
 // ──────────────────────────────────────────────
 // Routes: Lorebooks
 // ──────────────────────────────────────────────
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
+import { ZodError } from "zod";
 import { existsSync } from "fs";
 import { mkdir, readFile, writeFile } from "fs/promises";
 import { extname, join } from "path";
@@ -13,6 +14,23 @@ import {
   updateLorebookEntrySchema,
   bulkUpdateLorebookEntriesSchema,
   createLorebookFolderSchema,
+  PERSONAL_EXTENSION_COORDINATION_BOOT_HEADER,
+  PERSONAL_EXTENSION_COORDINATION_CONTENT_HASH_HEADER,
+  PERSONAL_EXTENSION_COORDINATION_EXTENSION_HEADER,
+  PERSONAL_EXTENSION_COORDINATION_FENCE_HEADER,
+  PERSONAL_EXTENSION_COORDINATION_HOLDER_HEADER,
+  PERSONAL_EXTENSION_COORDINATION_HTTP_STATUS,
+  PERSONAL_EXTENSION_COORDINATION_LEASE_TOKEN_HEADER,
+  personalExtensionCoordinationHolderSessionIdSchema,
+  personalExtensionCoordinationLorebookClearVectorsRequestSchema,
+  personalExtensionCoordinationLorebookCreateRequestSchema,
+  personalExtensionCoordinationLorebookDeleteRequestSchema,
+  personalExtensionCoordinationLorebookEntryCreateRequestSchema,
+  personalExtensionCoordinationLorebookEntryDeleteRequestSchema,
+  personalExtensionCoordinationLorebookEntryUpdateRequestSchema,
+  personalExtensionCoordinationLorebookReadAuthoritySchema,
+  personalExtensionCoordinationLorebookUpdateRequestSchema,
+  personalExtensionCoordinationLorebookVectorizeRequestSchema,
   updateLorebookFolderSchema,
   LOCAL_SIDECAR_CONNECTION_ID,
   stripMacroComments,
@@ -25,6 +43,7 @@ import {
 } from "@marinara-engine/shared";
 import type { ExportEnvelope } from "@marinara-engine/shared";
 import { createLorebooksStorage } from "../services/storage/lorebooks.storage.js";
+import { PersonalExtensionCoordinationKernelError } from "../services/extensions/personal-extension-coordination-kernel.service.js";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
 import { createCharactersStorage } from "../services/storage/characters.storage.js";
 import { createGameStateStorage } from "../services/storage/game-state.storage.js";
@@ -396,6 +415,85 @@ function buildTransferredEntryInput(
 export async function lorebooksRoutes(app: FastifyInstance) {
   const storage = createLorebooksStorage(app.db);
 
+  const sendCoordinationError = (error: unknown, reply: FastifyReply) => {
+    const code =
+      error instanceof PersonalExtensionCoordinationKernelError
+        ? error.code
+        : error instanceof ZodError
+          ? "invalid-request"
+          : "coordination-unavailable";
+    return reply.status(PERSONAL_EXTENSION_COORDINATION_HTTP_STATUS[code]).send({
+      code,
+      error: "Lorebook coordination mutation was rejected.",
+    });
+  };
+
+  const readCoordinationAuthority = (headers: Record<string, unknown>) => {
+    const input = personalExtensionCoordinationLorebookReadAuthoritySchema.parse({
+      extensionId: headers[PERSONAL_EXTENSION_COORDINATION_EXTENSION_HEADER],
+      serverBootId: headers[PERSONAL_EXTENSION_COORDINATION_BOOT_HEADER],
+      contentHash: headers[PERSONAL_EXTENSION_COORDINATION_CONTENT_HASH_HEADER],
+      fence: Number(headers[PERSONAL_EXTENSION_COORDINATION_FENCE_HEADER]),
+      leaseToken: headers[PERSONAL_EXTENSION_COORDINATION_LEASE_TOKEN_HEADER],
+    });
+    const holderSessionId = personalExtensionCoordinationHolderSessionIdSchema.parse(
+      headers[PERSONAL_EXTENSION_COORDINATION_HOLDER_HEADER],
+    );
+    return { ...input, holderSessionId };
+  };
+
+  const mutationContext = (
+    input: {
+      extensionId: string;
+      serverBootId: string;
+      contentHash: string;
+      fence: number;
+      leaseToken: string;
+      operationHandle: string;
+    },
+    headers: Record<string, unknown>,
+  ) => ({
+    extensionId: input.extensionId,
+    holderSessionId: personalExtensionCoordinationHolderSessionIdSchema.parse(
+      headers[PERSONAL_EXTENSION_COORDINATION_HOLDER_HEADER],
+    ),
+    serverBootId: input.serverBootId,
+    contentHash: input.contentHash,
+    fence: input.fence,
+    leaseToken: input.leaseToken,
+    operationHandle: input.operationHandle,
+  });
+
+  const guardedEmbeddingProvider = async (input: { connectionId: string; model?: string }) => {
+    const useLocalSidecar = input.connectionId === LOCAL_SIDECAR_CONNECTION_ID;
+    if (!useLocalSidecar && !input.model) {
+      throw new PersonalExtensionCoordinationKernelError("invalid-request");
+    }
+    if (useLocalSidecar) {
+      return { provider: getLocalSidecarProvider(), model: LOCAL_SIDECAR_MODEL };
+    }
+    const connection = await createConnectionsStorage(app.db).getWithKey(input.connectionId);
+    if (!connection) throw new PersonalExtensionCoordinationKernelError("invalid-request");
+    const baseUrl = connection.embeddingBaseUrl
+      ? (connection.embeddingBaseUrl as string).replace(/\/+$/, "")
+      : (connection.baseUrl as string);
+    return {
+      provider: createLLMProvider(
+        connection.provider as string,
+        baseUrl,
+        connection.apiKey as string,
+        connection.maxContext,
+        connection.openrouterProvider,
+        connection.maxTokensOverride,
+        connection.claudeFastMode === "true",
+        connection.treatAsLocalEndpoint === "true",
+        connection.defaultParameters,
+        connection.id,
+      ),
+      model: input.model!,
+    };
+  };
+
   // ── Lorebooks CRUD ──
 
   app.get("/", async (req) => {
@@ -424,6 +522,209 @@ export async function lorebooksRoutes(app: FastifyInstance) {
     if (query.personaId) return storage.listByPersona(query.personaId);
     if (query.chatId) return storage.listByChat(query.chatId);
     return storage.list();
+  });
+
+  app.get("/coordination", async (req, reply) => {
+    try {
+      const items = await storage.listFenced(readCoordinationAuthority(req.headers));
+      return { items };
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  app.post<{ Body: unknown }>("/coordination", async (req, reply) => {
+    try {
+      const input = personalExtensionCoordinationLorebookCreateRequestSchema.parse(req.body);
+      return await storage.createFenced(mutationContext(input, req.headers), input.book);
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  app.get<{ Params: { id: string } }>("/:id/coordination", async (req, reply) => {
+    try {
+      return await storage.getByIdFenced(readCoordinationAuthority(req.headers), req.params.id);
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  app.patch<{ Params: { id: string }; Body: unknown }>("/:id/coordination", async (req, reply) => {
+    try {
+      const input = personalExtensionCoordinationLorebookUpdateRequestSchema.parse(req.body);
+      return await storage.updateFenced(
+        mutationContext(input, req.headers),
+        req.params.id,
+        input.expectedResourceRevision,
+        input.changes,
+      );
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  app.delete<{ Params: { id: string }; Body: unknown }>("/:id/coordination", async (req, reply) => {
+    try {
+      const input = personalExtensionCoordinationLorebookDeleteRequestSchema.parse(req.body);
+      const linkedCharacterId = await resolveEmbeddedCharacterId(app.db, req.params.id);
+      const committed = await storage.removeFenced(
+        mutationContext(input, req.headers),
+        req.params.id,
+        input.expectedResourceRevision,
+      );
+      await createChatsStorage(app.db).removeLorebookFromChatMetadata(req.params.id);
+      if (linkedCharacterId) await clearCharacterEmbeddedLorebook(app.db, linkedCharacterId, req.params.id);
+      return { ...committed.result, resourceRevision: committed.resourceRevision };
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  app.get<{ Params: { id: string } }>("/:id/coordination/entries", async (req, reply) => {
+    try {
+      return await storage.listEntriesFenced(readCoordinationAuthority(req.headers), req.params.id);
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  app.post<{ Params: { id: string }; Body: unknown }>("/:id/coordination/entries", async (req, reply) => {
+    try {
+      const input = personalExtensionCoordinationLorebookEntryCreateRequestSchema.parse(req.body);
+      return await storage.createEntryFenced(
+        mutationContext(input, req.headers),
+        req.params.id,
+        input.expectedResourceRevision,
+        input.entry,
+      );
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  app.get<{ Params: { id: string; entryId: string } }>("/:id/coordination/entries/:entryId", async (req, reply) => {
+    try {
+      return await storage.getEntryFenced(readCoordinationAuthority(req.headers), req.params.id, req.params.entryId);
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  app.patch<{ Params: { id: string; entryId: string }; Body: unknown }>(
+    "/:id/coordination/entries/:entryId",
+    async (req, reply) => {
+      try {
+        const input = personalExtensionCoordinationLorebookEntryUpdateRequestSchema.parse(req.body);
+        return await storage.updateEntryFenced(
+          mutationContext(input, req.headers),
+          req.params.id,
+          req.params.entryId,
+          input.expectedResourceRevision,
+          input.changes,
+        );
+      } catch (error) {
+        return sendCoordinationError(error, reply);
+      }
+    },
+  );
+
+  app.delete<{ Params: { id: string; entryId: string }; Body: unknown }>(
+    "/:id/coordination/entries/:entryId",
+    async (req, reply) => {
+      try {
+        const input = personalExtensionCoordinationLorebookEntryDeleteRequestSchema.parse(req.body);
+        return await storage.removeEntryFenced(
+          mutationContext(input, req.headers),
+          req.params.id,
+          req.params.entryId,
+          input.expectedResourceRevision,
+        );
+      } catch (error) {
+        return sendCoordinationError(error, reply);
+      }
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: unknown }>("/:id/coordination/vectorize", async (req, reply) => {
+    try {
+      const input = personalExtensionCoordinationLorebookVectorizeRequestSchema.parse(req.body);
+      const context = mutationContext(input, req.headers);
+      const snapshot = await storage.getVectorizationSnapshotFenced(context, req.params.id, true);
+      if (snapshot.entries.length === 0) {
+        return {
+          vectorized: 0,
+          total: snapshot.total,
+          skipped: snapshot.total,
+          resourceRevision: snapshot.resourceRevision,
+        };
+      }
+      const { provider, model } = await guardedEmbeddingProvider(input);
+      const existingEmbeddingDimension = snapshot.existingEmbeddingDimension;
+      let resourceRevision = snapshot.resourceRevision;
+      let vectorized = 0;
+      const batchSize = 50;
+      for (let index = 0; index < snapshot.entries.length; index += batchSize) {
+        const batch = snapshot.entries.slice(index, index + batchSize);
+        const texts = batch.map(({ value }) => {
+          const keys = [...value.keys, ...value.secondaryKeys].join(", ");
+          return `${value.name}${keys ? ` [${keys}]` : ""}\n${value.content}`.trim();
+        });
+        let embeddings: number[][];
+        try {
+          embeddings = await provider.embed(texts, model);
+        } catch {
+          logger.warn("[lorebooks] Guarded embedding batch failed");
+          throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
+        }
+        if (
+          embeddings.length !== batch.length ||
+          embeddings.some(
+            (embedding) =>
+              !Array.isArray(embedding) || embedding.length === 0 || embedding.some((value) => !Number.isFinite(value)),
+          )
+        ) {
+          throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
+        }
+        const batchDimension = embeddings[0]?.length ?? null;
+        if (existingEmbeddingDimension && batchDimension && existingEmbeddingDimension !== batchDimension) {
+          throw new PersonalExtensionCoordinationKernelError("coordination-validation-failed");
+        }
+        const committed = await storage.commitEntryEmbeddingsFenced(
+          context,
+          req.params.id,
+          resourceRevision,
+          batch.map((entry, entryIndex) => ({
+            entryId: entry.value.id,
+            fingerprint: entry.fingerprint,
+            embedding: embeddings[entryIndex]!,
+          })),
+        );
+        resourceRevision = committed.resourceRevision;
+        vectorized += committed.updated;
+      }
+      return {
+        vectorized,
+        total: snapshot.total,
+        skipped: snapshot.total - vectorized,
+        resourceRevision,
+      };
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  app.delete<{ Params: { id: string }; Body: unknown }>("/:id/coordination/vectors", async (req, reply) => {
+    try {
+      const input = personalExtensionCoordinationLorebookClearVectorsRequestSchema.parse(req.body);
+      return await storage.clearEntryEmbeddingsFenced(
+        mutationContext(input, req.headers),
+        req.params.id,
+        input.expectedResourceRevision,
+      );
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
   });
 
   app.get<{ Params: { filename: string } }>("/images/file/:filename", async (req, reply) => {
@@ -495,11 +796,23 @@ export async function lorebooksRoutes(app: FastifyInstance) {
     // the V2 character_book mirror. Resolve via the authoritative forward
     // pointer (not the lorebook's alphabetically-first link) so a book embedded
     // into a non-first-linked character is cleared from the right card.
+    // This is a read, so it is safe to run before the guarded delete.
     const linkedCharacterId = await resolveEmbeddedCharacterId(app.db, req.params.id);
+
+    // Delete first. `remove` re-checks protection inside its own transaction, so
+    // a coordination activation that lands mid-request refuses the whole thing.
+    // Detaching before that check would strip the book from every chat on a
+    // request that then answers 428 — a rejected write that still destroys the
+    // ensemble wiring. Reference cleanup only runs once the row is really gone.
+    try {
+      await storage.remove(req.params.id);
+    } catch (error) {
+      if (error instanceof PersonalExtensionCoordinationKernelError) return sendCoordinationError(error, reply);
+      throw error;
+    }
 
     const chatsStorage = createChatsStorage(app.db);
     await chatsStorage.removeLorebookFromChatMetadata(req.params.id);
-    await storage.remove(req.params.id);
 
     if (linkedCharacterId) {
       await clearCharacterEmbeddedLorebook(app.db, linkedCharacterId, req.params.id);
@@ -1145,6 +1458,11 @@ export async function lorebooksRoutes(app: FastifyInstance) {
   // ── Vectorize: generate embeddings for all entries in a lorebook ──
 
   app.post<{ Params: { id: string } }>("/:id/vectorize", async (req, reply) => {
+    try {
+      await storage.assertLegacyWritable(req.params.id);
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
     const body = req.body as { connectionId: string; model: string; onlyMissing?: boolean };
     if (!body.connectionId) {
       return reply.status(400).send({ error: "connectionId is required" });
@@ -1260,6 +1578,11 @@ export async function lorebooksRoutes(app: FastifyInstance) {
   });
 
   app.delete<{ Params: { id: string } }>("/:id/vectors", async (req, reply) => {
+    try {
+      await storage.assertLegacyWritable(req.params.id);
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
     const lorebook = await storage.getById(req.params.id);
     if (!lorebook) return reply.status(404).send({ error: "Lorebook not found" });
 

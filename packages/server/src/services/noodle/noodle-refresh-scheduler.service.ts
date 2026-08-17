@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { logger } from "../../lib/logger.js";
+import { runWithDetachedProfileAssetMutation } from "../import/profile-asset-mutation-gate.js";
 import { createNoodleStorage } from "../storage/noodle.storage.js";
 import { AUTOMATIC_GENERATION_HEADER } from "../generation/connection-admission.js";
 import {
@@ -102,68 +103,80 @@ export function startNoodleRefreshScheduler(app: FastifyInstance) {
     polling = true;
     let nextDelay = NOODLE_SCHEDULER_MAX_POLL_MS;
     try {
-      const now = new Date();
-      const settings = await noodle.getSettings();
-      let schedule = await noodle.ensureRefreshSchedule(now, settings);
-      const retryAt = schedule.nextAttemptAt ? Date.parse(schedule.nextAttemptAt) : Number.NaN;
-      if (Number.isFinite(retryAt) && retryAt > now.getTime()) {
-        nextDelay = nextNoodleSchedulerPollDelayMs(schedule, now);
-        return;
-      }
+      // The timer is detached from every request. Its preflight read, injected
+      // refresh mutation, and post-response schedule RMW must all observe one
+      // side of a profile restore.
+      await runWithDetachedProfileAssetMutation(async () => {
+        try {
+          const now = new Date();
+          const settings = await noodle.getSettings();
+          let schedule = await noodle.ensureRefreshSchedule(now, settings);
+          const retryAt = schedule.nextAttemptAt ? Date.parse(schedule.nextAttemptAt) : Number.NaN;
+          if (Number.isFinite(retryAt) && retryAt > now.getTime()) {
+            nextDelay = nextNoodleSchedulerPollDelayMs(schedule, now);
+            return;
+          }
 
-      const dueTimes = dueNoodleRefreshTimes(schedule, now);
-      if (settings.refreshesPerDay === 0 || dueTimes.length === 0) {
-        nextDelay = nextNoodleSchedulerPollDelayMs(schedule, now);
-        return;
-      }
+          const dueTimes = dueNoodleRefreshTimes(schedule, now);
+          if (settings.refreshesPerDay === 0 || dueTimes.length === 0) {
+            nextDelay = nextNoodleSchedulerPollDelayMs(schedule, now);
+            return;
+          }
 
-      schedule = markNoodleRefreshAttempt(schedule, now);
-      await noodle.saveRefreshSchedule(schedule);
+          schedule = markNoodleRefreshAttempt(schedule, now);
+          await noodle.saveRefreshSchedule(schedule);
 
-      if (!settings.generationConnectionId) {
-        schedule = await persistFailure(schedule, "Select a Noodle generation connection first.", 400, new Date());
-        nextDelay = nextNoodleSchedulerPollDelayMs(schedule, new Date());
-        return;
-      }
+          if (!settings.generationConnectionId) {
+            schedule = await persistFailure(schedule, "Select a Noodle generation connection first.", 400, new Date());
+            nextDelay = nextNoodleSchedulerPollDelayMs(schedule, new Date());
+            return;
+          }
 
-      const response = await app.inject({
-        method: "POST",
-        url: "/api/noodle/refresh",
-        headers: { [AUTOMATIC_GENERATION_HEADER]: "1" },
-        payload: { mode: "public" },
+          const response = await app.inject({
+            method: "POST",
+            url: "/api/noodle/refresh",
+            headers: { [AUTOMATIC_GENERATION_HEADER]: "1" },
+            payload: { mode: "public" },
+          });
+          const completedAt = new Date();
+          const latest = await noodle.ensureRefreshSchedule(completedAt);
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            const latestDueTimes = dueNoodleRefreshTimes(latest, completedAt);
+            const consumedTimes = dueTimes.filter((time) => latest.scheduledTimes.includes(time));
+            const completed = markNoodleRefreshSuccess(
+              latest,
+              consumedTimes.length > 0 ? consumedTimes : latestDueTimes,
+              completedAt,
+            );
+            await noodle.saveRefreshSchedule(completed);
+            logger.info(
+              "[noodle-scheduler] Automatic timeline refresh completed; consumed %d due slot%s",
+              Math.max(consumedTimes.length, latestDueTimes.length),
+              Math.max(consumedTimes.length, latestDueTimes.length) === 1 ? "" : "s",
+            );
+            nextDelay = nextNoodleSchedulerPollDelayMs(completed, completedAt);
+            return;
+          }
+
+          const failed = await persistFailure(
+            latest,
+            responseError(response.payload),
+            response.statusCode,
+            completedAt,
+          );
+          nextDelay = nextNoodleSchedulerPollDelayMs(failed, completedAt);
+        } catch (error) {
+          const at = new Date();
+          const message = error instanceof Error ? error.message : String(error);
+          try {
+            const schedule = await noodle.ensureRefreshSchedule(at);
+            const failed = await persistFailure(schedule, message, 500, at);
+            nextDelay = nextNoodleSchedulerPollDelayMs(failed, at);
+          } catch (persistError) {
+            logger.error(persistError, "[noodle-scheduler] Failed to persist scheduler failure state");
+          }
+        }
       });
-      const completedAt = new Date();
-      const latest = await noodle.ensureRefreshSchedule(completedAt);
-      if (response.statusCode >= 200 && response.statusCode < 300) {
-        const latestDueTimes = dueNoodleRefreshTimes(latest, completedAt);
-        const consumedTimes = dueTimes.filter((time) => latest.scheduledTimes.includes(time));
-        const completed = markNoodleRefreshSuccess(
-          latest,
-          consumedTimes.length > 0 ? consumedTimes : latestDueTimes,
-          completedAt,
-        );
-        await noodle.saveRefreshSchedule(completed);
-        logger.info(
-          "[noodle-scheduler] Automatic timeline refresh completed; consumed %d due slot%s",
-          Math.max(consumedTimes.length, latestDueTimes.length),
-          Math.max(consumedTimes.length, latestDueTimes.length) === 1 ? "" : "s",
-        );
-        nextDelay = nextNoodleSchedulerPollDelayMs(completed, completedAt);
-        return;
-      }
-
-      const failed = await persistFailure(latest, responseError(response.payload), response.statusCode, completedAt);
-      nextDelay = nextNoodleSchedulerPollDelayMs(failed, completedAt);
-    } catch (error) {
-      const at = new Date();
-      const message = error instanceof Error ? error.message : String(error);
-      try {
-        const schedule = await noodle.ensureRefreshSchedule(at);
-        const failed = await persistFailure(schedule, message, 500, at);
-        nextDelay = nextNoodleSchedulerPollDelayMs(failed, at);
-      } catch (persistError) {
-        logger.error(persistError, "[noodle-scheduler] Failed to persist scheduler failure state");
-      }
     } finally {
       polling = false;
       scheduleNext(nextDelay);

@@ -24,6 +24,7 @@ export type StagedProfileImportAssets = {
   rootDir: string;
   assets: StagedProfileImportAsset[];
   totalBytes: number;
+  rollbackPrepared: boolean;
 };
 
 function safeRelativeAssetParts(path: string): string[] {
@@ -57,9 +58,7 @@ export async function stageProfileImportAssets(
       const buffer = await input.read();
       if (!buffer) continue;
       if (buffer.byteLength !== input.expectedSize) {
-        throw new ProfileImportAssetValidationError(
-          `Profile asset ${input.path} does not match its manifest size.`,
-        );
+        throw new ProfileImportAssetValidationError(`Profile asset ${input.path} does not match its manifest size.`);
       }
 
       totalBytes += buffer.byteLength;
@@ -84,21 +83,58 @@ export async function stageProfileImportAssets(
       });
     }
 
-    return { rootDir, assets, totalBytes };
+    return { rootDir, assets, totalBytes, rollbackPrepared: false };
   } catch (error) {
     await rm(rootDir, { recursive: true, force: true }).catch(() => undefined);
     throw error;
   }
 }
 
-export async function promoteStagedProfileAssets(stage: StagedProfileImportAssets): Promise<void> {
+export async function prepareStagedProfileAssetRollback(stage: StagedProfileImportAssets): Promise<void> {
+  if (stage.rollbackPrepared) return;
   for (const asset of stage.assets) {
-    await mkdir(dirname(asset.outputPath), { recursive: true });
     asset.hadExistingOutput = existsSync(asset.outputPath);
     if (asset.hadExistingOutput) {
       await mkdir(dirname(asset.backupPath), { recursive: true });
       await copyFile(asset.outputPath, asset.backupPath);
     }
+  }
+  stage.rollbackPrepared = true;
+}
+
+export function preparedProfileAssetRollbackDurabilityPaths(stage: StagedProfileImportAssets) {
+  if (!stage.rollbackPrepared) {
+    throw new ProfileImportAssetValidationError("Profile asset rollback has not been prepared");
+  }
+  const dataDir = dirname(stage.rootDir);
+  const files = stage.assets.filter((asset) => asset.hadExistingOutput).map((asset) => asset.backupPath);
+  const directories = new Set<string>();
+  for (const file of files) {
+    let directory = dirname(file);
+    for (;;) {
+      directories.add(directory);
+      if (directory === dataDir) break;
+      const parent = dirname(directory);
+      if (parent === directory) {
+        throw new ProfileImportAssetValidationError("Profile rollback asset escaped the data directory");
+      }
+      directory = parent;
+    }
+  }
+  return {
+    files,
+    // Persist the copied rollback entry before the staging-root ancestry.
+    directories: [...directories].sort((left, right) => right.length - left.length || left.localeCompare(right)),
+  };
+}
+
+export async function promoteStagedProfileAssets(stage: StagedProfileImportAssets): Promise<void> {
+  // Preserve compatibility for direct callers. The profile restore route invokes
+  // preparation itself so it can prove the rollback copy durable before this
+  // first destructive output mutation.
+  await prepareStagedProfileAssetRollback(stage);
+  for (const asset of stage.assets) {
+    await mkdir(dirname(asset.outputPath), { recursive: true });
 
     asset.promotionAttempted = true;
     try {
@@ -110,6 +146,41 @@ export async function promoteStagedProfileAssets(stage: StagedProfileImportAsset
       await rename(asset.stagedPath, asset.outputPath);
     }
   }
+}
+
+export function promotedProfileAssetDurabilityPaths(stage: StagedProfileImportAssets) {
+  const dataDir = dirname(stage.rootDir);
+  const files: string[] = [];
+  const directories = new Set<string>();
+  for (const asset of stage.assets) {
+    if (!asset.promotionAttempted) continue;
+    files.push(asset.outputPath);
+    let directory = dirname(asset.outputPath);
+    for (;;) {
+      directories.add(directory);
+      if (directory === dataDir) break;
+      const parent = dirname(directory);
+      if (parent === directory) {
+        throw new ProfileImportAssetValidationError(`Profile asset escaped the data directory: ${asset.path}`);
+      }
+      directory = parent;
+    }
+  }
+  return {
+    files,
+    // Persist leaf rename entries before their ancestor directory entries.
+    directories: [...directories].sort((left, right) => right.length - left.length || left.localeCompare(right)),
+  };
+}
+
+export function rolledBackProfileAssetDurabilityPaths(stage: StagedProfileImportAssets) {
+  const promoted = promotedProfileAssetDurabilityPaths(stage);
+  return {
+    files: stage.assets
+      .filter((asset) => asset.promotionAttempted && asset.hadExistingOutput)
+      .map((asset) => asset.outputPath),
+    directories: promoted.directories,
+  };
 }
 
 export async function rollbackPromotedProfileAssets(stage: StagedProfileImportAssets): Promise<void> {

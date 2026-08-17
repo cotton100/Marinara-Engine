@@ -57,6 +57,7 @@ import { noodleRoutes } from "./noodle.routes.js";
 import { capabilityPackagesRoutes } from "./capability-packages.routes.js";
 import { customAgentRepositoriesRoutes } from "./custom-agent-repositories.routes.js";
 import { personalExtensionsRoutes } from "./personal-extensions.routes.js";
+import { personalExtensionCoordinationRoutes } from "./personal-extension-coordination.routes.js";
 import { notificationSoundRoutes } from "./notification-sound.routes.js";
 import { libraryFoldersRoutes } from "./library-folders.routes.js";
 
@@ -116,6 +117,7 @@ export async function registerRoutes(app: FastifyInstance) {
   await app.register(capabilityPackagesRoutes, { prefix: "/api/capability-packages" });
   await app.register(customAgentRepositoriesRoutes, { prefix: "/api/custom-agent-repositories" });
   await app.register(personalExtensionsRoutes, { prefix: "/api/personal-extensions" });
+  await app.register(personalExtensionCoordinationRoutes, { prefix: "/api/personal-extensions" });
   await app.register(notificationSoundRoutes, { prefix: "/api/notification-sound" });
   if (process.env.MARINARA_LITE !== "true" && process.env.MARINARA_LITE !== "1") {
     await app.register(sidecarRoutes, { prefix: "/api/sidecar" });

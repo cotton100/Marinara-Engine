@@ -215,6 +215,7 @@ import {
   type GameDynamicImagePromptRequest,
 } from "../services/game/game-asset-generation.js";
 import { saveImageToDisk } from "../services/image/image-generation.js";
+import { runWithDetachedProfileAssetMutation } from "../services/import/profile-asset-mutation-gate.js";
 import { resolveGalleryImagePath } from "../services/image/gallery-image-path.js";
 import {
   generateVideo,
@@ -4148,7 +4149,7 @@ async function runGameLorebookKeeperAfterConclusion(args: {
 function queueGameLorebookKeeperAfterConclusion(
   args: Parameters<typeof runGameLorebookKeeperAfterConclusion>[0],
 ): void {
-  void runGameLorebookKeeperAfterConclusion(args).catch((err) => {
+  void runWithDetachedProfileAssetMutation(() => runGameLorebookKeeperAfterConclusion(args)).catch((err) => {
     logger.warn(err, "[game/lorebook-keeper] Queued run crashed for chat %s", args.chatId);
   });
 }
@@ -11615,7 +11616,7 @@ export async function gameRoutes(app: FastifyInstance) {
       const releaseBackgroundStoryboardLock = releaseStoryboardLock;
       releaseStoryboardLock = null;
 
-      void (async () => {
+      void runWithDetachedProfileAssetMutation(async () => {
         const backgroundTimeout = setTimeout(() => {
           backgroundController.abort(
             new Error(
@@ -11684,7 +11685,7 @@ export async function gameRoutes(app: FastifyInstance) {
           clearTimeout(backgroundTimeout);
           releaseBackgroundStoryboardLock?.();
         }
-      })();
+      });
 
       return {
         storyboard: initialStoryboard,

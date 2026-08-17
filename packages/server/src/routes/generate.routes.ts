@@ -200,6 +200,11 @@ import { eq } from "../db/file-query.js";
 import { PROFESSOR_MARI_ID, type GenerationParameterSendMap } from "@marinara-engine/shared";
 import { chunkAndEmbedMessages } from "../services/memory-recall.js";
 import {
+  getMemoryRecallSourceDirtyPublisher,
+  runMemoryRecallMutationWithDirtyHint,
+} from "../services/memory-recall-source-dirty.js";
+import { runWithDetachedProfileAssetMutation } from "../services/import/profile-asset-mutation-gate.js";
+import {
   isMemoryRecallVectorizerAvailable,
   resolveMemoryRecallEmbeddingSource,
 } from "../services/memory-recall-embedding.js";
@@ -711,6 +716,7 @@ function replaceConversationContextMacro(
 
 export async function generateRoutes(app: FastifyInstance) {
   const isDebug = logger.isLevelEnabled("debug");
+  const memoryRecallSourceDirty = getMemoryRecallSourceDirtyPublisher(app.db);
 
   const chats = createChatsStorage(app.db);
   const connections = createConnectionsStorage(app.db);
@@ -1795,10 +1801,7 @@ export async function generateRoutes(app: FastifyInstance) {
           idleDuration: promptIdleDuration,
           timeZone: promptTimeZone,
         });
-        const conversationMacroFieldsByCharacterId = new Map<
-          string,
-          NonNullable<MacroContext["convoFields"]>
-        >();
+        const conversationMacroFieldsByCharacterId = new Map<string, NonNullable<MacroContext["convoFields"]>>();
         const historyMacroProfilesById = (await resolveCharacterMacroData(app.db, allCharacterIds)).profilesById;
         const resolveHistoryMessageMacros = <T extends { content: string; characterId?: string | null }>(
           messages: T[],
@@ -2847,10 +2850,7 @@ export async function generateRoutes(app: FastifyInstance) {
               countUpcomingAssistantMessage: agent.phase === "post_processing" && createsAssistantMessage,
             })
           ) {
-            logger.debug(
-              "[agents] Skipping custom agent %s until its message cadence threshold",
-              agent.type,
-            );
+            logger.debug("[agents] Skipping custom agent %s until its message cadence threshold", agent.type);
             resolvedAgents.splice(index, 1);
           }
         }
@@ -3267,9 +3267,7 @@ export async function generateRoutes(app: FastifyInstance) {
         }
 
         const roleplayDmCommandsEnabled =
-          chatMode === "roleplay" &&
-          chatMeta.roleplayDmCommandsEnabled === true &&
-          !input.impersonate;
+          chatMode === "roleplay" && chatMeta.roleplayDmCommandsEnabled === true && !input.impersonate;
         if (roleplayDmCommandsEnabled) {
           const dmTargetHint =
             charInfo
@@ -5349,8 +5347,7 @@ export async function generateRoutes(app: FastifyInstance) {
           const responderMacroContext = targetCharId
             ? {
                 ...promptMacroContext,
-                convoFields:
-                  conversationMacroFieldsByCharacterId.get(targetCharId) ?? promptMacroContext.convoFields,
+                convoFields: conversationMacroFieldsByCharacterId.get(targetCharId) ?? promptMacroContext.convoFields,
               }
             : promptMacroContext;
           const macroScopedMessagesForGen = spatiallyScopedMessagesForGen.map((message) => ({
@@ -8634,8 +8631,7 @@ export async function generateRoutes(app: FastifyInstance) {
                       db: app.db,
                       chatId: input.chatId,
                       chatName: chat.name,
-                      chatMode:
-                        chatMode === "game" ? "game" : "roleplay",
+                      chatMode: chatMode === "game" ? "game" : "roleplay",
                       chatMetadata: freshMeta,
                       currentBackground: backgroundBeforeGeneration ?? currentBackground,
                       illustratorAgent: illustratorBackgroundAgent,
@@ -9165,7 +9161,6 @@ export async function generateRoutes(app: FastifyInstance) {
                 // Non-critical — don't fail generation if a rewrite agent errors.
               }
             }
-
           }
 
           if (holdForTextRewrite && !textRewriteApplied && !abortController.signal.aborted) {
@@ -9490,15 +9485,21 @@ export async function generateRoutes(app: FastifyInstance) {
             charNameMap[ci.id] = ci.name;
           }
           if (memoryRecallVectorizerAvailable) {
-            chunkAndEmbedMessages(
-              app.db,
-              input.chatId,
-              { userName: personaName, characterNames: charNameMap },
-              {
-                embeddingSource: memoryRecallEmbeddingSource,
-                readBehindMessageCount:
-                  typeof contextMessageLimit === "number" && contextMessageLimit > 0 ? contextMessageLimit : undefined,
-              },
+            void runWithDetachedProfileAssetMutation(() =>
+              runMemoryRecallMutationWithDirtyHint(memoryRecallSourceDirty, input.chatId, () =>
+                chunkAndEmbedMessages(
+                  app.db,
+                  input.chatId,
+                  { userName: personaName, characterNames: charNameMap },
+                  {
+                    embeddingSource: memoryRecallEmbeddingSource,
+                    readBehindMessageCount:
+                      typeof contextMessageLimit === "number" && contextMessageLimit > 0
+                        ? contextMessageLimit
+                        : undefined,
+                  },
+                ),
+              ),
             ).catch((err) => logger.error(err, "[memory-recall] Background chunking failed"));
           }
         }

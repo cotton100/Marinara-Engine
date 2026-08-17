@@ -6,13 +6,13 @@ import {
   getActivityState,
   getRecentAutonomousClientPresence,
 } from "./autonomous.service.js";
-import {
-  isIntentOnCooldown,
-  resolveIntent,
-  type MessageIntent,
-} from "./intent.service.js";
+import { isIntentOnCooldown, resolveIntent, type MessageIntent } from "./intent.service.js";
 import { getBusyDelay, getEffectiveCurrentStatus, type WeekSchedule } from "./schedule.service.js";
 import { parseConversationStatusOverrides } from "../generation/conversation-context-utils.js";
+import {
+  getProfileAssetMaintenanceEpoch,
+  runWithDetachedProfileAssetMutation,
+} from "../import/profile-asset-mutation-gate.js";
 import { resolveConversationTimeZone, toZonedWallClockDate } from "./timezone.js";
 
 const SERVER_AUTONOMOUS_INITIAL_DELAY_MS = 20_000;
@@ -126,6 +126,11 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
   let stopped = false;
   let polling = false;
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  const delayedGenerations = new Map<
+    ReturnType<typeof setTimeout>,
+    { chatId: string; claimedAt: number | undefined }
+  >();
+  let observedMaintenanceEpoch = getProfileAssetMaintenanceEpoch();
 
   const scheduleNext = (delayMs = SERVER_AUTONOMOUS_POLL_MS) => {
     if (stopped) return;
@@ -134,6 +139,20 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
       void poll();
     }, delayMs);
     pollTimer.unref?.();
+  };
+
+  const synchronizeMaintenanceEpoch = () => {
+    const currentEpoch = getProfileAssetMaintenanceEpoch();
+    if (currentEpoch === observedMaintenanceEpoch) return false;
+    for (const [timer, pending] of delayedGenerations) {
+      clearTimeout(timer);
+      clearGenerationInProgress(pending.chatId, pending.claimedAt);
+    }
+    delayedGenerations.clear();
+    runningChats.clear();
+    failureBackoffByChat.clear();
+    observedMaintenanceEpoch = currentEpoch;
+    return true;
   };
 
   const isChatOnFailureBackoff = (chatId: string) => {
@@ -153,7 +172,10 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
     const hardFailure = isHardGenerationFailure(error, statusCode);
     const delayMs = hardFailure
       ? Math.min(AUTONOMOUS_FAILURE_MAX_BACKOFF_MS, AUTONOMOUS_HARD_FAILURE_BACKOFF_MS * attempts)
-      : Math.min(AUTONOMOUS_FAILURE_MAX_BACKOFF_MS, AUTONOMOUS_FAILURE_BASE_BACKOFF_MS * 2 ** Math.max(0, attempts - 1));
+      : Math.min(
+          AUTONOMOUS_FAILURE_MAX_BACKOFF_MS,
+          AUTONOMOUS_FAILURE_BASE_BACKOFF_MS * 2 ** Math.max(0, attempts - 1),
+        );
     failureBackoffByChat.set(chatId, {
       attempts,
       nextAllowedAt: Date.now() + delayMs,
@@ -178,13 +200,7 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
   ): Promise<boolean> => {
     const promptTimeZone = resolveConversationTimeZone(chatMeta);
     const promptNow = toZonedWallClockDate(new Date(), promptTimeZone);
-    const { intent, onCooldown, disabled } = resolveAvailableIntent(
-      chatId,
-      characterId,
-      schedule,
-      chatMeta,
-      promptNow,
-    );
+    const { intent, onCooldown, disabled } = resolveAvailableIntent(chatId, characterId, schedule, chatMeta, promptNow);
     if (onCooldown || disabled) {
       clearGenerationInProgress(chatId, claimedAt);
       return false;
@@ -248,120 +264,198 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
 
   // Runs after a busy delay on a per-chat timer so the poll loop isn't blocked.
   // Owns the runningChats slot until it finishes.
-  const scheduleDelayedGeneration = (
-    chatId: string,
-    characterId: string,
-    schedule: WeekSchedule | null,
-    chatMeta: Record<string, unknown>,
-    claimedAt: number | undefined,
-    delayMs: number,
-  ) => {
+  const scheduleDelayedGeneration = (chatId: string, claimedAt: number | undefined, delayMs: number) => {
+    const scheduledEpoch = getProfileAssetMaintenanceEpoch();
     const timer = setTimeout(() => {
-      void (async () => {
+      delayedGenerations.delete(timer);
+      void runWithDetachedProfileAssetMutation(async () => {
+        let activeClaimedAt = claimedAt;
+        let rescheduled = false;
         try {
-          if (stopped) return;
+          // A restore may reuse the same chat UUID. Old process-memory claims,
+          // character selection, and activity timestamps are not valid across
+          // that boundary; let the next fresh poll reconstruct them.
+          const epochChanged = synchronizeMaintenanceEpoch();
+          if (epochChanged || scheduledEpoch !== getProfileAssetMaintenanceEpoch()) {
+            clearGenerationInProgress(chatId, activeClaimedAt);
+            return;
+          }
+          if (stopped) {
+            clearGenerationInProgress(chatId, activeClaimedAt);
+            return;
+          }
           if (getRecentAutonomousClientPresence(chatId, RECENT_CLIENT_PRESENCE_MS)) {
-            clearGenerationInProgress(chatId, claimedAt);
+            clearGenerationInProgress(chatId, activeClaimedAt);
             return;
           }
           if (isChatOnFailureBackoff(chatId)) {
-            clearGenerationInProgress(chatId, claimedAt);
+            clearGenerationInProgress(chatId, activeClaimedAt);
             return;
           }
-          const generated = await generateAutonomousMessage(chatId, characterId, schedule, chatMeta, claimedAt);
+
+          // Never pass the pre-delay claim or character selection to generate.
+          clearGenerationInProgress(chatId, activeClaimedAt);
+          activeClaimedAt = undefined;
+          const checkResponse = await app.inject({
+            method: "POST",
+            url: "/api/conversation/autonomous/check",
+            payload: {
+              chatId,
+              userStatus: "idle",
+              maxFollowups: OFFLINE_MAX_FOLLOWUPS,
+              source: "server",
+            },
+          });
+          if (checkResponse.statusCode !== 200) return;
+          const result = JSON.parse(checkResponse.payload) as AutonomousCheckResult;
+          activeClaimedAt = result.generationStartedAt;
+          const characterId = result.shouldTrigger ? result.characterIds?.[0] : null;
+          if (!characterId) return;
+
+          await chats.inheritFreshConversationSchedules(chatId);
+          const freshChat = await chats.getById(chatId);
+          if (!freshChat || !shouldConsiderChat(freshChat)) {
+            clearGenerationInProgress(chatId, activeClaimedAt);
+            return;
+          }
+          const freshMeta = parseMetadata(freshChat.metadata);
+          const freshSchedules = (freshMeta.characterSchedules ?? {}) as Record<string, WeekSchedule>;
+          const schedule = freshSchedules[characterId] ?? null;
+          if (schedule) {
+            const promptTimeZone = resolveConversationTimeZone(freshMeta);
+            const nowInstant = new Date();
+            const promptNow = toZonedWallClockDate(nowInstant, promptTimeZone);
+            const statusOverrides = parseConversationStatusOverrides(freshMeta.conversationStatusOverrides);
+            const { status } = getEffectiveCurrentStatus(
+              schedule,
+              statusOverrides[characterId],
+              nowInstant,
+              "free time",
+              promptNow,
+            );
+            if (status === "offline") {
+              clearGenerationInProgress(chatId, activeClaimedAt);
+              return;
+            }
+            const nextDelayMs = getBusyDelay(status, schedule);
+            if (nextDelayMs > 0) {
+              rescheduled = true;
+              scheduleDelayedGeneration(chatId, activeClaimedAt, nextDelayMs);
+              return;
+            }
+          }
+          const generated = await generateAutonomousMessage(chatId, characterId, schedule, freshMeta, activeClaimedAt);
           if (generated) {
             logger.info("[autonomous-scheduler] Generated autonomous message for chat %s (after delay)", chatId);
           }
         } catch (err) {
-          clearGenerationInProgress(chatId, claimedAt);
+          clearGenerationInProgress(chatId, activeClaimedAt);
           logger.warn(err, "[autonomous-scheduler] Failed during delayed generation for chat %s", chatId);
         } finally {
-          runningChats.delete(chatId);
+          if (!rescheduled) runningChats.delete(chatId);
         }
-      })();
+      }).catch((err) => {
+        clearGenerationInProgress(chatId, claimedAt);
+        runningChats.delete(chatId);
+        logger.warn(err, "[autonomous-scheduler] Failed to admit delayed generation for chat %s", chatId);
+      });
     }, delayMs);
+    delayedGenerations.set(timer, { chatId, claimedAt });
     timer.unref?.();
   };
 
-  const evaluateChat = async (chat: RawChat) => {
-    if (runningChats.has(chat.id)) return;
-    if (isChatOnFailureBackoff(chat.id)) return;
-    const activeGenerations = (app as unknown as { activeGenerations?: Map<string, unknown> }).activeGenerations;
-    if (activeGenerations?.has(chat.id)) return;
-
-    const recentPresence = getRecentAutonomousClientPresence(chat.id, RECENT_CLIENT_PRESENCE_MS);
-    if (recentPresence) return;
-
-    runningChats.add(chat.id);
+  const evaluateChat = async (chatId: string) => {
+    if (runningChats.has(chatId)) return;
+    runningChats.add(chatId);
     let generationStartedAt: number | undefined;
     let handedOffToTimer = false;
     try {
-      const checkResponse = await app.inject({
-        method: "POST",
-        url: "/api/conversation/autonomous/check",
-        payload: {
-          chatId: chat.id,
-          userStatus: "idle",
-          maxFollowups: OFFLINE_MAX_FOLLOWUPS,
-          source: "server",
-        },
-      });
+      // Poll snapshots are only candidate IDs. Re-read the chat after fresh
+      // admission so a restore cannot leave this detached evaluation acting on
+      // metadata captured from the old profile.
+      await runWithDetachedProfileAssetMutation(async () => {
+        synchronizeMaintenanceEpoch();
+        runningChats.add(chatId);
+        if (stopped) return;
+        const chat = await chats.getById(chatId);
+        if (!chat || !shouldConsiderChat(chat) || isChatOnFailureBackoff(chatId)) return;
+        const activeGenerations = (app as unknown as { activeGenerations?: Map<string, unknown> }).activeGenerations;
+        if (activeGenerations?.has(chatId)) return;
+        if (getRecentAutonomousClientPresence(chatId, RECENT_CLIENT_PRESENCE_MS)) return;
 
-      if (checkResponse.statusCode !== 200) {
-        logger.warn(
-          "[autonomous-scheduler] Eligibility check failed for chat %s with status %d",
-          chat.id,
-          checkResponse.statusCode,
-        );
-        return;
-      }
+        const checkResponse = await app.inject({
+          method: "POST",
+          url: "/api/conversation/autonomous/check",
+          payload: {
+            chatId,
+            userStatus: "idle",
+            maxFollowups: OFFLINE_MAX_FOLLOWUPS,
+            source: "server",
+          },
+        });
 
-      const result = JSON.parse(checkResponse.payload) as AutonomousCheckResult;
-      generationStartedAt = result.generationStartedAt;
-      const characterId = result.shouldTrigger ? result.characterIds?.[0] : null;
-      if (!characterId) return;
+        if (checkResponse.statusCode !== 200) {
+          logger.warn(
+            "[autonomous-scheduler] Eligibility check failed for chat %s with status %d",
+            chatId,
+            checkResponse.statusCode,
+          );
+          return;
+        }
 
-      await chats.inheritFreshConversationSchedules(chat.id);
-      const freshChat = await chats.getById(chat.id);
-      if (!freshChat) return;
-      const freshMeta = parseMetadata(freshChat.metadata);
-      const promptTimeZone = resolveConversationTimeZone(freshMeta);
-      const nowInstant = new Date();
-      const promptNow = toZonedWallClockDate(nowInstant, promptTimeZone);
-      const freshSchedules = (freshMeta.characterSchedules ?? {}) as Record<string, WeekSchedule>;
-      const statusOverrides = parseConversationStatusOverrides(freshMeta.conversationStatusOverrides);
-      const schedule = freshSchedules[characterId] ?? null;
+        const result = JSON.parse(checkResponse.payload) as AutonomousCheckResult;
+        generationStartedAt = result.generationStartedAt;
+        const characterId = result.shouldTrigger ? result.characterIds?.[0] : null;
+        if (!characterId) return;
 
-      if (schedule) {
-        const { status } = getEffectiveCurrentStatus(
+        await chats.inheritFreshConversationSchedules(chatId);
+        const freshChat = await chats.getById(chatId);
+        if (!freshChat || !shouldConsiderChat(freshChat)) return;
+        const freshMeta = parseMetadata(freshChat.metadata);
+        const promptTimeZone = resolveConversationTimeZone(freshMeta);
+        const nowInstant = new Date();
+        const promptNow = toZonedWallClockDate(nowInstant, promptTimeZone);
+        const freshSchedules = (freshMeta.characterSchedules ?? {}) as Record<string, WeekSchedule>;
+        const statusOverrides = parseConversationStatusOverrides(freshMeta.conversationStatusOverrides);
+        const schedule = freshSchedules[characterId] ?? null;
+
+        if (schedule) {
+          const { status } = getEffectiveCurrentStatus(
+            schedule,
+            statusOverrides[characterId],
+            nowInstant,
+            "free time",
+            promptNow,
+          );
+          if (status === "offline") {
+            clearGenerationInProgress(chatId, generationStartedAt);
+            return;
+          }
+          const delayMs = getBusyDelay(status, schedule);
+          if (delayMs > 0) {
+            handedOffToTimer = true;
+            scheduleDelayedGeneration(chatId, generationStartedAt, delayMs);
+            return;
+          }
+        }
+
+        const generated = await generateAutonomousMessage(
+          chatId,
+          characterId,
           schedule,
-          statusOverrides[characterId],
-          nowInstant,
-          "free time",
-          promptNow,
+          freshMeta,
+          generationStartedAt,
         );
-        if (status === "offline") {
-          clearGenerationInProgress(chat.id, generationStartedAt);
-          return;
+        if (generated) {
+          logger.info("[autonomous-scheduler] Generated autonomous message for chat %s", chatId);
         }
-        const delayMs = getBusyDelay(status, schedule);
-        if (delayMs > 0) {
-          handedOffToTimer = true;
-          scheduleDelayedGeneration(chat.id, characterId, schedule, freshMeta, generationStartedAt, delayMs);
-          return;
-        }
-      }
-
-      const generated = await generateAutonomousMessage(chat.id, characterId, schedule, freshMeta, generationStartedAt);
-      if (generated) {
-        logger.info("[autonomous-scheduler] Generated autonomous message for chat %s", chat.id);
-      }
+      });
     } catch (err) {
-      clearGenerationInProgress(chat.id, generationStartedAt);
-      recordFailureBackoff(chat.id, err instanceof Error ? err.message : String(err));
-      logger.warn(err, "[autonomous-scheduler] Failed while evaluating chat %s", chat.id);
+      clearGenerationInProgress(chatId, generationStartedAt);
+      recordFailureBackoff(chatId, err instanceof Error ? err.message : String(err));
+      logger.warn(err, "[autonomous-scheduler] Failed while evaluating chat %s", chatId);
     } finally {
-      if (!handedOffToTimer) runningChats.delete(chat.id);
+      if (!handedOffToTimer) runningChats.delete(chatId);
     }
   };
 
@@ -369,12 +463,13 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
     if (stopped || polling) return;
     polling = true;
     try {
+      synchronizeMaintenanceEpoch();
       const allChats = (await chats.list()) as RawChat[];
       for (const chat of allChats) {
         if (stopped) return;
         if (runningChats.size >= MAX_SERVER_AUTONOMOUS_CONCURRENT_EVALUATIONS) break;
         if (!shouldConsiderChat(chat)) continue;
-        void evaluateChat(chat);
+        void evaluateChat(chat.id);
       }
     } catch (err) {
       logger.warn(err, "[autonomous-scheduler] Poll failed");
@@ -388,6 +483,12 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
     stopped = true;
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = null;
+    for (const [timer, pending] of delayedGenerations) {
+      clearTimeout(timer);
+      clearGenerationInProgress(pending.chatId, pending.claimedAt);
+    }
+    delayedGenerations.clear();
+    runningChats.clear();
   };
 
   scheduleNext(SERVER_AUTONOMOUS_INITIAL_DELAY_MS);
@@ -397,5 +498,11 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
 
   logger.info("[autonomous-scheduler] Server-side autonomous scheduler started");
 
-  return { stop };
+  return {
+    stop,
+    // Deterministic regression seam for restore-vs-timer ordering. Production
+    // callers use only stop(); keeping the real closure here avoids a mock-only
+    // copy of the safety-critical delayed path.
+    scheduleDelayedGenerationForRegression: scheduleDelayedGeneration,
+  };
 }

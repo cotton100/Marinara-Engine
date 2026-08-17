@@ -18,7 +18,81 @@ import {
   removePersonalExtensionContributions,
   setPersonalExtensionContributionDispatcher,
 } from "../../lib/personal-extension-contributions";
+import {
+  issuePersonalExtensionCoordinationFacade,
+  type PersonalExtensionCoordinationFacade,
+} from "../../lib/personal-extension-coordination-facade";
 import { useChatStore } from "../../stores/chat.store";
+
+// This module is evaluated before any approved full-page extension starts.
+// Keep the primitives which protect host-only runtime records as lexical
+// captures: a previously started full-page extension may replace page globals
+// and collection prototypes, but it must not be able to observe a later
+// extension's coordination facade through those replacements.
+const pristineObjectFreeze = Object.freeze.bind(Object);
+const pristineReflectApply = Reflect.apply;
+const pristineEncodeURIComponent = globalThis.encodeURIComponent;
+const CapturedMap = Map;
+const CapturedSet = Set;
+const CapturedWeakMap = WeakMap;
+const pristineMapGet = Map.prototype.get;
+const pristineMapSet = Map.prototype.set;
+const pristineMapDelete = Map.prototype.delete;
+const pristineMapForEach = Map.prototype.forEach;
+const pristineSetAdd = Set.prototype.add;
+const pristineSetDelete = Set.prototype.delete;
+const pristineSetForEach = Set.prototype.forEach;
+const pristineWeakMapGet = WeakMap.prototype.get;
+const pristineWeakMapSet = WeakMap.prototype.set;
+const pristineWeakMapDelete = WeakMap.prototype.delete;
+
+function hostMapGet<K, V>(map: Map<K, V>, key: K) {
+  return pristineReflectApply(pristineMapGet, map, [key]) as V | undefined;
+}
+
+function hostMapSet<K, V>(map: Map<K, V>, key: K, value: V) {
+  pristineReflectApply(pristineMapSet, map, [key, value]);
+}
+
+function hostMapDelete<K, V>(map: Map<K, V>, key: K) {
+  return pristineReflectApply(pristineMapDelete, map, [key]) as boolean;
+}
+
+function hostMapForEach<K, V>(map: Map<K, V>, callback: (value: V, key: K) => void) {
+  pristineReflectApply(pristineMapForEach, map, [
+    (value: V, key: K) => {
+      callback(value, key);
+    },
+  ]);
+}
+
+function hostWeakMapGet<K extends object, V>(map: WeakMap<K, V>, key: K) {
+  return pristineReflectApply(pristineWeakMapGet, map, [key]) as V | undefined;
+}
+
+function hostWeakMapSet<K extends object, V>(map: WeakMap<K, V>, key: K, value: V) {
+  pristineReflectApply(pristineWeakMapSet, map, [key, value]);
+}
+
+function hostWeakMapDelete<K extends object, V>(map: WeakMap<K, V>, key: K) {
+  pristineReflectApply(pristineWeakMapDelete, map, [key]);
+}
+
+function hostSetAdd<T>(set: Set<T>, value: T) {
+  pristineReflectApply(pristineSetAdd, set, [value]);
+}
+
+function hostSetDelete<T>(set: Set<T>, value: T) {
+  pristineReflectApply(pristineSetDelete, set, [value]);
+}
+
+function hostSetForEach<T>(set: Set<T>, callback: (value: T) => void) {
+  pristineReflectApply(pristineSetForEach, set, [
+    (value: T) => {
+      callback(value);
+    },
+  ]);
+}
 
 type ActiveClientExtension = {
   contentHash: string;
@@ -35,6 +109,7 @@ type FullPageExtensionIdentity = {
 type FullPageExtensionApi = {
   version: 1;
   extension: Readonly<FullPageExtensionIdentity>;
+  coordination: PersonalExtensionCoordinationFacade;
   log: Readonly<Pick<Console, "debug" | "info" | "warn" | "error">>;
   storage: Readonly<{
     get: () => Promise<Record<string, unknown>>;
@@ -49,21 +124,49 @@ type FullPageExtensionApi = {
 };
 
 type ActiveFullPageExtension = {
-  contentHash: string;
-  extension: PersonalClientExtensionRuntime;
-  script: HTMLScriptElement;
+  identity: Readonly<FullPageExtensionIdentity>;
   style: HTMLLinkElement | null;
-  cleanupFns: Array<() => unknown>;
+  started: boolean;
+  cleanupHead: FullPageCleanupNode | null;
   timeoutIds: Set<number>;
   intervalIds: Set<number>;
 };
 
-type FullPageExtensionHostWindow = Window & {
-  __marinaraRunFullPageExtension?: (
-    identity: FullPageExtensionIdentity,
-    main: (api: FullPageExtensionApi) => unknown,
-  ) => void;
+type FullPageCleanupNode = {
+  cleanup: () => unknown;
+  next: FullPageCleanupNode | null;
 };
+
+type FullPageExtensionModule = {
+  extensionId?: unknown;
+  contentHash?: unknown;
+  default?: unknown;
+};
+
+type ExpectedClientExtension = Readonly<{
+  executionMode: PersonalClientExtensionRuntime["executionMode"];
+  contentHash: string;
+}>;
+
+function snapshotFullPageIdentity(extension: PersonalClientExtensionRuntime) {
+  try {
+    const id = extension.id;
+    const name = extension.name;
+    const contentHash = extension.contentHash;
+    if (typeof id !== "string" || typeof name !== "string" || typeof contentHash !== "string") return null;
+    return pristineObjectFreeze({ id, name, contentHash });
+  } catch {
+    return null;
+  }
+}
+
+export function approvedFullPageRuntimeUrl(identity: Readonly<FullPageExtensionIdentity>) {
+  return `/api/personal-extensions/${pristineEncodeURIComponent(identity.id)}/page-runtime.js?hash=${pristineEncodeURIComponent(identity.contentHash)}`;
+}
+
+function approvedFullPageStyleUrl(identity: Readonly<FullPageExtensionIdentity>) {
+  return `/api/personal-extensions/${pristineEncodeURIComponent(identity.id)}/page-style.css?hash=${pristineEncodeURIComponent(identity.contentHash)}`;
+}
 
 type SandboxMessage = {
   channel?: string;
@@ -213,6 +316,10 @@ async function postSandboxContext(active: ActiveClientExtension, context = readP
 
 const activeExtensions = new Map<string, ActiveClientExtension>();
 const activeFullPageExtensions = new Map<string, ActiveFullPageExtension>();
+const fullPageCoordination = new CapturedWeakMap<
+  ActiveFullPageExtension,
+  ReturnType<typeof issuePersonalExtensionCoordinationFacade>
+>();
 
 function extensionFetch(id: string, path: string, init: RequestInit = {}) {
   const method = (init.method ?? "GET").toUpperCase();
@@ -229,31 +336,50 @@ function extensionFetch(id: string, path: string, init: RequestInit = {}) {
 }
 
 async function cleanupExtension(id: string) {
-  const active = activeExtensions.get(id);
-  activeExtensions.delete(id);
+  const active = hostMapGet(activeExtensions, id);
+  hostMapDelete(activeExtensions, id);
   removePersonalExtensionContributions(id);
   if (active) {
     active.iframe.contentWindow?.postMessage({ channel: "marinara-personal-extension", type: "stop" }, "*");
     active.iframe.remove();
   }
 
-  const fullPage = activeFullPageExtensions.get(id);
-  activeFullPageExtensions.delete(id);
+  const fullPage = hostMapGet(activeFullPageExtensions, id);
+  hostMapDelete(activeFullPageExtensions, id);
   if (!fullPage) return;
-  fullPage.script.remove();
+  const coordination = hostWeakMapGet(fullPageCoordination, fullPage);
+  hostWeakMapDelete(fullPageCoordination, fullPage);
+  if (coordination) {
+    try {
+      coordination.beginCleanup();
+    } catch (error) {
+      console.warn(`[Personal Extension ${fullPage.identity.name}] cleanup start failed`, error);
+    }
+  }
   fullPage.style?.remove();
-  for (const timerId of fullPage.timeoutIds) window.clearTimeout(timerId);
-  for (const timerId of fullPage.intervalIds) window.clearInterval(timerId);
-  for (const cleanup of fullPage.cleanupFns.reverse()) {
+  hostSetForEach(fullPage.timeoutIds, (timerId) => window.clearTimeout(timerId));
+  hostSetForEach(fullPage.intervalIds, (timerId) => window.clearInterval(timerId));
+  let cleanupNode = fullPage.cleanupHead;
+  fullPage.cleanupHead = null;
+  while (cleanupNode) {
+    const cleanup = cleanupNode.cleanup;
     try {
       await cleanup();
     } catch (error) {
-      console.warn(`[Personal Extension ${fullPage.extension.name}] cleanup failed`, error);
+      console.warn(`[Personal Extension ${fullPage.identity.name}] cleanup failed`, error);
+    }
+    cleanupNode = cleanupNode.next;
+  }
+  if (coordination) {
+    try {
+      await coordination.cleanup();
+    } catch (error) {
+      console.warn(`[Personal Extension ${fullPage.identity.name}] host cleanup failed`, error);
     }
   }
   window.dispatchEvent(
     new CustomEvent("marinara-personal-extension-stopped", {
-      detail: { id: fullPage.extension.id, contentHash: fullPage.contentHash },
+      detail: { id: fullPage.identity.id, contentHash: fullPage.identity.contentHash },
     }),
   );
 }
@@ -262,19 +388,25 @@ const STORAGE_ACTIONS = new Set<SandboxMessage["action"]>(["get", "patch", "dele
 const LOG_LEVELS = new Set<NonNullable<SandboxMessage["level"]>>(["debug", "info", "warn", "error"]);
 
 function createFullPageExtensionApi(active: ActiveFullPageExtension): FullPageExtensionApi {
-  const extension = Object.freeze({
-    id: active.extension.id,
-    name: active.extension.name,
-    contentHash: active.contentHash,
+  const coordination = issuePersonalExtensionCoordinationFacade({
+    runtimeEpoch: pristineObjectFreeze({}),
+    extensionId: active.identity.id,
+    contentHash: active.identity.contentHash,
   });
-  const storage = Object.freeze({
+  hostWeakMapSet(fullPageCoordination, active, coordination);
+  const extension = pristineObjectFreeze({
+    id: active.identity.id,
+    name: active.identity.name,
+    contentHash: active.identity.contentHash,
+  });
+  const storage = pristineObjectFreeze({
     async get() {
-      const response = await extensionFetch(active.extension.id, "storage");
+      const response = await extensionFetch(active.identity.id, "storage");
       if (!response.ok) throw new Error(`Storage read failed (${response.status})`);
       return ((await response.json()) as { value?: Record<string, unknown> }).value ?? {};
     },
     async patch(value: Record<string, unknown>) {
-      const response = await extensionFetch(active.extension.id, "storage", {
+      const response = await extensionFetch(active.identity.id, "storage", {
         method: "PATCH",
         body: JSON.stringify(value),
       });
@@ -282,47 +414,48 @@ function createFullPageExtensionApi(active: ActiveFullPageExtension): FullPageEx
       return ((await response.json()) as { value?: Record<string, unknown> }).value ?? {};
     },
     async clear() {
-      const response = await extensionFetch(active.extension.id, "storage", { method: "DELETE" });
+      const response = await extensionFetch(active.identity.id, "storage", { method: "DELETE" });
       if (!response.ok) throw new Error(`Storage clear failed (${response.status})`);
     },
   });
   const api: FullPageExtensionApi = {
     version: 1,
     extension,
-    log: Object.freeze({
-      debug: console.debug.bind(console, `[Personal Extension ${active.extension.name}]`),
-      info: console.info.bind(console, `[Personal Extension ${active.extension.name}]`),
-      warn: console.warn.bind(console, `[Personal Extension ${active.extension.name}]`),
-      error: console.error.bind(console, `[Personal Extension ${active.extension.name}]`),
+    coordination: coordination.facade,
+    log: pristineObjectFreeze({
+      debug: console.debug.bind(console, `[Personal Extension ${active.identity.name}]`),
+      info: console.info.bind(console, `[Personal Extension ${active.identity.name}]`),
+      warn: console.warn.bind(console, `[Personal Extension ${active.identity.name}]`),
+      error: console.error.bind(console, `[Personal Extension ${active.identity.name}]`),
     }),
     storage,
     setTimeout(callback, delay, ...args) {
       const timerId = window.setTimeout(() => {
-        active.timeoutIds.delete(timerId);
+        hostSetDelete(active.timeoutIds, timerId);
         callback(...args);
       }, delay);
-      active.timeoutIds.add(timerId);
+      hostSetAdd(active.timeoutIds, timerId);
       return timerId;
     },
     clearTimeout(timerId) {
-      active.timeoutIds.delete(timerId);
+      hostSetDelete(active.timeoutIds, timerId);
       window.clearTimeout(timerId);
     },
     setInterval(callback, delay, ...args) {
       const timerId = window.setInterval(callback, delay, ...args);
-      active.intervalIds.add(timerId);
+      hostSetAdd(active.intervalIds, timerId);
       return timerId;
     },
     clearInterval(timerId) {
-      active.intervalIds.delete(timerId);
+      hostSetDelete(active.intervalIds, timerId);
       window.clearInterval(timerId);
     },
     onCleanup(cleanup) {
       if (typeof cleanup !== "function") throw new TypeError("onCleanup requires a function");
-      active.cleanupFns.push(cleanup);
+      active.cleanupHead = { cleanup, next: active.cleanupHead };
     },
   };
-  return Object.freeze(api);
+  return pristineObjectFreeze(api);
 }
 
 async function handleStorage(active: ActiveClientExtension, message: SandboxMessage) {
@@ -382,67 +515,98 @@ async function handleStorage(active: ActiveClientExtension, message: SandboxMess
   }
 }
 
+type FullPageModuleLoadOptions<Api> = Readonly<{
+  runtimeUrl: string;
+  identity: Readonly<FullPageExtensionIdentity>;
+  isCurrent: () => boolean;
+  createApi: () => Api;
+  registerCleanup: (cleanup: () => unknown) => void;
+  onLateCleanupError: (error: unknown) => void;
+}>;
+
+// Dynamic import keeps the runtime's `main` binding and the API handoff inside
+// this host module. Unlike the retired window dispatcher, no earlier
+// full-page extension can wrap a public property and receive a later API.
+export async function loadApprovedFullPageExtensionModule<Api>(options: FullPageModuleLoadOptions<Api>) {
+  let runtime: FullPageExtensionModule;
+  try {
+    runtime = (await import(/* @vite-ignore */ options.runtimeUrl)) as FullPageExtensionModule;
+  } catch (error) {
+    if (!options.isCurrent()) return false;
+    throw new Error("Full-page extension runtime could not be loaded", { cause: error });
+  }
+  if (!options.isCurrent()) return false;
+
+  const main = runtime.default;
+  if (
+    runtime.extensionId !== options.identity.id ||
+    runtime.contentHash !== options.identity.contentHash ||
+    typeof main !== "function"
+  ) {
+    throw new Error("Full-page extension identity did not match the approved runtime");
+  }
+
+  // There is deliberately no await or page-visible intermediary between the
+  // last stale check, API issuance, and the lexical module call.
+  if (!options.isCurrent()) return false;
+  const cleanup = await (main as (api: Api) => unknown)(options.createApi());
+  const stale = !options.isCurrent();
+  if (typeof cleanup === "function") {
+    if (stale) {
+      try {
+        await cleanup();
+      } catch (error) {
+        options.onLateCleanupError(error);
+      }
+    } else {
+      options.registerCleanup(cleanup as () => unknown);
+    }
+  }
+  return !stale;
+}
+
+async function startFullPageExtension(active: ActiveFullPageExtension) {
+  if (active.started) throw new Error("Full-page extension runtime was already started");
+  active.started = true;
+  const identity = active.identity;
+  try {
+    const ready = await loadApprovedFullPageExtensionModule({
+      runtimeUrl: approvedFullPageRuntimeUrl(identity),
+      identity,
+      isCurrent: () => hostMapGet(activeFullPageExtensions, identity.id) === active,
+      createApi: () => createFullPageExtensionApi(active),
+      registerCleanup: (cleanup) => {
+        active.cleanupHead = { cleanup, next: active.cleanupHead };
+      },
+      onLateCleanupError: (error) => {
+        console.warn(`[Personal Extension ${identity.name}] late cleanup failed`, error);
+      },
+    });
+    if (!ready) return;
+    window.dispatchEvent(
+      new CustomEvent("marinara-personal-extension-ready", {
+        detail: { id: identity.id, contentHash: identity.contentHash },
+      }),
+    );
+  } catch (error) {
+    const current = hostMapGet(activeFullPageExtensions, identity.id) === active;
+    if (!current) return;
+    console.error(`[Personal Extension ${identity.name}] failed`, error);
+    await cleanupExtension(identity.id);
+    window.dispatchEvent(
+      new CustomEvent("marinara-personal-extension-error", {
+        detail: {
+          id: identity.id,
+          contentHash: identity.contentHash,
+          message: error instanceof Error ? error.message : String(error),
+        },
+      }),
+    );
+  }
+}
+
 export function PersonalExtensionInjector() {
   const { data: extensions = [] } = usePersonalExtensionRuntime();
-
-  useEffect(() => {
-    const host = window as FullPageExtensionHostWindow;
-    const runFullPageExtension = (
-      identity: FullPageExtensionIdentity,
-      main: (api: FullPageExtensionApi) => unknown,
-    ) => {
-      const active =
-        identity && typeof identity.id === "string" ? activeFullPageExtensions.get(identity.id) : undefined;
-      if (
-        !active ||
-        identity.contentHash !== active.contentHash ||
-        identity.name !== active.extension.name ||
-        typeof main !== "function"
-      ) {
-        throw new Error("Full-page extension identity did not match the approved runtime");
-      }
-      Promise.resolve()
-        .then(() => main(createFullPageExtensionApi(active)))
-        .then(async (cleanup) => {
-          const stale = activeFullPageExtensions.get(identity.id) !== active;
-          if (typeof cleanup === "function") {
-            if (stale) {
-              try {
-                await cleanup();
-              } catch (error) {
-                console.warn(`[Personal Extension ${active.extension.name}] late cleanup failed`, error);
-              }
-              return;
-            }
-            active.cleanupFns.push(() => cleanup());
-          }
-          if (stale) return;
-          window.dispatchEvent(
-            new CustomEvent("marinara-personal-extension-ready", {
-              detail: { id: identity.id, contentHash: identity.contentHash },
-            }),
-          );
-        })
-        .catch((error) => {
-          console.error(`[Personal Extension ${active.extension.name}] failed`, error);
-          window.dispatchEvent(
-            new CustomEvent("marinara-personal-extension-error", {
-              detail: {
-                id: identity.id,
-                contentHash: identity.contentHash,
-                message: error instanceof Error ? error.message : String(error),
-              },
-            }),
-          );
-        });
-    };
-    host.__marinaraRunFullPageExtension = runFullPageExtension;
-    return () => {
-      if (host.__marinaraRunFullPageExtension === runFullPageExtension) {
-        delete host.__marinaraRunFullPageExtension;
-      }
-    };
-  }, []);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<unknown>) => {
@@ -525,60 +689,77 @@ export function PersonalExtensionInjector() {
   }, []);
 
   useEffect(() => {
-    const expected = new Map(extensions.map((extension) => [extension.id, extension]));
+    const expected = new CapturedMap<string, ExpectedClientExtension>();
+    for (let index = 0; index < extensions.length; index += 1) {
+      const extension = extensions[index]!;
+      try {
+        const id = extension.id;
+        const executionMode = extension.executionMode;
+        const contentHash = extension.contentHash;
+        if (
+          typeof id !== "string" ||
+          (executionMode !== "full-page" && executionMode !== "sandboxed") ||
+          typeof contentHash !== "string"
+        ) {
+          continue;
+        }
+        hostMapSet(expected, id, pristineObjectFreeze({ executionMode, contentHash }));
+      } catch {
+        // A malformed or accessor-backed runtime record is never executable.
+      }
+    }
     for (const [id, active] of activeExtensions) {
-      const next = expected.get(id);
+      const next = hostMapGet(expected, id);
       if (!next || next.executionMode !== "sandboxed" || next.contentHash !== active.contentHash) {
         void cleanupExtension(id);
       }
     }
-    for (const [id, active] of activeFullPageExtensions) {
-      const next = expected.get(id);
-      if (!next || next.executionMode !== "full-page" || next.contentHash !== active.contentHash) {
+    hostMapForEach(activeFullPageExtensions, (active, id) => {
+      const next = hostMapGet(expected, id);
+      if (!next || next.executionMode !== "full-page" || next.contentHash !== active.identity.contentHash) {
         void cleanupExtension(id);
       }
-    }
+    });
 
-    for (const extension of extensions) {
-      if (extension.executionMode === "full-page") {
-        const active = activeFullPageExtensions.get(extension.id);
-        if (active?.contentHash === extension.contentHash) continue;
-        const script = document.createElement("script");
-        script.src = extension.runtimeUrl;
-        script.async = true;
-        script.dataset.personalExtensionFullPage = extension.id;
-        script.addEventListener("error", () => {
-          console.error(`[Personal Extension ${extension.name}] full-page runtime could not be loaded`);
-          if (activeFullPageExtensions.get(extension.id)?.script === script) {
-            void cleanupExtension(extension.id);
-          }
-          window.dispatchEvent(
-            new CustomEvent("marinara-personal-extension-error", {
-              detail: {
-                id: extension.id,
-                contentHash: extension.contentHash,
-                message: "Full-page extension runtime could not be loaded",
-              },
-            }),
-          );
-        });
-        const style = extension.styleUrl ? document.createElement("link") : null;
+    for (let index = 0; index < extensions.length; index += 1) {
+      const extension = extensions[index]!;
+      let executionMode: PersonalClientExtensionRuntime["executionMode"];
+      try {
+        executionMode = extension.executionMode;
+      } catch {
+        continue;
+      }
+      if (executionMode === "full-page") {
+        const identity = snapshotFullPageIdentity(extension);
+        if (!identity) continue;
+        const active = hostMapGet(activeFullPageExtensions, identity.id);
+        if (active?.identity.contentHash === identity.contentHash && active.identity.name === identity.name) {
+          continue;
+        }
+        if (active) void cleanupExtension(identity.id);
+        let includeStyle = false;
+        try {
+          includeStyle = Boolean(extension.styleUrl);
+        } catch {
+          continue;
+        }
+        const style = includeStyle ? document.createElement("link") : null;
         if (style) {
           style.rel = "stylesheet";
-          style.href = extension.styleUrl!;
-          style.dataset.personalExtensionFullPageStyle = extension.id;
+          style.href = approvedFullPageStyleUrl(identity);
+          style.dataset.personalExtensionFullPageStyle = identity.id;
           document.head.appendChild(style);
         }
-        activeFullPageExtensions.set(extension.id, {
-          contentHash: extension.contentHash,
-          extension,
-          script,
+        const nextActive: ActiveFullPageExtension = {
+          identity,
           style,
-          cleanupFns: [],
-          timeoutIds: new Set(),
-          intervalIds: new Set(),
-        });
-        document.head.appendChild(script);
+          started: false,
+          cleanupHead: null,
+          timeoutIds: new CapturedSet(),
+          intervalIds: new CapturedSet(),
+        };
+        hostMapSet(activeFullPageExtensions, identity.id, nextActive);
+        void startFullPageExtension(nextActive);
         continue;
       }
       const active = activeExtensions.get(extension.id);
@@ -607,8 +788,8 @@ export function PersonalExtensionInjector() {
 
   useEffect(
     () => () => {
-      const ids = new Set([...activeExtensions.keys(), ...activeFullPageExtensions.keys()]);
-      for (const id of ids) void cleanupExtension(id);
+      hostMapForEach(activeFullPageExtensions, (_active, id) => void cleanupExtension(id));
+      for (const id of activeExtensions.keys()) void cleanupExtension(id);
     },
     [],
   );

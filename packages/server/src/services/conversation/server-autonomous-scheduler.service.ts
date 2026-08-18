@@ -85,10 +85,16 @@ function shouldConsiderChat(chat: RawChat): boolean {
   return meta.autonomousMessages === true && meta.sceneStatus !== "active";
 }
 
-function parseSsePayload(payload: string): { done: boolean; discarded: boolean; error: string | null } {
+export function parseServerAutonomousGenerationSse(payload: string): {
+  done: boolean;
+  discarded: boolean;
+  error: string | null;
+  visibleAssistantMessageSaved: boolean;
+} {
   let done = false;
   let discarded = false;
   let error: string | null = null;
+  let visibleAssistantMessageSaved = false;
 
   for (const block of payload.split(/\n\n/u)) {
     const line = block
@@ -101,6 +107,9 @@ function parseSsePayload(payload: string): { done: boolean; discarded: boolean; 
       const event = JSON.parse(line) as { type?: string; data?: unknown };
       if (event.type === "done") done = true;
       if (event.type === "generation_discarded") discarded = true;
+      if (event.type === "message_saved" && isVisibleSavedAssistantMessage(event.data)) {
+        visibleAssistantMessageSaved = true;
+      }
       if (event.type === "error") {
         error = typeof event.data === "string" ? event.data : "Generation failed";
       }
@@ -109,7 +118,30 @@ function parseSsePayload(payload: string): { done: boolean; discarded: boolean; 
     }
   }
 
-  return { done, discarded, error };
+  return { done, discarded, error, visibleAssistantMessageSaved };
+}
+
+function isVisibleSavedAssistantMessage(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const message = value as Record<string, unknown>;
+  if (message.role !== "assistant" || typeof message.id !== "string" || message.id.length === 0) return false;
+
+  let extra: Record<string, unknown> | null = null;
+  if (typeof message.extra === "string") {
+    try {
+      const parsed = JSON.parse(message.extra) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        extra = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // A persisted message extra is always a JSON object. If that invariant is
+      // broken, do not claim the row is user-visible and create an unread alert.
+    }
+  } else if (message.extra && typeof message.extra === "object" && !Array.isArray(message.extra)) {
+    extra = message.extra as Record<string, unknown>;
+  }
+
+  return extra !== null && extra.hiddenFromUser !== true && extra.commandOnly !== true;
 }
 
 function isHardGenerationFailure(error: string, statusCode?: number): boolean {
@@ -260,7 +292,7 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
       return false;
     }
 
-    const result = parseSsePayload(response.payload);
+    const result = parseServerAutonomousGenerationSse(response.payload);
     if (result.error) {
       clearGenerationInProgress(chatId, claimedAt);
       recordFailureBackoff(chatId, result.error);
@@ -279,6 +311,7 @@ export function startServerAutonomousScheduler(app: FastifyInstance) {
     }
 
     clearFailureBackoff(chatId);
+    if (!result.visibleAssistantMessageSaved) return false;
     await chats.markAutonomousUnread(chatId, { characterId });
     return true;
   };

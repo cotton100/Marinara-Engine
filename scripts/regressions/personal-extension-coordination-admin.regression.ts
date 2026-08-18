@@ -48,6 +48,10 @@ const ENSEMBLE_ID = "ensemble-main";
 const CHARACTER_ID = "character-alice";
 const RP_CHAT_ID = "chat-rp";
 const DM_CHAT_ID = "chat-dm";
+const SECOND_ENSEMBLE_ID = "ensemble-second";
+const SECOND_CHARACTER_ID = "character-bob";
+const SECOND_RP_CHAT_ID = "chat-second-rp";
+const SECOND_DM_CHAT_ID = "chat-second-dm";
 const STORAGE_KEY = `extension-storage:${EXTENSION_ID}`;
 const MANAGED_LOREBOOK_TAG = "convo-memory-bridge";
 const POLICY_ENTRY_TAG = "convo-memory-bridge-policy";
@@ -116,6 +120,13 @@ await db.insert(characters).values({
   updatedAt: timestamp,
 });
 await db.insert(characters).values({
+  id: SECOND_CHARACTER_ID,
+  data: JSON.stringify({ name: "Bob" }),
+  comment: "",
+  createdAt: timestamp,
+  updatedAt: timestamp,
+});
+await db.insert(characters).values({
   id: "unrelated-corrupt-character",
   data: "not-json",
   comment: "",
@@ -137,6 +148,20 @@ for (const chat of [
     characterIds: JSON.stringify([CHARACTER_ID]),
     metadata: JSON.stringify({ crossChatAwareness: false }),
   },
+  {
+    id: SECOND_RP_CHAT_ID,
+    name: "Second RP",
+    mode: "roleplay" as const,
+    characterIds: JSON.stringify([SECOND_CHARACTER_ID]),
+    metadata: JSON.stringify({ groupChatMode: "merged" }),
+  },
+  {
+    id: SECOND_DM_CHAT_ID,
+    name: "Second DM",
+    mode: "conversation" as const,
+    characterIds: JSON.stringify([SECOND_CHARACTER_ID]),
+    metadata: JSON.stringify({ crossChatAwareness: false }),
+  },
 ]) {
   await db.insert(chats).values({
     ...chat,
@@ -154,6 +179,14 @@ const lorebook = await lorebooks.create({
   excludeFromVectorization: false,
 });
 assert.ok(lorebook);
+const secondLorebook = await lorebooks.create({
+  name: "CMB managed second",
+  tags: [MANAGED_LOREBOOK_TAG, `convo-memory-bridge-ensemble:${SECOND_ENSEMBLE_ID}`],
+  characterIds: [SECOND_CHARACTER_ID],
+  scope: { mode: "specific", chatIds: [SECOND_RP_CHAT_ID, SECOND_DM_CHAT_ID] },
+  excludeFromVectorization: false,
+});
+assert.ok(secondLorebook);
 
 const policyMembers = [{ castId: "alice", characterId: CHARACTER_ID, displayName: "Alice" }];
 const policyContent = [
@@ -192,6 +225,48 @@ const policyEntry = await lorebooks.createEntry({
   dynamicState: { convoMemoryBridge: { schemaVersion: 1, ensembleId: ENSEMBLE_ID, policyMembers } },
 });
 assert.ok(policyEntry);
+const secondPolicyMembers = [{ castId: "bob", characterId: SECOND_CHARACTER_ID, displayName: "Bob" }];
+const secondPolicyEntry = await lorebooks.createEntry({
+  lorebookId: secondLorebook.id,
+  name: "Convo Memory Bridge Cast Policy",
+  description: "Stable cast-ID knowledge policy for managed memories.",
+  content: [
+    "[Character knowledge boundary]",
+    "Memory labels use stable cast IDs. Current cast ID map:",
+    "- bob = Bob",
+    "Each recalled memory declares which stable cast IDs do not know it.",
+    'A character whose cast ID is listed under "Unknown to cast IDs" must not recall, mention, react to, infer, or act on that memory unless it becomes visible in the current conversation.',
+    "Other characters may use it normally.",
+  ].join("\n"),
+  keys: [],
+  secondaryKeys: [],
+  enabled: true,
+  constant: true,
+  selective: false,
+  characterFilterMode: "include",
+  characterFilterIds: [SECOND_CHARACTER_ID],
+  position: 0,
+  depth: 4,
+  order: -1_000_000,
+  role: "system",
+  preventRecursion: true,
+  excludeRecursion: false,
+  delayUntilRecursion: false,
+  locked: true,
+  tag: POLICY_ENTRY_TAG,
+  relationships: {},
+  activationConditions: [],
+  schedule: null,
+  excludeFromVectorization: true,
+  dynamicState: {
+    convoMemoryBridge: {
+      schemaVersion: 1,
+      ensembleId: SECOND_ENSEMBLE_ID,
+      policyMembers: secondPolicyMembers,
+    },
+  },
+});
+assert.ok(secondPolicyEntry);
 const manualEntry = await lorebooks.createEntry({
   lorebookId: lorebook.id,
   name: "Manual memory",
@@ -238,8 +313,72 @@ function config(manualRecoveryReasons: string[] = []) {
   };
 }
 
+type PreparedActivationConfigPatch = {
+  autoSync?: boolean;
+  semanticStatus?: string;
+  lastSuccessfulEmbeddingProfile?: typeof embedding | null;
+  pendingEmbeddingProfile?: typeof embedding | null;
+  manualRecoveryReasons?: string[];
+  includeSecondPreparedEnsemble?: boolean;
+};
+
+function preparedActivationConfig(patch: PreparedActivationConfigPatch = {}) {
+  const value = config();
+  const ensemble = value.ensembles[0]!;
+  const preparedRuntime = {
+    ...ensemble.runtime,
+    semanticStatus: patch.semanticStatus ?? "pending",
+    lastSuccessfulEmbeddingProfile:
+      patch.lastSuccessfulEmbeddingProfile === undefined ? embedding : patch.lastSuccessfulEmbeddingProfile,
+    pendingEmbeddingProfile:
+      patch.pendingEmbeddingProfile === undefined ? embedding : patch.pendingEmbeddingProfile,
+    manualRecoveryReasons: patch.manualRecoveryReasons ?? ["mutation-ambiguous", "vectorization-pending"],
+  };
+  return {
+    ...value,
+    ensembles: [
+      {
+        ...ensemble,
+        autoSync: patch.autoSync ?? true,
+        runtime: preparedRuntime,
+      },
+      ...(patch.includeSecondPreparedEnsemble
+        ? [
+            {
+              ensembleId: SECOND_ENSEMBLE_ID,
+              name: "Second ensemble",
+              rpChatId: SECOND_RP_CHAT_ID,
+              groupConvoChatIds: [],
+              lorebookId: secondLorebook.id,
+              autoSync: true,
+              embedding,
+              runtime: {
+                ...preparedRuntime,
+                lastSuccessfulEmbeddingProfile: null,
+              },
+              members: [{ castId: "bob", characterId: SECOND_CHARACTER_ID, dmChatId: SECOND_DM_CHAT_ID }],
+            },
+          ]
+        : []),
+    ],
+  };
+}
+
+function secondOnlyPreparedActivationConfig() {
+  const clean = config();
+  const withTwoPrepared = preparedActivationConfig({ includeSecondPreparedEnsemble: true });
+  return {
+    ...withTwoPrepared,
+    ensembles: [clean.ensembles[0]!, withTwoPrepared.ensembles[1]!],
+  };
+}
+
+async function setConfigValue(value: unknown) {
+  await settings.set(STORAGE_KEY, JSON.stringify({ convoMemoryBridgeV1: value }));
+}
+
 async function setConfig(manualRecoveryReasons: string[] = []) {
-  await settings.set(STORAGE_KEY, JSON.stringify({ convoMemoryBridgeV1: config(manualRecoveryReasons) }));
+  await setConfigValue(config(manualRecoveryReasons));
 }
 await setConfig();
 await fileDb._fileStore.flushStrict();
@@ -381,6 +520,111 @@ try {
   assert.equal(strictActivationFailure.statusCode, 503, strictActivationFailure.body);
   assert.equal(strictActivationFailure.json().code, "coordination-unavailable");
   assert.equal(await coordinationRow(), null, "failed activating barrier must roll back its provisional row");
+
+  for (const [label, prepared] of [
+    ["same last-success profile", preparedActivationConfig()],
+    [
+      "null last-success profile and reversed marker order",
+      preparedActivationConfig({
+        lastSuccessfulEmbeddingProfile: null,
+        manualRecoveryReasons: ["vectorization-pending", "mutation-ambiguous"],
+      }),
+    ],
+    ["one prepared ensemble among multiple ensembles", secondOnlyPreparedActivationConfig()],
+  ] as const) {
+    await setConfigValue(prepared);
+    const rawPreparedStorage = await settings.get(STORAGE_KEY);
+    const preparedRevisionBefore = (await coordinationRow())?.configRevision ?? 0;
+    const preparedActivation = await app.inject({
+      method: "POST",
+      url: adminUrl("activate"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(preparedActivation.statusCode, 200, `${label}: ${preparedActivation.body}`);
+    assert.equal(preparedActivation.json().mode, "active");
+    assert.equal(
+      (await coordinationRow())?.configRevision,
+      preparedRevisionBefore,
+      `${label} activation must preserve the storage revision used by browser recovery`,
+    );
+    assert.equal(
+      await settings.get(STORAGE_KEY),
+      rawPreparedStorage,
+      `${label} activation must preserve the exact prepared-auto recovery evidence for the client`,
+    );
+    const preparedDeactivation = await app.inject({
+      method: "POST",
+      url: adminUrl("deactivate"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(preparedDeactivation.statusCode, 200, `${label}: ${preparedDeactivation.body}`);
+    assert.equal((await coordinationRow())?.mode, "inactive");
+  }
+
+  const unsafePreparedActivationFixtures: ReadonlyArray<readonly [string, ReturnType<typeof preparedActivationConfig>]> = [
+    [
+      "missing vectorization marker",
+      preparedActivationConfig({ manualRecoveryReasons: ["mutation-ambiguous"] }),
+    ],
+    [
+      "extra recovery marker",
+      preparedActivationConfig({
+        manualRecoveryReasons: ["mutation-ambiguous", "vectorization-pending", "source-read-incomplete"],
+      }),
+    ],
+    ["auto sync disabled", preparedActivationConfig({ autoSync: false })],
+    ["semantic state not pending", preparedActivationConfig({ semanticStatus: "ready" })],
+    ["missing pending profile", preparedActivationConfig({ pendingEmbeddingProfile: null })],
+    [
+      "mismatched pending profile",
+      preparedActivationConfig({
+        pendingEmbeddingProfile: { connectionId: "different-connection", model: "different-model" },
+      }),
+    ],
+    [
+      "mismatched last-success profile",
+      preparedActivationConfig({
+        lastSuccessfulEmbeddingProfile: { connectionId: "different-connection", model: "different-model" },
+      }),
+    ],
+    [
+      "multiple prepared ensembles",
+      preparedActivationConfig({ includeSecondPreparedEnsemble: true }),
+    ],
+  ];
+  for (const [label, unsafePrepared] of unsafePreparedActivationFixtures) {
+    await setConfigValue(unsafePrepared);
+    const rawUnsafeStorage = await settings.get(STORAGE_KEY);
+    const inactiveRowBefore = await coordinationRow();
+    assert.equal(inactiveRowBefore?.mode, "inactive");
+    const adminEventCountBefore = publishedAdminDrafts.length;
+    const unsafeActivation = await app.inject({
+      method: "POST",
+      url: adminUrl("activate"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(unsafeActivation.statusCode, 409, `${label}: ${unsafeActivation.body}`);
+    assert.equal(unsafeActivation.json().code, "coordination-validation-failed", label);
+    const inactiveRowAfter = await coordinationRow();
+    assert.equal(inactiveRowAfter?.mode, "inactive", `${label} must roll back the activation barrier`);
+    assert.equal(inactiveRowAfter?.fence, inactiveRowBefore?.fence, `${label} must preserve the writer fence`);
+    assert.equal(
+      inactiveRowAfter?.configRevision,
+      inactiveRowBefore?.configRevision,
+      `${label} must preserve the storage revision`,
+    );
+    assert.equal(
+      inactiveRowAfter?.protectedLorebookRegistry,
+      inactiveRowBefore?.protectedLorebookRegistry,
+      `${label} must preserve the protected-resource registry`,
+    );
+    assert.equal(await settings.get(STORAGE_KEY), rawUnsafeStorage, `${label} rejection must preserve storage`);
+    assert.equal(publishedAdminDrafts.length, adminEventCountBefore, `${label} must not publish an admin event`);
+  }
+  await setConfig();
 
   const activated = await app.inject({
     method: "POST",

@@ -474,7 +474,19 @@ export async function lorebooksRoutes(app: FastifyInstance) {
       throw new PersonalExtensionCoordinationKernelError("invalid-request");
     }
     if (useLocalSidecar) {
-      return { provider: getLocalSidecarProvider(), model: LOCAL_SIDECAR_MODEL };
+      // Same space-id derivation as the legacy /:id/vectorize route, so vectors
+      // written through coordination stay readable by upstream recall (#5104).
+      const embeddingProfileModel = sidecarModelService.getConfiguredModelRef() ?? LOCAL_SIDECAR_MODEL;
+      return {
+        provider: getLocalSidecarProvider(),
+        model: LOCAL_SIDECAR_MODEL,
+        embeddingProfileModel,
+        embeddingSpaceId: createMemoryRecallEmbeddingSpaceId(
+          "sidecar",
+          embeddingProfileModel,
+          sidecarModelService.getResolvedBackend(),
+        ),
+      };
     }
     const connection = await createConnectionsStorage(app.db).getWithKey(input.connectionId);
     if (!connection) throw new PersonalExtensionCoordinationKernelError("invalid-request");
@@ -482,6 +494,13 @@ export async function lorebooksRoutes(app: FastifyInstance) {
       ? (connection.embeddingBaseUrl as string).replace(/\/+$/, "")
       : (connection.baseUrl as string);
     return {
+      embeddingProfileModel: input.model!,
+      embeddingSpaceId: createMemoryRecallEmbeddingSpaceId(
+        "remote",
+        input.model!,
+        connection.provider as string,
+        baseUrl,
+      ),
       provider: createLLMProvider(
         connection.provider as string,
         baseUrl,
@@ -654,7 +673,8 @@ export async function lorebooksRoutes(app: FastifyInstance) {
     try {
       const input = personalExtensionCoordinationLorebookVectorizeRequestSchema.parse(req.body);
       const context = mutationContext(input, req.headers);
-      const snapshot = await storage.getVectorizationSnapshotFenced(context, req.params.id, true);
+      const onlyMissing = input.onlyMissing ?? true;
+      const snapshot = await storage.getVectorizationSnapshotFenced(context, req.params.id, onlyMissing);
       if (snapshot.entries.length === 0) {
         return {
           vectorized: 0,
@@ -663,17 +683,24 @@ export async function lorebooksRoutes(app: FastifyInstance) {
           resourceRevision: snapshot.resourceRevision,
         };
       }
-      const { provider, model } = await guardedEmbeddingProvider(input);
-      const existingEmbeddingDimension = snapshot.existingEmbeddingDimension;
+      const { provider, model, embeddingProfileModel, embeddingSpaceId } = await guardedEmbeddingProvider(input);
+      // Mirrors the legacy route's guard: filling in missing vectors next to
+      // vectors from a different known embedding space would mix spaces. Legacy
+      // vectors without a space id are re-embedded instead (snapshot includes them).
+      if (onlyMissing && snapshot.existingEmbeddingSpaceIds.some((spaceId) => spaceId !== embeddingSpaceId)) {
+        throw new PersonalExtensionCoordinationKernelError("coordination-validation-failed");
+      }
+      const existingEmbeddingDimension = onlyMissing ? snapshot.existingEmbeddingDimension : null;
       let resourceRevision = snapshot.resourceRevision;
       let vectorized = 0;
       const batchSize = 50;
       for (let index = 0; index < snapshot.entries.length; index += batchSize) {
         const batch = snapshot.entries.slice(index, index + batchSize);
-        const texts = batch.map(({ value }) => {
-          const keys = [...value.keys, ...value.secondaryKeys].join(", ");
-          return `${value.name}${keys ? ` [${keys}]` : ""}\n${value.content}`.trim();
-        });
+        const texts = formatMemoryRecallEmbeddingTexts(
+          batch.map(({ value }) => buildLorebookEntryEmbeddingText(value)),
+          embeddingProfileModel,
+          "document",
+        );
         let embeddings: number[][];
         try {
           embeddings = await provider.embed(texts, model);
@@ -703,6 +730,7 @@ export async function lorebooksRoutes(app: FastifyInstance) {
             fingerprint: entry.fingerprint,
             embedding: embeddings[entryIndex]!,
           })),
+          embeddingSpaceId,
         );
         resourceRevision = committed.resourceRevision;
         vectorized += committed.updated;

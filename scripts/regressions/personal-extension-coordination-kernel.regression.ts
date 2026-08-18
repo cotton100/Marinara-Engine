@@ -11,6 +11,7 @@ import { getFileTableConfig } from "../../packages/server/src/db/file-schema.js"
 import {
   installedExtensions,
   personalExtensionCoordination,
+  personalExtensionOperationJournal,
   type PersonalExtensionCoordinationMode,
 } from "../../packages/server/src/db/schema/index.js";
 import {
@@ -19,6 +20,7 @@ import {
   PersonalExtensionCoordinationKernelError,
   PERSONAL_EXTENSION_OPERATION_DEADLINES_MS,
   PERSONAL_EXTENSION_PROTECTED_RESOURCE_REGISTRY_VERSION,
+  type PersonalExtensionOperationVectorizeTransitionProof,
 } from "../../packages/server/src/services/extensions/personal-extension-coordination-kernel.service.js";
 
 const EXTENSION_ID = "coordination-kernel-extension";
@@ -37,6 +39,7 @@ async function createKernelFixture() {
   let tokenCounter = 0;
   let handoffRequestCounter = 0;
   let failNextWrite = false;
+  let vectorizeTransitionProof: PersonalExtensionOperationVectorizeTransitionProof = async () => true;
 
   const fileDb = await createFileNativeDB({
     fileOperations: {
@@ -90,6 +93,7 @@ async function createKernelFixture() {
     // This kernel-focused fixture exercises authority/revision mechanics. The
     // CMB-specific marker parser has its own dynamic journal regression.
     proveDispatchMarker: async () => true,
+    proveVectorizeTransition: (...args) => vectorizeTransitionProof(...args),
   };
   const kernel = createPersonalExtensionCoordinationKernel(db, kernelOptions);
 
@@ -104,6 +108,9 @@ async function createKernelFixture() {
     },
     failNextStrictWrite() {
       failNextWrite = true;
+    },
+    setVectorizeTransitionProof(proof: PersonalExtensionOperationVectorizeTransitionProof) {
+      vectorizeTransitionProof = proof;
     },
     async setMode(mode: PersonalExtensionCoordinationMode) {
       await db
@@ -134,6 +141,15 @@ async function coordinationRow(fixture: KernelFixture) {
     .select()
     .from(personalExtensionCoordination)
     .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  assert.ok(rows[0]);
+  return rows[0];
+}
+
+async function journalForIsolatedKernelTest(fixture: KernelFixture, operationDigest: string) {
+  const rows = await fixture.db
+    .select()
+    .from(personalExtensionOperationJournal)
+    .where(eq(personalExtensionOperationJournal.operationDigest, operationDigest));
   assert.ok(rows[0]);
   return rows[0];
 }
@@ -675,6 +691,359 @@ try {
   assert.deepEqual(JSON.parse((await coordinationRow(operationFixture)).activeOperations), []);
 } finally {
   await operationFixture.cleanup();
+}
+
+const transitionFixture = await createKernelFixture();
+try {
+  await transitionFixture.setProtectedRegistry({
+    version: PERSONAL_EXTENSION_PROTECTED_RESOURCE_REGISTRY_VERSION,
+    extensionStorage: { resourceRevision: 0 },
+    lorebooks: {},
+  });
+  const lease = await transitionFixture.kernel.acquireLease({
+    extensionId: EXTENSION_ID,
+    holderSessionId: "transition-holder",
+    serverBootId: BOOT_ID,
+    contentHash: CONTENT_HASH,
+  });
+  const leaseAuthority = authority(lease, "transition-holder");
+  const operation = await transitionFixture.kernel.beginOperation({
+    ...leaseAuthority,
+    kind: "mutation",
+    targetEnsembleId: "ensemble-transition",
+    requestedDeadlineMs: 1_000,
+  });
+  const operationDigest = sha256(operation.operationHandle);
+  const beforeFailedTransition = await coordinationRow(transitionFixture);
+  const beforeFailedJournal = (
+    await transitionFixture.db
+      .select()
+      .from(personalExtensionOperationJournal)
+      .where(eq(personalExtensionOperationJournal.operationDigest, operationDigest))
+  )[0];
+  assert.ok(beforeFailedJournal);
+
+  await expectKernelCode(
+    transitionFixture.kernel.transitionOperationToVectorize({
+      ...leaseAuthority,
+      operationHandle: operation.operationHandle,
+      targetEnsembleId: "other-ensemble",
+    }),
+    "operation-lost",
+  );
+  assert.deepEqual(await coordinationRow(transitionFixture), beforeFailedTransition);
+
+  transitionFixture.failNextStrictWrite();
+  await expectKernelCode(
+    transitionFixture.kernel.transitionOperationToVectorize({
+      ...leaseAuthority,
+      operationHandle: operation.operationHandle,
+      targetEnsembleId: "ensemble-transition",
+    }),
+    "coordination-unavailable",
+  );
+  assert.deepEqual(
+    await coordinationRow(transitionFixture),
+    beforeFailedTransition,
+    "a failed strict transition must leave the persisted operation unchanged",
+  );
+  assert.deepEqual(
+    (
+      await transitionFixture.db
+        .select()
+        .from(personalExtensionOperationJournal)
+        .where(eq(personalExtensionOperationJournal.operationDigest, operationDigest))
+    )[0],
+    beforeFailedJournal,
+    "a failed strict transition must leave the same journal revision and phase unchanged",
+  );
+
+  const transitioned = await transitionFixture.kernel.transitionOperationToVectorize({
+    ...leaseAuthority,
+    operationHandle: operation.operationHandle,
+    targetEnsembleId: "ensemble-transition",
+  });
+  assert.equal(transitioned.operationHandle, operation.operationHandle);
+  assert.equal(transitioned.kind, "vectorize");
+  assert.equal(transitioned.remainingMs, PERSONAL_EXTENSION_OPERATION_DEADLINES_MS.vectorize);
+  assert.equal(
+    transitioned.deadlineAt,
+    new Date(START_WALL_MS + PERSONAL_EXTENSION_OPERATION_DEADLINES_MS.vectorize).toISOString(),
+  );
+  const transitionedRow = await coordinationRow(transitionFixture);
+  const transitionedOperations = JSON.parse(transitionedRow.activeOperations) as Array<Record<string, unknown>>;
+  assert.equal(transitionedOperations.length, 1);
+  assert.equal(transitionedOperations[0]?.digest, operationDigest);
+  assert.equal(transitionedOperations[0]?.kind, "vectorize");
+  assert.equal(transitionedOperations[0]?.startedAt, new Date(START_WALL_MS).toISOString());
+  assert.equal(transitionedOperations[0]?.deadlineAt, transitioned.deadlineAt);
+  const transitionedJournal = (
+    await transitionFixture.db
+      .select()
+      .from(personalExtensionOperationJournal)
+      .where(eq(personalExtensionOperationJournal.operationDigest, operationDigest))
+  )[0];
+  assert.ok(transitionedJournal);
+  assert.equal(transitionedJournal.operationKind, "vectorize");
+  assert.equal(transitionedJournal.phase, beforeFailedJournal.phase);
+  assert.equal(transitionedJournal.protectedResourceRevisions, beforeFailedJournal.protectedResourceRevisions);
+
+  assert.deepEqual(
+    await transitionFixture.kernel.transitionOperationToVectorize({
+      ...leaseAuthority,
+      operationHandle: operation.operationHandle,
+      targetEnsembleId: "ensemble-transition",
+    }),
+    transitioned,
+    "a same-handle replay must recover a lost transition response without creating new authority",
+  );
+
+  let callbackRan = false;
+  await expectKernelCode(
+    transitionFixture.kernel.runFencedResourceMutation(
+      { ...leaseAuthority, operationHandle: operation.operationHandle },
+      [{ kind: "extension-storage", resourceId: EXTENSION_ID, expectedRevision: 0 }],
+      async () => {
+        callbackRan = true;
+        return null;
+      },
+      { operationKind: "mutation" },
+    ),
+    "operation-kind-unsupported",
+  );
+  assert.equal(callbackRan, false, "a transitioned handle must reject every later mutation dispatch");
+  assert.equal(
+    await transitionFixture.kernel.runFencedOperationRead(
+      { ...leaseAuthority, operationHandle: operation.operationHandle },
+      "vectorize",
+      async () => "vectorize-admitted",
+    ),
+    "vectorize-admitted",
+  );
+
+  await transitionFixture.kernel.endOperation({
+    ...leaseAuthority,
+    operationHandle: operation.operationHandle,
+  });
+
+  let proofEnteredResolve!: () => void;
+  const proofEntered = new Promise<void>((resolve) => {
+    proofEnteredResolve = resolve;
+  });
+  let releaseProof!: () => void;
+  const proofGate = new Promise<void>((resolve) => {
+    releaseProof = resolve;
+  });
+  transitionFixture.setVectorizeTransitionProof(async () => {
+    proofEnteredResolve();
+    await proofGate;
+    return true;
+  });
+  const expiring = await transitionFixture.kernel.beginOperation({
+    ...leaseAuthority,
+    kind: "mutation",
+    targetEnsembleId: "ensemble-transition-expiring-proof",
+    requestedDeadlineMs: 1_000,
+  });
+  const expiringDigest = sha256(expiring.operationHandle);
+  const beforeExpiredProof = await coordinationRow(transitionFixture);
+  const beforeExpiredProofJournal = await journalForIsolatedKernelTest(
+    transitionFixture,
+    expiringDigest,
+  );
+  const expiredProofRejection = expectKernelCode(
+    transitionFixture.kernel.transitionOperationToVectorize({
+      ...leaseAuthority,
+      operationHandle: expiring.operationHandle,
+      targetEnsembleId: "ensemble-transition-expiring-proof",
+    }),
+    "operation-lost",
+  );
+  await proofEntered;
+  transitionFixture.advance(1_001);
+  releaseProof();
+  await expiredProofRejection;
+  assert.deepEqual(
+    await coordinationRow(transitionFixture),
+    beforeExpiredProof,
+    "proof completion after the mutation deadline must not transition the persisted operation",
+  );
+  assert.deepEqual(
+    await journalForIsolatedKernelTest(transitionFixture, expiringDigest),
+    beforeExpiredProofJournal,
+    "proof completion after expiry must not transition or revise the journal",
+  );
+
+  const replacement = await transitionFixture.kernel.beginOperation({
+    ...leaseAuthority,
+    kind: "mutation",
+    targetEnsembleId: "ensemble-after-expired-proof",
+  });
+  const afterExpiredProofReap = JSON.parse(
+    (await coordinationRow(transitionFixture)).activeOperations,
+  ) as Array<{ digest: string }>;
+  assert.equal(
+    afterExpiredProofReap.some((candidate) => candidate.digest === expiringDigest),
+    false,
+    "a rejected transition must not extend the expired operation's runtime deadline",
+  );
+  await transitionFixture.kernel.endOperation({
+    ...leaseAuthority,
+    operationHandle: replacement.operationHandle,
+  });
+} finally {
+  await transitionFixture.cleanup();
+}
+
+const transitionHandoffFixture = await createKernelFixture();
+try {
+  await transitionHandoffFixture.setProtectedRegistry({
+    version: PERSONAL_EXTENSION_PROTECTED_RESOURCE_REGISTRY_VERSION,
+    extensionStorage: { resourceRevision: 0 },
+    lorebooks: {},
+  });
+  const lease = await transitionHandoffFixture.kernel.acquireLease({
+    extensionId: EXTENSION_ID,
+    holderSessionId: "transition-draining-holder",
+    serverBootId: BOOT_ID,
+    contentHash: CONTENT_HASH,
+  });
+  const leaseAuthority = authority(lease, "transition-draining-holder");
+  const operation = await transitionHandoffFixture.kernel.beginOperation({
+    ...leaseAuthority,
+    kind: "mutation",
+    targetEnsembleId: "ensemble-transition-draining",
+    requestedDeadlineMs: 1_000,
+  });
+  const requester = {
+    extensionId: EXTENSION_ID,
+    holderSessionId: "transition-next-holder",
+    serverBootId: BOOT_ID,
+    contentHash: CONTENT_HASH,
+  };
+  const initialHandoff = await transitionHandoffFixture.kernel.requestHandoff(requester);
+  assert.equal(initialHandoff.remainingMs, 1_000);
+  const transitioned = await transitionHandoffFixture.kernel.transitionOperationToVectorize({
+    ...leaseAuthority,
+    operationHandle: operation.operationHandle,
+    targetEnsembleId: "ensemble-transition-draining",
+  });
+  const expectedDeadlineAt = new Date(
+    START_WALL_MS + PERSONAL_EXTENSION_OPERATION_DEADLINES_MS.vectorize,
+  ).toISOString();
+  assert.equal(transitioned.deadlineAt, expectedDeadlineAt);
+  const drainingRow = await coordinationRow(transitionHandoffFixture);
+  assert.equal(drainingRow.handoffRequestId, initialHandoff.requestId);
+  assert.equal(drainingRow.handoffRequester, requester.holderSessionId);
+  assert.equal(drainingRow.handoffDeadlineAt, expectedDeadlineAt);
+  assert.equal(
+    (await transitionHandoffFixture.kernel.requestHandoff(requester)).deadlineAt,
+    expectedDeadlineAt,
+    "the same handoff request must observe the transitioned operation's absolute cap",
+  );
+
+  transitionHandoffFixture.advance(45_001);
+  await expectKernelCode(
+    transitionHandoffFixture.kernel.acquireLease(requester),
+    "handoff-pending",
+  );
+  await transitionHandoffFixture.kernel.endOperation({
+    ...leaseAuthority,
+    operationHandle: operation.operationHandle,
+  });
+  const reservation = await transitionHandoffFixture.kernel.releaseLease({
+    ...leaseAuthority,
+    handoffRequestId: initialHandoff.requestId,
+  });
+  assert.equal(reservation.fence, lease.fence + 1);
+} finally {
+  await transitionHandoffFixture.cleanup();
+}
+
+const transitionExpiryHandoffFixture = await createKernelFixture();
+try {
+  await transitionExpiryHandoffFixture.setProtectedRegistry({
+    version: PERSONAL_EXTENSION_PROTECTED_RESOURCE_REGISTRY_VERSION,
+    extensionStorage: { resourceRevision: 0 },
+    lorebooks: {},
+  });
+  const lease = await transitionExpiryHandoffFixture.kernel.acquireLease({
+    extensionId: EXTENSION_ID,
+    holderSessionId: "transition-expiry-draining-holder",
+    serverBootId: BOOT_ID,
+    contentHash: CONTENT_HASH,
+  });
+  const leaseAuthority = authority(lease, "transition-expiry-draining-holder");
+  const operation = await transitionExpiryHandoffFixture.kernel.beginOperation({
+    ...leaseAuthority,
+    kind: "mutation",
+    targetEnsembleId: "ensemble-transition-expiry-draining",
+    requestedDeadlineMs: 1_000,
+  });
+  const requester = {
+    extensionId: EXTENSION_ID,
+    holderSessionId: "transition-expiry-next-holder",
+    serverBootId: BOOT_ID,
+    contentHash: CONTENT_HASH,
+  };
+  const handoff = await transitionExpiryHandoffFixture.kernel.requestHandoff(requester);
+  const operationDigest = sha256(operation.operationHandle);
+  const beforeExpiredProof = await coordinationRow(transitionExpiryHandoffFixture);
+  const beforeExpiredProofJournal = await journalForIsolatedKernelTest(
+    transitionExpiryHandoffFixture,
+    operationDigest,
+  );
+  let proofEnteredResolve!: () => void;
+  const proofEntered = new Promise<void>((resolve) => {
+    proofEnteredResolve = resolve;
+  });
+  let releaseProof!: () => void;
+  const proofGate = new Promise<void>((resolve) => {
+    releaseProof = resolve;
+  });
+  transitionExpiryHandoffFixture.setVectorizeTransitionProof(async () => {
+    proofEnteredResolve();
+    await proofGate;
+    return true;
+  });
+  const expiredProofRejection = expectKernelCode(
+    transitionExpiryHandoffFixture.kernel.transitionOperationToVectorize({
+      ...leaseAuthority,
+      operationHandle: operation.operationHandle,
+      targetEnsembleId: "ensemble-transition-expiry-draining",
+    }),
+    "operation-lost",
+  );
+  await proofEntered;
+  transitionExpiryHandoffFixture.advance(1_001);
+  releaseProof();
+  await expiredProofRejection;
+  assert.deepEqual(
+    await coordinationRow(transitionExpiryHandoffFixture),
+    beforeExpiredProof,
+    "an expired draining transition must preserve the operation and handoff deadlines",
+  );
+  assert.deepEqual(
+    await journalForIsolatedKernelTest(transitionExpiryHandoffFixture, operationDigest),
+    beforeExpiredProofJournal,
+    "an expired draining transition must preserve the mutation journal",
+  );
+  assert.equal(
+    (await transitionExpiryHandoffFixture.kernel.requestHandoff(requester)).remainingMs,
+    0,
+    "a rejected transition must not extend the draining handoff runtime deadline",
+  );
+  await transitionExpiryHandoffFixture.kernel.endOperation({
+    ...leaseAuthority,
+    operationHandle: operation.operationHandle,
+  });
+  const reservation = await transitionExpiryHandoffFixture.kernel.releaseLease({
+    ...leaseAuthority,
+    handoffRequestId: handoff.requestId,
+  });
+  assert.equal(reservation.fence, lease.fence + 1);
+} finally {
+  await transitionExpiryHandoffFixture.cleanup();
 }
 
 const fencedFixture = await createKernelFixture();

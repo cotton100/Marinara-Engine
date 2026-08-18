@@ -16,6 +16,7 @@ import {
   personalExtensionCoordinationLeaseAuthorityRequestSchema,
   personalExtensionCoordinationOperationBeginRequestSchema,
   personalExtensionCoordinationOperationEndRequestSchema,
+  personalExtensionCoordinationOperationTransitionToVectorizeRequestSchema,
   personalExtensionCoordinationParamsSchema,
   personalExtensionCoordinationReleaseRequestSchema,
   type PersonalExtensionCoordinationErrorCode,
@@ -321,6 +322,24 @@ export async function personalExtensionCoordinationRoutes(
       return sendCoordinationError(error, request, reply);
     }
   });
+
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/:id/coordination/operations/transition-to-vectorize",
+    async (request, reply) => {
+      try {
+        const id = extensionId(request);
+        const holder = holderSessionId(request, true)!;
+        const input = personalExtensionCoordinationOperationTransitionToVectorizeRequestSchema.parse(request.body);
+        return await service.transitionOperationToVectorize({
+          ...authority(id, holder, input),
+          operationHandle: input.operationHandle,
+          targetEnsembleId: input.targetEnsembleId,
+        });
+      } catch (error) {
+        return sendCoordinationError(error, request, reply);
+      }
+    },
+  );
 
   app.post<{ Params: { id: string }; Body: unknown }>("/:id/coordination/operations/end", async (request, reply) => {
     try {

@@ -630,12 +630,47 @@ try {
   const vectorSnapshot = await storage.getVectorizationSnapshotFenced(vectorContext, protectedBook.id, false);
   const protectedVectorEntry = vectorSnapshot.entries.find((entry) => entry.value.id === protectedEntry.id);
   assert.ok(protectedVectorEntry);
-  const committedVector = await storage.commitEntryEmbeddingsFenced(vectorContext, protectedBook.id, 5, [
-    { entryId: protectedEntry.id, fingerprint: protectedVectorEntry.fingerprint, embedding: [0.25, 0.75] },
-  ]);
+  const VECTOR_SPACE_ID = "remote:protected-lorebook-regression-space";
+  const committedVector = await storage.commitEntryEmbeddingsFenced(
+    vectorContext,
+    protectedBook.id,
+    5,
+    [{ entryId: protectedEntry.id, fingerprint: protectedVectorEntry.fingerprint, embedding: [0.25, 0.75] }],
+    VECTOR_SPACE_ID,
+  );
   assert.deepEqual(committedVector, { updated: 1, resourceRevision: 6 });
   assert.equal(publishedEvents.at(-1)?.type, "resource-changed");
   assert.equal(publishedEvents.at(-1)?.resourceRevision, 6, "vector commits must publish their durable revision");
+  // Upstream 2.4.3 recall rejects vectors without an embedding space id, so a
+  // coordinated vector commit must record the same space id the legacy route does.
+  const committedVectorRow = (await db.select().from(lorebookEntries).where(eq(lorebookEntries.id, protectedEntry.id)))[0];
+  assert.equal(committedVectorRow?.embeddingSpaceId, VECTOR_SPACE_ID, "coordinated vector commits must record their space");
+  const spacedSnapshot = await storage.getVectorizationSnapshotFenced(vectorContext, protectedBook.id, true);
+  assert.deepEqual(spacedSnapshot.existingEmbeddingSpaceIds, [VECTOR_SPACE_ID]);
+  assert.equal(spacedSnapshot.existingEmbeddingDimension, 2);
+  assert.equal(
+    spacedSnapshot.entries.some((entry) => entry.value.id === protectedEntry.id),
+    false,
+    "an entry vectorized in a known space is not missing",
+  );
+  // A vector written before space ids existed is stale under 2.4.3 recall: it
+  // must count as missing (so coordination can repair it) and never as a known space.
+  await db
+    .update(lorebookEntries)
+    .set({ embeddingSpaceId: null })
+    .where(eq(lorebookEntries.id, protectedEntry.id));
+  const legacySnapshot = await storage.getVectorizationSnapshotFenced(vectorContext, protectedBook.id, true);
+  assert.equal(
+    legacySnapshot.entries.some((entry) => entry.value.id === protectedEntry.id),
+    true,
+    "a legacy vector without a space id must be re-vectorized, not treated as present",
+  );
+  assert.deepEqual(legacySnapshot.existingEmbeddingSpaceIds, []);
+  assert.equal(legacySnapshot.existingEmbeddingDimension, null);
+  await db
+    .update(lorebookEntries)
+    .set({ embeddingSpaceId: VECTOR_SPACE_ID })
+    .where(eq(lorebookEntries.id, protectedEntry.id));
   const clearVectors = await app.inject({
     method: "DELETE",
     url: `${guardedUrl(protectedBook.id)}/vectors`,
@@ -656,9 +691,13 @@ try {
     .set({ content: "changed after provider compute", updatedAt: new Date().toISOString() })
     .where(eq(lorebookEntries.id, protectedEntry.id));
   await expectCode(
-    storage.commitEntryEmbeddingsFenced(vectorContext, protectedBook.id, 7, [
-      { entryId: protectedEntry.id, fingerprint: staleFingerprintEntry.fingerprint, embedding: [1, 0] },
-    ]),
+    storage.commitEntryEmbeddingsFenced(
+      vectorContext,
+      protectedBook.id,
+      7,
+      [{ entryId: protectedEntry.id, fingerprint: staleFingerprintEntry.fingerprint, embedding: [1, 0] }],
+      VECTOR_SPACE_ID,
+    ),
     "resource-revision-conflict",
   );
   assert.equal(

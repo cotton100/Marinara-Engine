@@ -231,6 +231,9 @@ function lorebookEntryVectorFingerprint(entry: Record<string, unknown>) {
         id: entry.id,
         lorebookId: entry.lorebookId,
         name: entry.name,
+        // Mirrors buildLorebookEntryEmbeddingText: description is embedded, so
+        // a description edit between snapshot and commit must invalidate.
+        description: entry.description,
         content: entry.content,
         keys: entry.keys,
         secondaryKeys: entry.secondaryKeys,
@@ -239,6 +242,14 @@ function lorebookEntryVectorFingerprint(entry: Record<string, unknown>) {
       "utf8",
     )
     .digest("hex");
+}
+
+function hasStoredEmbedding(entry: { embedding?: unknown }): entry is { embedding: number[] } {
+  return Array.isArray(entry.embedding) && entry.embedding.length > 0;
+}
+
+function knownEmbeddingSpaceId(entry: { embeddingSpaceId?: unknown }): string | null {
+  return typeof entry.embeddingSpaceId === "string" && entry.embeddingSpaceId.trim() ? entry.embeddingSpaceId : null;
 }
 
 function parseFolderRow(row: Record<string, unknown>) {
@@ -896,9 +907,16 @@ export function createLorebooksStorage(db: DB) {
           const vectorizable = book.excludeFromVectorization
             ? []
             : allEntries.filter((entry) => !entry.excludeFromVectorization);
+          // Upstream 2.4.3 records an embeddingSpaceId with every vector and
+          // rejects recall from an unknown space. Vectors written before that
+          // (no space id) are therefore stale, not "present": treat them as
+          // missing so a coordinated vectorize repairs them instead of refusing.
           const entries = onlyMissing
-            ? vectorizable.filter((entry) => !Array.isArray(entry.embedding) || entry.embedding.length === 0)
+            ? vectorizable.filter((entry) => !hasStoredEmbedding(entry) || knownEmbeddingSpaceId(entry) === null)
             : vectorizable;
+          const knownSpaceEntries = vectorizable.filter(
+            (entry) => hasStoredEmbedding(entry) && knownEmbeddingSpaceId(entry) !== null,
+          );
           return {
             book,
             entries: entries.map((entry) => ({
@@ -907,10 +925,13 @@ export function createLorebooksStorage(db: DB) {
             })),
             total: allEntries.length,
             existingEmbeddingDimension:
-              allEntries
+              knownSpaceEntries
                 .map((entry) => entry.embedding)
                 .find((embedding): embedding is number[] => Array.isArray(embedding) && embedding.length > 0)?.length ??
               null,
+            existingEmbeddingSpaceIds: [
+              ...new Set(knownSpaceEntries.map((entry) => knownEmbeddingSpaceId(entry) as string)),
+            ],
             resourceRevision,
           };
         },
@@ -922,7 +943,9 @@ export function createLorebooksStorage(db: DB) {
       lorebookId: string,
       expectedResourceRevision: number,
       entries: readonly { entryId: string; fingerprint: string; embedding: number[] }[],
+      embeddingSpaceId: string,
     ) {
+      if (!embeddingSpaceId.trim()) throw new PersonalExtensionCoordinationKernelError("invalid-request");
       const committed = await getPersonalExtensionCoordinationService(db).runFencedResourceMutation(
         context,
         [{ kind: "lorebook", resourceId: lorebookId, expectedRevision: expectedResourceRevision }],
@@ -942,7 +965,7 @@ export function createLorebooksStorage(db: DB) {
           for (const entry of entries) {
             await tx
               .update(lorebookEntries)
-              .set({ embedding: JSON.stringify(entry.embedding), updatedAt: timestamp })
+              .set({ embedding: JSON.stringify(entry.embedding), embeddingSpaceId, updatedAt: timestamp })
               .where(and(eq(lorebookEntries.id, entry.entryId), eq(lorebookEntries.lorebookId, lorebookId)));
           }
           return entries.length;
@@ -968,7 +991,7 @@ export function createLorebooksStorage(db: DB) {
           const cleared = rows.filter((row) => typeof row.embedding === "string" && row.embedding.length > 0).length;
           await tx
             .update(lorebookEntries)
-            .set({ embedding: null, updatedAt: now() })
+            .set({ embedding: null, embeddingSpaceId: null, updatedAt: now() })
             .where(eq(lorebookEntries.lorebookId, lorebookId));
           return { cleared, total: rows.length };
         },

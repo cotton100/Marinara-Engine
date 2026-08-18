@@ -55,6 +55,7 @@ const MANUAL_RECOVERY_REASONS = new Set([
   "setup-reconcile-ambiguous",
 ]);
 const SETUP_RECOVERY_REASONS = new Set(["setup-attach-ambiguous", "setup-reconcile-ambiguous"]);
+const PREPARED_AUTO_RECOVERY_REASONS = ["mutation-ambiguous", "vectorization-pending"] as const;
 
 type CmbEmbeddingProfile = { connectionId: string; model: string };
 type CmbRuntime = {
@@ -112,6 +113,30 @@ function exactIsoTimestamp(value: unknown) {
 
 function sameEmbeddingProfile(left: CmbEmbeddingProfile | null, right: CmbEmbeddingProfile) {
   return left !== null && left.connectionId === right.connectionId && left.model === right.model;
+}
+
+function exactPreparedAutoRecoveryState(ensemble: CmbEnsemble) {
+  const reasons = ensemble.runtime.manualRecoveryReasons;
+  const lastSuccessfulProfile = ensemble.runtime.lastSuccessfulEmbeddingProfile;
+  return (
+    ensemble.autoSync &&
+    ensemble.runtime.semanticStatus === "pending" &&
+    sameUniqueStrings(reasons, PREPARED_AUTO_RECOVERY_REASONS) &&
+    sameEmbeddingProfile(ensemble.runtime.pendingEmbeddingProfile, ensemble.embedding) &&
+    (lastSuccessfulProfile === null || sameEmbeddingProfile(lastSuccessfulProfile, ensemble.embedding))
+  );
+}
+
+// Activation does not recover or clear this evidence. It only admits one
+// exact crash-safe handoff that the newly active guarded client can resume.
+function activationRecoveryStateIsSafe(config: CmbConfig) {
+  const markerBearingEnsembles = config.ensembles.filter(
+    (ensemble) => ensemble.runtime.manualRecoveryReasons.length > 0,
+  );
+  return (
+    markerBearingEnsembles.length === 0 ||
+    (markerBearingEnsembles.length === 1 && exactPreparedAutoRecoveryState(markerBearingEnsembles[0]!))
+  );
 }
 
 function parseEmbeddingProfile(value: unknown, nullable: true): CmbEmbeddingProfile | null;
@@ -723,9 +748,10 @@ async function validateCmbResources(
   tx: DB,
   config: CmbConfig,
   registry: PersonalExtensionProtectedResourceRegistry,
-  requireNoRecoveryMarkers: boolean,
+  requireActivationSafeRecoveryState: boolean,
 ) {
   if (registry.version !== PERSONAL_EXTENSION_PROTECTED_RESOURCE_REGISTRY_VERSION) throw validationError();
+  if (requireActivationSafeRecoveryState && !activationRecoveryStateIsSafe(config)) throw validationError();
   const expectedLorebookIds = config.ensembles.map((ensemble) => ensemble.lorebookId).sort();
   if (!sameValue(Object.keys(registry.lorebooks).sort(), expectedLorebookIds)) throw validationError();
 
@@ -749,7 +775,6 @@ async function validateCmbResources(
   const lorebookStorage = createLorebooksStorage(tx);
 
   for (const ensemble of config.ensembles) {
-    if (requireNoRecoveryMarkers && ensemble.runtime.manualRecoveryReasons.length > 0) throw validationError();
     if (ensemble.members.some((member) => !displayNames.has(member.characterId))) throw validationError();
     const allCharacterIds = ensemble.members.map((member) => member.characterId);
     const mappedChatIds = [

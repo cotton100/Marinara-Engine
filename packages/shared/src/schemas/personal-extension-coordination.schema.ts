@@ -95,6 +95,14 @@ export const personalExtensionCoordinationOperationBeginRequestSchema =
     })
     .strict();
 
+export const personalExtensionCoordinationOperationTransitionToVectorizeRequestSchema =
+  personalExtensionCoordinationLeaseAuthorityRequestSchema
+    .extend({
+      operationHandle: personalExtensionCoordinationOperationHandleSchema,
+      targetEnsembleId: personalExtensionCoordinationTargetEnsembleIdSchema,
+    })
+    .strict();
+
 export const personalExtensionCoordinationOperationEndRequestSchema =
   personalExtensionCoordinationLeaseAuthorityRequestSchema
     .extend({
@@ -389,7 +397,7 @@ export const personalExtensionCoordinationOperationGrantSchema = z
     operationHandle: personalExtensionCoordinationOperationHandleSchema,
     kind: personalExtensionCoordinationOperationKindSchema,
     deadlineAt: z.string().datetime(),
-    remainingMs: z.number().int().positive().safe(),
+    remainingMs: z.number().int().positive().max(600_000).safe(),
   })
   .strict();
 
@@ -619,6 +627,9 @@ export type PersonalExtensionCoordinationReleaseRequest = z.infer<
 >;
 export type PersonalExtensionCoordinationOperationBeginRequest = z.infer<
   typeof personalExtensionCoordinationOperationBeginRequestSchema
+>;
+export type PersonalExtensionCoordinationOperationTransitionToVectorizeRequest = z.infer<
+  typeof personalExtensionCoordinationOperationTransitionToVectorizeRequestSchema
 >;
 export type PersonalExtensionCoordinationOperationEndRequest = z.infer<
   typeof personalExtensionCoordinationOperationEndRequestSchema

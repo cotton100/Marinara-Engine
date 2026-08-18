@@ -24,6 +24,7 @@ import {
   proveCmbBlockedJournalRecovery,
   proveCmbOperationConclusiveState,
   proveCmbOperationDispatchMarker,
+  proveCmbOperationVectorizeTransition,
 } from "../../packages/server/src/services/extensions/personal-extension-coordination-admin.service.js";
 
 const EXTENSION_ID = "coordination-journal-extension";
@@ -46,6 +47,7 @@ function cmbStorageValue(
   manualRecoveryReasons: string[],
   otherManualRecoveryReasons?: string[],
   targetLorebookId = LOREBOOK_ID,
+  runtimeOverrides: Record<string, unknown> = {},
 ) {
   return JSON.stringify({
     convoMemoryBridgeV1: {
@@ -63,8 +65,9 @@ function cmbStorageValue(
             semanticStatus: "ready",
             lastSuccessfulEmbeddingProfile: null,
             pendingEmbeddingProfile: null,
-            manualRecoveryReasons,
             lastSuccessfulSyncAt: null,
+            ...runtimeOverrides,
+            manualRecoveryReasons,
           },
           members: [{ castId: "alpha", characterId: "journal-character", dmChatId: "journal-dm-chat" }],
         },
@@ -169,6 +172,7 @@ async function createFixture(
     wallNow: () => wallMs,
     randomToken: () => `raw-journal-secret-${++secretCounter}`,
     proveDispatchMarker,
+    proveVectorizeTransition: proveCmbOperationVectorizeTransition,
   });
   return {
     db,
@@ -257,6 +261,7 @@ async function writeConfig(
   reasons: string[],
   otherReasons?: string[],
   targetLorebookId = LOREBOOK_ID,
+  runtimeOverrides: Record<string, unknown> = {},
 ) {
   return fixture.kernel.runFencedResourceMutation(
     context,
@@ -265,7 +270,10 @@ async function writeConfig(
       const timestamp = new Date(START_WALL_MS + expectedRevision + 1).toISOString();
       await tx
         .update(appSettings)
-        .set({ value: cmbStorageValue(reasons, otherReasons, targetLorebookId), updatedAt: timestamp })
+        .set({
+          value: cmbStorageValue(reasons, otherReasons, targetLorebookId, runtimeOverrides),
+          updatedAt: timestamp,
+        })
         .where(eq(appSettings.key, STORAGE_SETTING_KEY));
       await tx
         .update(personalExtensionCoordination)
@@ -421,6 +429,153 @@ try {
   assert.equal((await journalFor(markerProofFixture, pairedSetup.operationHandle)).phase, "dispatching");
 } finally {
   await markerProofFixture.cleanup();
+}
+
+const vectorizeTransitionProofFixture = await createFixture();
+try {
+  const lease = await vectorizeTransitionProofFixture.kernel.acquireLease({
+    extensionId: EXTENSION_ID,
+    holderSessionId: HOLDER,
+    serverBootId: BOOT_ID,
+    contentHash: CONTENT_HASH,
+  });
+  const leaseAuthority = authority(lease);
+  const currentProfile = { connectionId: "__local_sidecar__", model: "local-sidecar" };
+  let expectedRevision = 0;
+
+  const transitionCase = async (
+    label: string,
+    reasons: string[],
+    runtimeOverrides: Record<string, unknown>,
+    expectedCode: PersonalExtensionCoordinationKernelError["code"] | null,
+    initialKind: "mutation" | "vectorize" = "mutation",
+  ) => {
+    const operation = await vectorizeTransitionProofFixture.kernel.beginOperation({
+      ...leaseAuthority,
+      kind: initialKind,
+      targetEnsembleId: ENSEMBLE_ID,
+    });
+    const context = { ...leaseAuthority, operationHandle: operation.operationHandle };
+    await writeConfig(
+      vectorizeTransitionProofFixture,
+      context,
+      expectedRevision,
+      reasons,
+      undefined,
+      LOREBOOK_ID,
+      runtimeOverrides,
+    );
+    expectedRevision += 1;
+    const transition = vectorizeTransitionProofFixture.kernel.transitionOperationToVectorize({
+      ...context,
+      targetEnsembleId: ENSEMBLE_ID,
+    });
+    if (expectedCode === null) {
+      const grant = await transition;
+      assert.equal(grant.operationHandle, operation.operationHandle, `${label}: the raw handle must be unchanged`);
+      assert.equal(grant.kind, "vectorize", `${label}: the operation must narrow to vectorize`);
+    } else {
+      await expectCode(transition, expectedCode);
+      const persisted = JSON.parse(
+        (await coordinationRow(vectorizeTransitionProofFixture)).activeOperations,
+      ) as Array<{ digest: string; kind: string }>;
+      assert.equal(
+        persisted.find((candidate) => candidate.digest === sha256(operation.operationHandle))?.kind,
+        initialKind,
+        `${label}: rejected proof must not mutate operation kind`,
+      );
+      assert.equal(
+        (await journalFor(vectorizeTransitionProofFixture, operation.operationHandle)).operationKind,
+        initialKind,
+        `${label}: rejected proof must not mutate the journal`,
+      );
+    }
+    await vectorizeTransitionProofFixture.kernel.endOperation({
+      ...leaseAuthority,
+      operationHandle: operation.operationHandle,
+      disposition: "aborted",
+    });
+  };
+
+  await transitionCase(
+    "exact generic pending pair",
+    ["mutation-ambiguous", "vectorization-pending"],
+    { semanticStatus: "pending", pendingEmbeddingProfile: currentProfile },
+    null,
+  );
+  await transitionCase(
+    "one exact setup reason",
+    ["mutation-ambiguous", "vectorization-pending", "setup-attach-ambiguous"],
+    {
+      semanticStatus: "pending",
+      pendingEmbeddingProfile: currentProfile,
+      lastSuccessfulEmbeddingProfile: currentProfile,
+    },
+    null,
+  );
+  await transitionCase(
+    "idempotent direct vectorize recovery",
+    ["mutation-ambiguous", "vectorization-pending"],
+    { semanticStatus: "pending", pendingEmbeddingProfile: currentProfile },
+    null,
+    "vectorize",
+  );
+  await transitionCase(
+    "source reason is not transition proof",
+    ["mutation-ambiguous", "vectorization-pending", "source-read-incomplete"],
+    { semanticStatus: "pending", pendingEmbeddingProfile: currentProfile },
+    "coordination-unavailable",
+  );
+  await transitionCase(
+    "both setup reasons are not transition proof",
+    [
+      "mutation-ambiguous",
+      "vectorization-pending",
+      "setup-attach-ambiguous",
+      "setup-reconcile-ambiguous",
+    ],
+    { semanticStatus: "pending", pendingEmbeddingProfile: currentProfile },
+    "coordination-unavailable",
+  );
+  await transitionCase(
+    "missing generic marker",
+    ["vectorization-pending"],
+    { semanticStatus: "pending", pendingEmbeddingProfile: currentProfile },
+    "coordination-unavailable",
+  );
+  await transitionCase(
+    "ready semantic state",
+    ["mutation-ambiguous", "vectorization-pending"],
+    { semanticStatus: "ready", pendingEmbeddingProfile: currentProfile },
+    "coordination-unavailable",
+  );
+  await transitionCase(
+    "missing pending profile",
+    ["mutation-ambiguous", "vectorization-pending"],
+    { semanticStatus: "pending", pendingEmbeddingProfile: null },
+    "coordination-unavailable",
+  );
+  await transitionCase(
+    "foreign pending profile",
+    ["mutation-ambiguous", "vectorization-pending"],
+    {
+      semanticStatus: "pending",
+      pendingEmbeddingProfile: { connectionId: "foreign-connection", model: "foreign-model" },
+    },
+    "coordination-unavailable",
+  );
+  await transitionCase(
+    "foreign last successful profile",
+    ["mutation-ambiguous", "vectorization-pending"],
+    {
+      semanticStatus: "pending",
+      pendingEmbeddingProfile: currentProfile,
+      lastSuccessfulEmbeddingProfile: { connectionId: "foreign-connection", model: "foreign-model" },
+    },
+    "coordination-unavailable",
+  );
+} finally {
+  await vectorizeTransitionProofFixture.cleanup();
 }
 
 const bindFixture = await createFixture();

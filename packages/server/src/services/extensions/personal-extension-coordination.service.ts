@@ -28,6 +28,7 @@ import {
   type PersonalExtensionOperationBeginInput,
   type PersonalExtensionOperationEndInput,
   type PersonalExtensionOperationKind,
+  type PersonalExtensionOperationTransitionToVectorizeInput,
   type PersonalExtensionProtectedResourceRegistry,
   type PersonalExtensionProtectedResource,
 } from "./personal-extension-coordination-kernel.service.js";
@@ -35,6 +36,7 @@ import {
   createPersonalExtensionCoordinationAdminService,
   proveCmbOperationConclusiveState,
   proveCmbOperationDispatchMarker,
+  proveCmbOperationVectorizeTransition,
 } from "./personal-extension-coordination-admin.service.js";
 import {
   getPersonalExtensionCoordinationEventService,
@@ -115,6 +117,7 @@ export function createPersonalExtensionCoordinationService(
     // This proof is server-owned and cannot be replaced through service test
     // options or a page-controlled request.
     proveDispatchMarker: proveCmbOperationDispatchMarker,
+    proveVectorizeTransition: proveCmbOperationVectorizeTransition,
     afterHandoffCommitted(extensionId, requestId) {
       publishAfterCommit(extensionId, { type: "handoff-requested", requestId });
     },
@@ -224,6 +227,10 @@ export function createPersonalExtensionCoordinationService(
     async beginOperation(input: PersonalExtensionOperationBeginInput) {
       await requireKnownExtension(input.extensionId);
       return kernel.beginOperation(input);
+    },
+    async transitionOperationToVectorize(input: PersonalExtensionOperationTransitionToVectorizeInput) {
+      await requireKnownExtension(input.extensionId);
+      return kernel.transitionOperationToVectorize(input);
     },
     async endOperation(input: PersonalExtensionOperationEndInput) {
       await requireKnownExtension(input.extensionId);

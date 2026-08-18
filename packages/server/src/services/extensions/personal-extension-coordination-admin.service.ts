@@ -27,6 +27,7 @@ import {
   type PersonalExtensionCoordinationKernelOptions,
   type PersonalExtensionOperationConclusionEvidence,
   type PersonalExtensionOperationDispatchMarkerProof,
+  type PersonalExtensionOperationVectorizeTransitionProof,
   type PersonalExtensionProtectedResourceRegistry,
 } from "./personal-extension-coordination-kernel.service.js";
 
@@ -107,6 +108,10 @@ function exactIsoTimestamp(value: unknown) {
   } catch {
     return false;
   }
+}
+
+function sameEmbeddingProfile(left: CmbEmbeddingProfile | null, right: CmbEmbeddingProfile) {
+  return left !== null && left.connectionId === right.connectionId && left.model === right.model;
 }
 
 function parseEmbeddingProfile(value: unknown, nullable: true): CmbEmbeddingProfile | null;
@@ -424,6 +429,61 @@ export const proveCmbOperationDispatchMarker: PersonalExtensionOperationDispatch
       reasons.includes("mutation-ambiguous") &&
       setupReasons.length <= 1 &&
       dispatchTargetsExactEnsemble
+    );
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * A mutation operation can narrow to vectorize-only without changing its
+ * handle or journal only after the exact target ensemble durably records both
+ * the generic dispatch marker and its current pending embedding profile.
+ */
+export const proveCmbOperationVectorizeTransition: PersonalExtensionOperationVectorizeTransitionProof = async (
+  tx,
+  evidence,
+) => {
+  try {
+    const fresh = await readCmbStorageSnapshot(tx, evidence.journal.extensionId);
+    const ensemble = fresh.config.ensembles.find(
+      (candidate) => candidate.ensembleId === evidence.journal.targetEnsembleId,
+    );
+    if (!ensemble || fresh.configRevision !== evidence.coordination.configRevision) return false;
+    const storageRevisions = evidence.resourceRevisions.filter(
+      (resource) => resource.kind === "extension-storage",
+    );
+    const lorebookRevisions = evidence.resourceRevisions.filter(
+      (resource) => resource.kind === "lorebook",
+    );
+    const storageRevision = storageRevisions[0];
+    const reasons = ensemble.runtime.manualRecoveryReasons;
+    const setupReasons = reasons.filter((reason) => SETUP_RECOVERY_REASONS.has(reason));
+    const lastSuccessfulProfile = ensemble.runtime.lastSuccessfulEmbeddingProfile;
+    return (
+      storageRevisions.length === 1 &&
+      storageRevision?.resourceId === evidence.journal.extensionId &&
+      storageRevision.presence === "present" &&
+      storageRevision.resourceRevision === fresh.configRevision &&
+      ensemble.lorebookId !== "" &&
+      ensemble.runtime.semanticStatus === "pending" &&
+      sameEmbeddingProfile(ensemble.runtime.pendingEmbeddingProfile, ensemble.embedding) &&
+      (lastSuccessfulProfile === null || sameEmbeddingProfile(lastSuccessfulProfile, ensemble.embedding)) &&
+      reasons.includes("mutation-ambiguous") &&
+      reasons.includes("vectorization-pending") &&
+      !reasons.includes("profile-changed") &&
+      reasons.length >= 2 &&
+      reasons.length <= 3 &&
+      reasons.every(
+        (reason) =>
+          reason === "mutation-ambiguous" ||
+          reason === "vectorization-pending" ||
+          SETUP_RECOVERY_REASONS.has(reason),
+      ) &&
+      setupReasons.length <= 1 &&
+      lorebookRevisions.every(
+        (resource) => resource.presence === "present" && resource.resourceId === ensemble.lorebookId,
+      )
     );
   } catch {
     return false;

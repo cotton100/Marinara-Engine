@@ -531,6 +531,16 @@ const trustedFetch: typeof fetch = async (input, init = {}) => {
       remainingMs: 180_000,
     });
   }
+  if (url.endsWith("/coordination/operations/transition-to-vectorize") && method === "POST") {
+    assert.equal(body?.operationHandle, RAW_OPERATION_HANDLE);
+    assert.equal(body?.targetEnsembleId, "ensemble-facade");
+    return json(200, {
+      operationHandle: RAW_OPERATION_HANDLE,
+      kind: "vectorize",
+      deadlineAt: "2026-08-16T00:10:00.000Z",
+      remainingMs: 600_000,
+    });
+  }
   if (url.endsWith("/coordination/operations/end") && method === "POST") {
     return json(200, {
       ended: true,
@@ -1222,7 +1232,17 @@ assert.equal(Object.isFrozen(operation), true);
 assert.equal(Object.isFrozen(operation.storage), true);
 assert.equal(Object.isFrozen(operation.lorebooks), true);
 assert.equal(Object.isFrozen(operation.storage.patch), true);
+assert.equal(Object.isFrozen(operation.transitionToVectorize), true);
 assert.equal(nativeObjectHasOwn(operation, "operationHandle"), false);
+const beforePrematureVectorize = trustedRequests.length;
+await assert.rejects(
+  operation.lorebooks.vectorizeMissing({ lorebookId: LOREBOOK_ID, connectionId: "embedding-fixture" }),
+  (error) =>
+    error instanceof PersonalExtensionCoordinationFacadeError
+    && error.code === "operation-kind-unsupported",
+  "a mutation capability must reject vector dispatch before the explicit transition",
+);
+assert.equal(trustedRequests.length, beforePrematureVectorize);
 assert.deepEqual(await operation.storage.patch({ expectedConfigRevision: 4, patch: { coordinated: true } }), {
   value: { coordinated: true },
   configRevision: 5,
@@ -1265,6 +1285,62 @@ assert.equal(
   "Updated entry",
 );
 assert.equal(await operation.lorebooks.deleteEntry({ lorebookId: LOREBOOK_ID, entryId: ENTRY_ID }), undefined);
+
+const initialOperationDeadlineAt = operation.deadlineAt;
+const initialOperationRemainingMs = operation.remainingMs;
+blockNextRequest = true;
+const transitionAbort = new AbortController();
+const cancelledTransition = operation.transitionToVectorize({ signal: transitionAbort.signal });
+transitionAbort.abort();
+await assert.rejects(
+  cancelledTransition,
+  (error) =>
+    error instanceof PersonalExtensionCoordinationFacadeError
+    && error.code === "request-cancelled",
+  "an interrupted transition must remain retryable without exposing or replacing its handle",
+);
+assert.equal(operation.kind, "mutation");
+assert.equal(operation.deadlineAt, initialOperationDeadlineAt);
+assert.equal(operation.remainingMs, initialOperationRemainingMs);
+
+const transitionRequestCount = trustedRequests.filter((request) =>
+  request.url.endsWith("/coordination/operations/transition-to-vectorize"),
+).length;
+assert.equal(await operation.transitionToVectorize(), undefined);
+assert.equal(operation.kind, "vectorize");
+assert.equal(operation.deadlineAt, "2026-08-16T00:10:00.000Z");
+assert.equal(operation.remainingMs, 600_000);
+assert.equal(
+  trustedRequests.findLast((request) =>
+    request.url.endsWith("/coordination/operations/transition-to-vectorize"),
+  )?.body?.targetEnsembleId,
+  "ensemble-facade",
+);
+assert.equal(await operation.transitionToVectorize(), undefined);
+assert.equal(
+  trustedRequests.filter((request) =>
+    request.url.endsWith("/coordination/operations/transition-to-vectorize"),
+  ).length,
+  transitionRequestCount + 1,
+  "a completed local transition must be an idempotent no-op",
+);
+
+const beforePostTransitionMutation = trustedRequests.length;
+await assert.rejects(
+  operation.lorebooks.createEntry({ lorebookId: LOREBOOK_ID, entry: { name: "too late" } }),
+  (error) =>
+    error instanceof PersonalExtensionCoordinationFacadeError
+    && error.code === "operation-kind-unsupported",
+  "the same capability must reject CRUD after it narrows to vectorize",
+);
+assert.equal(trustedRequests.length, beforePostTransitionMutation);
+assert.deepEqual(
+  await operation.lorebooks.vectorizeMissing({
+    lorebookId: LOREBOOK_ID,
+    connectionId: "embedding-fixture",
+  }),
+  { vectorized: 1, total: 1, skipped: 0 },
+);
 await operation.end({ disposition: "conclusive" });
 assert.equal(
   trustedRequests.findLast((request) => request.url.endsWith("/coordination/operations/end"))?.body?.disposition,
@@ -1272,6 +1348,16 @@ assert.equal(
 );
 
 const vectorOperation = await facade.beginOperation({ kind: "vectorize", targetEnsembleId: "ensemble-facade" });
+const beforeDirectVectorNoOp = trustedRequests.length;
+assert.equal(await vectorOperation.transitionToVectorize(), undefined);
+assert.equal(trustedRequests.length, beforeDirectVectorNoOp);
+await assert.rejects(
+  vectorOperation.lorebooks.deleteEntry({ lorebookId: LOREBOOK_ID, entryId: ENTRY_ID }),
+  (error) =>
+    error instanceof PersonalExtensionCoordinationFacadeError
+    && error.code === "operation-kind-unsupported",
+);
+assert.equal(trustedRequests.length, beforeDirectVectorNoOp);
 blockNextRequest = true;
 accelerateNextDeadline = true;
 await assert.rejects(
@@ -1549,6 +1635,7 @@ assert.deepEqual(
     `/api/personal-extensions/${EXTENSION_ID}/coordination/lease/renew`,
     `/api/personal-extensions/${EXTENSION_ID}/coordination/operations/begin`,
     `/api/personal-extensions/${EXTENSION_ID}/coordination/operations/end`,
+    `/api/personal-extensions/${EXTENSION_ID}/coordination/operations/transition-to-vectorize`,
     `/api/personal-extensions/${EXTENSION_ID}/coordination/storage`,
     "/api/lorebooks/coordination",
     `/api/lorebooks/${LOREBOOK_ID}/coordination`,

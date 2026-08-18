@@ -83,7 +83,7 @@ try {
   assert.equal(await service.getPersistedRow("missing-extension"), null);
   assert.equal(
     Object.keys(service).join(","),
-    "getPersistedRow,getState,getInactiveState,acquireLease,requestHandoff,renewLease,releaseLease,beginOperation,endOperation,activateCoordination,deactivateCoordination,recoverBlockedCoordination,recoverStaleTransitions,runLegacyInactiveMutation,runFencedResourceMutation,runFencedResourceRead,runFencedOperationRead,runFencedLorebookRegistryTransition",
+    "getPersistedRow,getState,getInactiveState,acquireLease,requestHandoff,renewLease,releaseLease,beginOperation,transitionOperationToVectorize,endOperation,activateCoordination,deactivateCoordination,recoverBlockedCoordination,recoverStaleTransitions,runLegacyInactiveMutation,runFencedResourceMutation,runFencedResourceRead,runFencedOperationRead,runFencedLorebookRegistryTransition",
   );
   for (const forbiddenApi of ["activate", "deactivate", "handoff"]) {
     assert.equal(forbiddenApi in service, false);

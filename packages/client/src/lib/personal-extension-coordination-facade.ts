@@ -299,6 +299,7 @@ export interface PersonalExtensionCoordinationOperationCapability {
       input: PersonalExtensionCoordinationLorebookClearVectorsInput,
     ): Promise<Omit<PersonalExtensionCoordinationLorebookClearVectorsResponse, "resourceRevision">>;
   }>;
+  transitionToVectorize(options?: PersonalExtensionCoordinationSignalOptions): Promise<void>;
   end(options?: PersonalExtensionCoordinationOperationEndOptions): Promise<void>;
 }
 
@@ -406,6 +407,11 @@ type CoordinationEventHub = {
 type OperationPrivateState = {
   facade: PersonalExtensionCoordinationFacade;
   operationHandle: string;
+  targetEnsembleId: string;
+  kind: PersonalExtensionCoordinationOperationGrant["kind"];
+  deadlineAt: string;
+  remainingMs: number;
+  transitionPromise: Promise<void> | null;
   active: boolean;
 };
 
@@ -1531,6 +1537,60 @@ function operationStateFor(capability: PersonalExtensionCoordinationOperationCap
   return { operation, privateState, authority };
 }
 
+function requireOperationKind(
+  operation: OperationPrivateState,
+  expectedKind: PersonalExtensionCoordinationOperationGrant["kind"],
+) {
+  if (operation.kind !== expectedKind) fail("operation-kind-unsupported");
+}
+
+async function transitionOperationToVectorize(
+  capability: PersonalExtensionCoordinationOperationCapability,
+  options?: PersonalExtensionCoordinationSignalOptions,
+): Promise<void> {
+  const { operation, privateState, authority } = operationStateFor(capability);
+  const { signal } = signalOptions(options);
+  if (signal?.aborted) throw requestCancelled();
+  if (operation.kind === "vectorize") return;
+  if (operation.transitionPromise) {
+    await operation.transitionPromise;
+    return;
+  }
+  const body = operationAuthorityBody(authority, operation.operationHandle);
+  body.targetEnsembleId = operation.targetEnsembleId;
+  let transitionPromise!: Promise<void>;
+  transitionPromise = (async () => {
+    try {
+      const grant = await guardedRequest(
+        privateState,
+        "/operations/transition-to-vectorize",
+        "POST",
+        privateOperationGrantSchema,
+        { body, signal, holderSessionId: authority.holderSessionId, timeoutMs: DEFAULT_MUTATION_TIMEOUT_MS },
+      );
+      if (grant.operationHandle !== operation.operationHandle || grant.kind !== "vectorize") {
+        throw genericUnavailable();
+      }
+      operation.kind = grant.kind;
+      operation.deadlineAt = grant.deadlineAt;
+      operation.remainingMs = grant.remainingMs;
+    } catch (error) {
+      if (error instanceof PersonalExtensionCoordinationFacadeError && error.code === "operation-lost") {
+        operation.active = false;
+        operationPrivateDelete(capability);
+        setDelete(privateState.operations, capability);
+      } else if (terminalAuthorityError(error)) {
+        invalidateAuthority(privateState);
+      }
+      throw error instanceof PersonalExtensionCoordinationFacadeError ? error : genericUnavailable();
+    } finally {
+      if (operation.transitionPromise === transitionPromise) operation.transitionPromise = null;
+    }
+  })();
+  operation.transitionPromise = transitionPromise;
+  await transitionPromise;
+}
+
 async function endOperation(
   capability: PersonalExtensionCoordinationOperationCapability,
   options?: PersonalExtensionCoordinationOperationEndOptions,
@@ -1576,6 +1636,7 @@ async function endOperation(
 function createOperationCapability(
   facade: PersonalExtensionCoordinationFacade,
   grant: PersonalExtensionCoordinationOperationGrant & { operationHandle: string },
+  operationTargetEnsembleId: string,
 ) {
   const storage = {
     async patch(input: PersonalExtensionCoordinationStoragePatchInput) {
@@ -1636,6 +1697,7 @@ function createOperationCapability(
   const lorebooks = {
     async create(input: PersonalExtensionCoordinationLorebookCreateInput) {
       const { operation, privateState, authority } = operationStateFor(capability);
+      requireOperationKind(operation, "mutation");
       const parsed = fixedInput<{ book: unknown; signal?: unknown }>(input, ["book", "signal"], ["book"]);
       const signal = readSignal(parsed.signal);
       let book: CreateLorebookInput;
@@ -1660,6 +1722,7 @@ function createOperationCapability(
 
     async update(input: PersonalExtensionCoordinationLorebookUpdateInput) {
       const { operation, privateState, authority } = operationStateFor(capability);
+      requireOperationKind(operation, "mutation");
       const parsed = fixedInput<{ lorebookId: unknown; changes: unknown; signal?: unknown }>(
         input,
         ["lorebookId", "changes", "signal"],
@@ -1692,6 +1755,7 @@ function createOperationCapability(
 
     async createEntry(input: PersonalExtensionCoordinationLorebookEntryCreateInput) {
       const { operation, privateState, authority } = operationStateFor(capability);
+      requireOperationKind(operation, "mutation");
       const parsed = fixedInput<{ lorebookId: unknown; entry: unknown; signal?: unknown }>(
         input,
         ["lorebookId", "entry", "signal"],
@@ -1724,6 +1788,7 @@ function createOperationCapability(
 
     async updateEntry(input: PersonalExtensionCoordinationLorebookEntryUpdateInput) {
       const { operation, privateState, authority } = operationStateFor(capability);
+      requireOperationKind(operation, "mutation");
       const parsed = fixedInput<{
         lorebookId: unknown;
         entryId: unknown;
@@ -1758,6 +1823,7 @@ function createOperationCapability(
 
     async deleteEntry(input: PersonalExtensionCoordinationLorebookEntryDeleteInput) {
       const { operation, privateState, authority } = operationStateFor(capability);
+      requireOperationKind(operation, "mutation");
       const parsed = fixedInput<{ lorebookId: unknown; entryId: unknown; signal?: unknown }>(
         input,
         ["lorebookId", "entryId", "signal"],
@@ -1781,6 +1847,7 @@ function createOperationCapability(
 
     async vectorizeMissing(input: PersonalExtensionCoordinationLorebookVectorizeInput) {
       const { operation, privateState, authority } = operationStateFor(capability);
+      requireOperationKind(operation, "vectorize");
       const parsed = fixedInput<{
         lorebookId: unknown;
         connectionId: unknown;
@@ -1810,6 +1877,7 @@ function createOperationCapability(
 
     async clearVectors(input: PersonalExtensionCoordinationLorebookClearVectorsInput) {
       const { operation, privateState, authority } = operationStateFor(capability);
+      requireOperationKind(operation, "vectorize");
       const parsed = fixedInput<{ lorebookId: unknown; signal?: unknown }>(
         input,
         ["lorebookId", "signal"],
@@ -1831,19 +1899,44 @@ function createOperationCapability(
       return deepFreeze({ cleared: response.cleared, total: response.total });
     },
   };
-  const capability: PersonalExtensionCoordinationOperationCapability = deepFreeze({
+  const publicGrantState = {
     kind: grant.kind,
     deadlineAt: grant.deadlineAt,
     remainingMs: grant.remainingMs,
+  };
+  const capability: PersonalExtensionCoordinationOperationCapability = {
+    get kind() {
+      return operationPrivateGet(capability)?.kind ?? publicGrantState.kind;
+    },
+    get deadlineAt() {
+      return operationPrivateGet(capability)?.deadlineAt ?? publicGrantState.deadlineAt;
+    },
+    get remainingMs() {
+      return operationPrivateGet(capability)?.remainingMs ?? publicGrantState.remainingMs;
+    },
     storage,
     lorebooks,
+    async transitionToVectorize(options?: PersonalExtensionCoordinationSignalOptions) {
+      await transitionOperationToVectorize(capability, options);
+      const operation = operationPrivateGet(capability);
+      if (!operation?.active || operation.kind !== "vectorize") fail("operation-lost");
+      publicGrantState.kind = operation.kind;
+      publicGrantState.deadlineAt = operation.deadlineAt;
+      publicGrantState.remainingMs = operation.remainingMs;
+    },
     end: (options?: PersonalExtensionCoordinationOperationEndOptions) => endOperation(capability, options),
-  });
+  };
   operationPrivateSet(capability, {
     facade,
     operationHandle: grant.operationHandle,
+    targetEnsembleId: operationTargetEnsembleId,
+    kind: grant.kind,
+    deadlineAt: grant.deadlineAt,
+    remainingMs: grant.remainingMs,
+    transitionPromise: null,
     active: true,
   });
+  deepFreeze(capability);
   const privateState = facadePrivateGet(facade);
   if (!privateState) fail("coordination-unavailable");
   setAdd(privateState.operations, capability);
@@ -1865,9 +1958,10 @@ async function beginOperation(
   }>(input, ["kind", "targetEnsembleId", "requestedDeadlineMs", "signal"], ["kind", "targetEnsembleId"]);
   const signal = readSignal(parsed.signal);
   const kind = operationKind(parsed.kind);
+  const operationTargetEnsembleId = targetEnsembleId(parsed.targetEnsembleId);
   const body = authorityBody(authority);
   body.kind = kind;
-  body.targetEnsembleId = targetEnsembleId(parsed.targetEnsembleId);
+  body.targetEnsembleId = operationTargetEnsembleId;
   const deadline = requestedDeadlineMs(parsed.requestedDeadlineMs);
   if (deadline !== undefined) body.requestedDeadlineMs = deadline;
   try {
@@ -1878,7 +1972,7 @@ async function beginOperation(
       timeoutMs: DEFAULT_MUTATION_TIMEOUT_MS,
     });
     if (grant.kind !== kind) throw genericUnavailable();
-    return createOperationCapability(facade, grant);
+    return createOperationCapability(facade, grant, operationTargetEnsembleId);
   } catch (error) {
     if (terminalAuthorityError(error)) invalidateAuthority(privateState);
     throw error instanceof PersonalExtensionCoordinationFacadeError ? error : genericUnavailable();

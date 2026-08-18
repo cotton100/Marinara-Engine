@@ -114,6 +114,11 @@ export type PersonalExtensionCoordinationKernelOptions = {
    */
   proveDispatchMarker?: PersonalExtensionOperationDispatchMarkerProof;
   /**
+   * Server-owned proof that the exact CMB ensemble is durably pending
+   * vectorization before a mutation journal can narrow to vectorize-only.
+   */
+  proveVectorizeTransition?: PersonalExtensionOperationVectorizeTransitionProof;
+  /**
    * Runs only after a newly-created handoff request is durably committed.
    * The callback is notification-only: failures must be contained by the
    * caller and must never change the committed handoff result.
@@ -164,6 +169,11 @@ export type PersonalExtensionOperationBeginInput = PersonalExtensionLeaseAuthori
   kind: PersonalExtensionOperationKind;
   targetEnsembleId: string;
   requestedDeadlineMs?: number;
+};
+
+export type PersonalExtensionOperationTransitionToVectorizeInput = PersonalExtensionLeaseAuthority & {
+  operationHandle: string;
+  targetEnsembleId: string;
 };
 
 export type PersonalExtensionOperationEndInput = PersonalExtensionLeaseAuthority & {
@@ -237,6 +247,11 @@ export type PersonalExtensionOperationConclusionEvidence = {
 };
 
 export type PersonalExtensionOperationConclusionProof = (
+  tx: DB,
+  evidence: PersonalExtensionOperationConclusionEvidence,
+) => Promise<boolean>;
+
+export type PersonalExtensionOperationVectorizeTransitionProof = (
   tx: DB,
   evidence: PersonalExtensionOperationConclusionEvidence,
 ) => Promise<boolean>;
@@ -333,6 +348,7 @@ type RuntimeLease = {
 type RuntimeOperation = {
   extensionId: string;
   fence: number;
+  startedAtMs: number;
   deadlineMs: number;
 };
 
@@ -718,15 +734,25 @@ export function createPersonalExtensionCoordinationKernel(
   const randomRequestId = options.randomRequestId ?? (() => randomUUID());
   const leaseTtlMs = requireFinitePositive(options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS);
   const operationDeadlinesMs = {
-    mutation: requireFinitePositive(
-      options.operationDeadlinesMs?.mutation ?? PERSONAL_EXTENSION_OPERATION_DEADLINES_MS.mutation,
+    mutation: Math.min(
+      requireFinitePositive(
+        options.operationDeadlinesMs?.mutation ?? PERSONAL_EXTENSION_OPERATION_DEADLINES_MS.mutation,
+      ),
+      PERSONAL_EXTENSION_OPERATION_DEADLINES_MS.mutation,
     ),
-    vectorize: requireFinitePositive(
-      options.operationDeadlinesMs?.vectorize ?? PERSONAL_EXTENSION_OPERATION_DEADLINES_MS.vectorize,
+    vectorize: Math.min(
+      requireFinitePositive(
+        options.operationDeadlinesMs?.vectorize ?? PERSONAL_EXTENSION_OPERATION_DEADLINES_MS.vectorize,
+      ),
+      PERSONAL_EXTENSION_OPERATION_DEADLINES_MS.vectorize,
     ),
   } satisfies Record<PersonalExtensionOperationKind, number>;
   const proveDispatchMarker = options.proveDispatchMarker;
   if (proveDispatchMarker !== undefined && typeof proveDispatchMarker !== "function") {
+    throw kernelError("invalid-request");
+  }
+  const proveVectorizeTransition = options.proveVectorizeTransition;
+  if (proveVectorizeTransition !== undefined && typeof proveVectorizeTransition !== "function") {
     throw kernelError("invalid-request");
   }
   const afterHandoffCommitted = options.afterHandoffCommitted;
@@ -2464,6 +2490,7 @@ export function createPersonalExtensionCoordinationKernel(
           runtimeOperation: {
             extensionId: input.extensionId,
             fence: row.fence,
+            startedAtMs: monotonicMs,
             deadlineMs: monotonicMs + requestedDeadlineMs,
           },
           operationKey: operationRuntimeKey(input.extensionId, issued.digest),
@@ -2475,6 +2502,223 @@ export function createPersonalExtensionCoordinationKernel(
         runtimeOperationDeadlines.set(result.operationKey, result.runtimeOperation);
       },
     );
+    return committed.response;
+  };
+
+  const transitionOperationToVectorize = async (
+    input: PersonalExtensionOperationTransitionToVectorizeInput,
+  ): Promise<PersonalExtensionOperationGrant> => {
+    requireIdentifier(input.holderSessionId);
+    requireIdentifier(input.operationHandle);
+    requireTargetEnsembleId(input.targetEnsembleId);
+    const committed = await runStrictMutation(
+      input.extensionId,
+      async (tx) => {
+        const row = await readActiveContext(tx, input);
+        assertExactAuthority(row, input);
+        const admissionMonotonicMs = checkedMonotonicNow();
+        const admissionWallMs = checkedWallNow();
+        const operation = assertOperationLive(row, input, admissionMonotonicMs, admissionWallMs);
+        if (operation.targetEnsembleId !== input.targetEnsembleId) {
+          throw kernelError("operation-lost");
+        }
+        if (operation.kind !== "mutation" && operation.kind !== "vectorize") {
+          throw kernelError("operation-kind-unsupported");
+        }
+        const handoff = parseHandoff(row);
+        if (handoff) {
+          if (!operation.drainEligible) throw kernelError("handoff-pending");
+          if (
+            row.leaseTokenDigest === null ||
+            row.holderSessionId === handoff.requester
+          ) {
+            throw kernelError("handoff-pending");
+          }
+          if (!liveHandoffRuntime(row, handoff, "draining", admissionMonotonicMs)) {
+            throw kernelError("handoff-pending");
+          }
+        } else if (operation.drainEligible) {
+          throw kernelError("coordination-unavailable");
+        }
+
+        const operationKey = operationRuntimeKey(input.extensionId, operation.digest);
+        const runtimeOperation = runtimeOperationDeadlines.get(operationKey);
+        if (
+          !runtimeOperation ||
+          runtimeOperation.extensionId !== input.extensionId ||
+          runtimeOperation.fence !== row.fence ||
+          !Number.isFinite(runtimeOperation.startedAtMs) ||
+          runtimeOperation.startedAtMs < 0
+        ) {
+          throw kernelError("operation-lost");
+        }
+        const journalState = await readOperationJournal(tx, input.extensionId, operation);
+        if (journalState.journal.phase === "final") throw kernelError("operation-lost");
+        const registry = parsePersonalExtensionProtectedResourceRegistry(row.protectedLorebookRegistry);
+        if (!journalRevisionsAreCurrent(registry, journalState.resourceRevisions)) {
+          throw kernelError("resource-revision-conflict");
+        }
+        if (
+          proveVectorizeTransition === undefined ||
+          !(await proveVectorizeTransition(tx, {
+            coordination: row,
+            journal: journalState.journal,
+            resourceRevisions: journalState.resourceRevisions,
+          }))
+        ) {
+          throw kernelError("coordination-unavailable");
+        }
+
+        // The server-owned proof performs fresh durable reads and may await
+        // storage. It cannot carry the operation/handoff liveness observed
+        // before that await across the authority transition.
+        const transitionMonotonicMs = checkedMonotonicNow();
+        const transitionWallMs = checkedWallNow();
+        const freshOperation = assertOperationLive(
+          row,
+          input,
+          transitionMonotonicMs,
+          transitionWallMs,
+        );
+        if (
+          freshOperation.digest !== operation.digest ||
+          freshOperation.targetEnsembleId !== operation.targetEnsembleId ||
+          freshOperation.kind !== operation.kind
+        ) {
+          throw kernelError("operation-lost");
+        }
+        const freshRuntimeOperation = runtimeOperationDeadlines.get(operationKey);
+        if (
+          !freshRuntimeOperation ||
+          freshRuntimeOperation.extensionId !== input.extensionId ||
+          freshRuntimeOperation.fence !== row.fence ||
+          freshRuntimeOperation.startedAtMs !== runtimeOperation.startedAtMs
+        ) {
+          throw kernelError("operation-lost");
+        }
+        let drainingHandoff: RuntimeHandoff | null = null;
+        if (handoff) {
+          if (!freshOperation.drainEligible) throw kernelError("handoff-pending");
+          drainingHandoff = liveHandoffRuntime(row, handoff, "draining", transitionMonotonicMs);
+          if (!drainingHandoff) throw kernelError("handoff-pending");
+        }
+
+        const startedWallMs = Date.parse(freshOperation.startedAt);
+        const vectorizeWindowMs = operationDeadlinesMs.vectorize;
+        const deadlineWallMs = startedWallMs + vectorizeWindowMs;
+        const deadlineMonotonicMs = freshRuntimeOperation.startedAtMs + vectorizeWindowMs;
+        const currentWallDeadlineMs = Date.parse(freshOperation.deadlineAt);
+        if (
+          !Number.isFinite(startedWallMs) ||
+          startedWallMs > transitionWallMs ||
+          currentWallDeadlineMs > deadlineWallMs ||
+          freshRuntimeOperation.deadlineMs > deadlineMonotonicMs ||
+          transitionWallMs >= deadlineWallMs ||
+          transitionMonotonicMs >= deadlineMonotonicMs
+        ) {
+          throw kernelError("operation-lost");
+        }
+        const remainingMs = Math.floor(
+          Math.min(
+            deadlineWallMs - transitionWallMs,
+            deadlineMonotonicMs - transitionMonotonicMs,
+          ),
+        );
+        if (!Number.isSafeInteger(remainingMs) || remainingMs <= 0) {
+          throw kernelError("operation-lost");
+        }
+        const deadlineAt = new Date(deadlineWallMs).toISOString();
+
+        if (freshOperation.kind === "vectorize") {
+          const currentRemainingMs = Math.floor(
+            Math.min(
+              currentWallDeadlineMs - transitionWallMs,
+              freshRuntimeOperation.deadlineMs - transitionMonotonicMs,
+            ),
+          );
+          if (!Number.isSafeInteger(currentRemainingMs) || currentRemainingMs <= 0) {
+            throw kernelError("operation-lost");
+          }
+          return {
+            response: {
+              operationHandle: input.operationHandle,
+              kind: "vectorize" as const,
+              deadlineAt: freshOperation.deadlineAt,
+              remainingMs: currentRemainingMs,
+            },
+            operationKey,
+            runtimeOperation: null,
+            runtimeHandoff: null,
+          };
+        }
+
+        const operations = parseOperations(row.activeOperations);
+        const operationIndex = operations.findIndex((candidate) => candidate.digest === freshOperation.digest);
+        if (operationIndex < 0) throw kernelError("operation-lost");
+        const transitionedOperation: PersistedPersonalExtensionOperation = {
+          ...freshOperation,
+          kind: "vectorize",
+          deadlineAt,
+        };
+        const transitionedOperations = operations.map((candidate, index) =>
+          index === operationIndex ? transitionedOperation : candidate,
+        );
+        const updatedAt = new Date(transitionWallMs).toISOString();
+        if (handoff) {
+          const currentHandoffDeadlineMs = Date.parse(handoff.deadlineAt);
+          if (
+            currentHandoffDeadlineMs > deadlineWallMs ||
+            drainingHandoff === null ||
+            drainingHandoff.deadlineMs > deadlineMonotonicMs
+          ) {
+            throw kernelError("handoff-pending");
+          }
+        }
+        await tx
+          .update(personalExtensionCoordination)
+          .set({
+            activeOperations: JSON.stringify(transitionedOperations),
+            handoffDeadlineAt: handoff ? deadlineAt : row.handoffDeadlineAt,
+            updatedAt,
+          })
+          .where(eq(personalExtensionCoordination.extensionId, input.extensionId));
+        await tx
+          .update(personalExtensionOperationJournal)
+          .set({ operationKind: "vectorize", updatedAt })
+          .where(eq(personalExtensionOperationJournal.operationDigest, operation.digest));
+
+        return {
+          response: {
+            operationHandle: input.operationHandle,
+            kind: "vectorize" as const,
+            deadlineAt,
+            remainingMs,
+          },
+          operationKey,
+          runtimeOperation: {
+            ...freshRuntimeOperation,
+            deadlineMs: deadlineMonotonicMs,
+          },
+          runtimeHandoff: handoff && drainingHandoff
+            ? {
+                ...drainingHandoff,
+                deadlineMs: deadlineMonotonicMs,
+              }
+            : null,
+        };
+      },
+      (result) => {
+        if (result.runtimeOperation) {
+          runtimeOperationDeadlines.set(result.operationKey, result.runtimeOperation);
+        }
+        if (result.runtimeHandoff) {
+          runtimeHandoffDeadlines.set(handoffRuntimeKey(input.extensionId), result.runtimeHandoff);
+        }
+      },
+    );
+    if (!Number.isSafeInteger(committed.response.remainingMs) || committed.response.remainingMs <= 0) {
+      throw kernelError("operation-lost");
+    }
     return committed.response;
   };
 
@@ -2569,6 +2813,7 @@ export function createPersonalExtensionCoordinationKernel(
     renewLease,
     releaseLease,
     beginOperation,
+    transitionOperationToVectorize,
     endOperation,
     beginActivation,
     completeActivation,

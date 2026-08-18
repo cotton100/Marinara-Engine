@@ -409,6 +409,59 @@ try {
   const operation = personalExtensionCoordinationOperationGrantSchema.parse(beginResponse.json());
   assert.equal(operation.kind, "mutation");
 
+  const beforeTransitionValidation = await coordinationRow();
+  const beforeTransitionValidationWrites = tableWrites;
+  await expectError(
+    {
+      method: "POST",
+      url: routeUrl(ACTIVE_EXTENSION_ID, "/operations/transition-to-vectorize"),
+      headers: headers(HOLDER_A),
+      payload: { ...authorityPayload(lease), operationHandle: operation.operationHandle },
+    },
+    400,
+    "invalid-request",
+  );
+  await expectError(
+    {
+      method: "POST",
+      url: routeUrl(ACTIVE_EXTENSION_ID, "/operations/transition-to-vectorize"),
+      headers: headers(HOLDER_A),
+      payload: {
+        ...authorityPayload(lease),
+        operationHandle: operation.operationHandle,
+        targetEnsembleId: "other-route-ensemble",
+      },
+    },
+    409,
+    "operation-lost",
+  );
+  assert.deepEqual(await coordinationRow(), beforeTransitionValidation);
+  assert.equal(
+    tableWrites,
+    beforeTransitionValidationWrites,
+    "invalid or wrong-target transitions must not reach a durable write",
+  );
+
+  await expectError(
+    {
+      method: "POST",
+      url: routeUrl(ACTIVE_EXTENSION_ID, "/operations/transition-to-vectorize"),
+      headers: headers(HOLDER_A),
+      payload: {
+        ...authorityPayload(lease),
+        operationHandle: operation.operationHandle,
+        targetEnsembleId: "ensemble-route",
+      },
+    },
+    503,
+    "coordination-unavailable",
+  );
+  assert.deepEqual(
+    await coordinationRow(),
+    beforeTransitionValidation,
+    "the HTTP transition must fail closed when server-owned CMB marker proof is absent",
+  );
+
   const malformedHandoffWrites = tableWrites;
   await expectError(
     {

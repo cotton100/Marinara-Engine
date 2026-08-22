@@ -11,6 +11,10 @@ import {
   PERSONAL_EXTENSION_COORDINATION_FENCE_HEADER,
   PERSONAL_EXTENSION_COORDINATION_HOLDER_HEADER,
   PERSONAL_EXTENSION_COORDINATION_LEASE_TOKEN_HEADER,
+  personalExtensionCoordinationRevisionedLorebookEntryListResponseSchema,
+  personalExtensionCoordinationRevisionedLorebookEntryResponseSchema,
+  personalExtensionCoordinationRevisionedLorebookListResponseSchema,
+  personalExtensionCoordinationRevisionedLorebookResponseSchema,
 } from "../../packages/shared/src/schemas/personal-extension-coordination.schema.js";
 import type { DB } from "../../packages/server/src/db/connection.js";
 import { createFileNativeDB } from "../../packages/server/src/db/file-backed-store.js";
@@ -165,6 +169,14 @@ const eventSubscription = await eventService.subscribe(
 const app = Fastify();
 app.decorate("db", db);
 await app.register(lorebooksRoutes, { prefix: "/api/lorebooks" });
+
+// The client facade validates every coordination response with these closed
+// schemas; a key that upstream adds to ordinary lorebook rows (lorebooks.embedding,
+// lorebook_entries.embeddingSpaceId) must never leak into the fenced wire shape.
+function assertContractShape(label: string, schema: { safeParse(value: unknown): { success: boolean; error?: unknown } }, body: unknown) {
+  const parsed = schema.safeParse(body);
+  assert.ok(parsed.success, `${label}: fenced response must match the closed client contract: ${String(parsed.error)}`);
+}
 
 async function expectCode(promise: Promise<unknown>, code: string) {
   await assert.rejects(
@@ -478,6 +490,7 @@ try {
   assert.equal(listResponse.statusCode, 200, listResponse.body);
   assert.equal(listResponse.json().items[0].resourceRevision, 1);
   assert.equal(listResponse.body.includes(lease.leaseToken), false, "read responses must not echo raw authority");
+  assertContractShape("list", personalExtensionCoordinationRevisionedLorebookListResponseSchema, listResponse.json());
   const getResponse = await app.inject({
     method: "GET",
     url: guardedUrl(protectedBook.id),
@@ -485,6 +498,7 @@ try {
   });
   assert.equal(getResponse.statusCode, 200, getResponse.body);
   assert.equal(getResponse.json().value.id, protectedBook.id);
+  assertContractShape("get", personalExtensionCoordinationRevisionedLorebookResponseSchema, getResponse.json());
 
   const guardedUpdate = await app.inject({
     method: "PATCH",
@@ -498,6 +512,7 @@ try {
   assert.equal(guardedUpdate.statusCode, 200, guardedUpdate.body);
   assert.equal(guardedUpdate.json().resourceRevision, 2);
   assert.equal(guardedUpdate.json().value.name, "guarded route update");
+  assertContractShape("update", personalExtensionCoordinationRevisionedLorebookResponseSchema, guardedUpdate.json());
 
   const guardedCreateEntry = await app.inject({
     method: "POST",
@@ -507,7 +522,27 @@ try {
   });
   assert.equal(guardedCreateEntry.statusCode, 200, guardedCreateEntry.body);
   assert.equal(guardedCreateEntry.json().resourceRevision, 3);
+  assertContractShape("create entry", personalExtensionCoordinationRevisionedLorebookEntryResponseSchema, guardedCreateEntry.json());
   const guardedEntryId = String(guardedCreateEntry.json().value.id);
+  const guardedEntriesList = await app.inject({
+    method: "GET",
+    url: `${guardedUrl(protectedBook.id)}/entries`,
+    headers: guardedHeaders,
+  });
+  assert.equal(guardedEntriesList.statusCode, 200, guardedEntriesList.body);
+  assert.ok(
+    guardedEntriesList.json().items.some((entry: { id: string }) => entry.id === guardedEntryId),
+    "fenced entry list must include the guarded entry",
+  );
+  assertContractShape("list entries", personalExtensionCoordinationRevisionedLorebookEntryListResponseSchema, guardedEntriesList.json());
+  const guardedGetEntry = await app.inject({
+    method: "GET",
+    url: `${guardedUrl(protectedBook.id)}/entries/${encodeURIComponent(guardedEntryId)}`,
+    headers: guardedHeaders,
+  });
+  assert.equal(guardedGetEntry.statusCode, 200, guardedGetEntry.body);
+  assert.equal(guardedGetEntry.json().value.id, guardedEntryId);
+  assertContractShape("get entry", personalExtensionCoordinationRevisionedLorebookEntryResponseSchema, guardedGetEntry.json());
 
   const guardedUpdateEntry = await app.inject({
     method: "PATCH",
@@ -518,6 +553,7 @@ try {
   assert.equal(guardedUpdateEntry.statusCode, 200, guardedUpdateEntry.body);
   assert.equal(guardedUpdateEntry.json().resourceRevision, 4);
   assert.equal(guardedUpdateEntry.json().value.content, "updated memory");
+  assertContractShape("update entry", personalExtensionCoordinationRevisionedLorebookEntryResponseSchema, guardedUpdateEntry.json());
 
   const guardedDeleteEntry = await app.inject({
     method: "DELETE",
@@ -765,6 +801,7 @@ try {
   });
   assert.equal(guardedCreateBook.statusCode, 200, guardedCreateBook.body);
   assert.equal(guardedCreateBook.json().resourceRevision, 0);
+  assertContractShape("create", personalExtensionCoordinationRevisionedLorebookResponseSchema, guardedCreateBook.json());
   assert.deepEqual(publishedEvents.at(-1), {
     schemaVersion: 1,
     eventEpoch: publishedEvents.at(-1)?.eventEpoch,

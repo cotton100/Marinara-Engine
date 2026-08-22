@@ -28,6 +28,10 @@ import {
   type UpdateLorebookFolderInput,
 } from "@marinara-engine/shared";
 import { collectEffectivelyDisabledFolderIds, collectFolderSubtreeIds } from "@marinara-engine/shared";
+import {
+  personalExtensionCoordinationLorebookEntrySchema,
+  personalExtensionCoordinationLorebookSchema,
+} from "@marinara-engine/shared";
 import { normalizeTimestampOverrides, type TimestampOverrides } from "../import/import-timestamps.js";
 import { toPaginatedList } from "../../utils/list-pagination.js";
 import {
@@ -144,6 +148,32 @@ function activeLorebookMatchesFilters(book: LinkedLorebook, filters: LorebookSco
 }
 
 /** Parse DB row booleans ("true"/"false") → real booleans and JSON strings → objects. */
+// Coordination (fenced) responses are validated by the client facade with
+// closed (.strict()) contract schemas. Upstream keeps adding nullable columns
+// that ordinary lorebook reads expose as-is (lorebooks.embedding #4768,
+// lorebook_entries.embedding_space_id #5104); a single unknown key makes the
+// facade reject the whole response and the extension reports a failed
+// validation. Project every coordination value onto the contract's key set so
+// the wire shape stays exactly what the contract promises.
+const COORDINATION_LOREBOOK_KEYS: readonly string[] = Object.freeze(
+  Object.keys(personalExtensionCoordinationLorebookSchema.shape),
+);
+const COORDINATION_ENTRY_KEYS: readonly string[] = Object.freeze(
+  Object.keys(personalExtensionCoordinationLorebookEntrySchema.shape),
+);
+
+function projectOntoContract<T>(value: T, keys: readonly string[]): T {
+  const source = value as unknown as Record<string, unknown>;
+  const projected: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (Object.hasOwn(source, key)) projected[key] = source[key];
+  }
+  return projected as unknown as T;
+}
+
+const coordinationLorebookView = <T>(value: T): T => projectOntoContract(value, COORDINATION_LOREBOOK_KEYS);
+const coordinationEntryView = <T>(value: T): T => projectOntoContract(value, COORDINATION_ENTRY_KEYS);
+
 function parseLorebookRow(row: Record<string, unknown>) {
   const characterIds = resolveLinkIds(row.characterIds, row.characterId);
   const personaIds = resolveLinkIds(row.personaIds, row.personaId);
@@ -761,7 +791,7 @@ export function createLorebooksStorage(db: DB) {
         return registered.map(([lorebookId, resource]) => {
           const value = byId.get(lorebookId);
           if (!value) throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
-          return { value, resourceRevision: resource.resourceRevision };
+          return { value: coordinationLorebookView(value), resourceRevision: resource.resourceRevision };
         });
       });
     },
@@ -772,7 +802,7 @@ export function createLorebooksStorage(db: DB) {
         const rows = await readDb.select().from(lorebooks).where(eq(lorebooks.id, lorebookId));
         const value = (await hydrateLorebookRows(readDb, rows))[0];
         if (!value) throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
-        return { value, resourceRevision };
+        return { value: coordinationLorebookView(value), resourceRevision };
       });
     },
 
@@ -787,7 +817,7 @@ export function createLorebooksStorage(db: DB) {
           .where(eq(lorebookEntries.lorebookId, lorebookId))
           .orderBy(lorebookEntries.order);
         return {
-          items: rows.map((row) => parseEntryRow(row as Record<string, unknown>)),
+          items: rows.map((row) => coordinationEntryView(parseEntryRow(row as Record<string, unknown>))),
           resourceRevision,
         };
       });
@@ -801,7 +831,7 @@ export function createLorebooksStorage(db: DB) {
         if (!row || row.lorebookId !== lorebookId) {
           throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
         }
-        return { value: parseEntryRow(row as Record<string, unknown>), resourceRevision };
+        return { value: coordinationEntryView(parseEntryRow(row as Record<string, unknown>)), resourceRevision };
       });
     },
 
@@ -821,7 +851,7 @@ export function createLorebooksStorage(db: DB) {
       if (committed.resourceRevision === null) {
         throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
       }
-      return { value: committed.result, resourceRevision: committed.resourceRevision };
+      return { value: coordinationLorebookView(committed.result), resourceRevision: committed.resourceRevision };
     },
 
     async updateFenced(
@@ -840,7 +870,7 @@ export function createLorebooksStorage(db: DB) {
         },
         { operationKind: "mutation" },
       );
-      return { value: committed.result, resourceRevision: committed.resourceRevisions[0]!.resourceRevision };
+      return { value: coordinationLorebookView(committed.result), resourceRevision: committed.resourceRevisions[0]!.resourceRevision };
     },
 
     async createEntryFenced(
@@ -860,7 +890,7 @@ export function createLorebooksStorage(db: DB) {
         },
         { operationKind: "mutation" },
       );
-      return { value: committed.result, resourceRevision: committed.resourceRevisions[0]!.resourceRevision };
+      return { value: coordinationEntryView(committed.result), resourceRevision: committed.resourceRevisions[0]!.resourceRevision };
     },
 
     async updateEntryFenced(
@@ -880,7 +910,7 @@ export function createLorebooksStorage(db: DB) {
         },
         { operationKind: "mutation" },
       );
-      return { value: committed.result, resourceRevision: committed.resourceRevisions[0]!.resourceRevision };
+      return { value: coordinationEntryView(committed.result), resourceRevision: committed.resourceRevisions[0]!.resourceRevision };
     },
 
     async getVectorizationSnapshotFenced(

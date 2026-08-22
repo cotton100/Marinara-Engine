@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,6 +21,7 @@ type LeaseRecord = {
   hostname: string;
   token: string;
   acquiredAt: string;
+  pidStartedAt?: string | null;
 };
 
 const previousStorageDir = process.env.FILE_STORAGE_DIR;
@@ -108,6 +110,124 @@ try {
       const afterCrash = await createFileNativeDB();
       assert.notEqual(readJson<LeaseRecord>(ownerPath(dir)).token, "stale-owner-token");
       await afterCrash._fileStore.close();
+    }
+
+    // Containers hand out PIDs from 1 on every restart, so a crashed writer's
+    // PID is frequently alive again as a *different* process. The lease now
+    // records the holder's process start identity (Linux /proc start time); a
+    // same-host lease whose PID is alive but whose start identity differs is
+    // reclaimed, while a matching identity (the holder really is running) is
+    // still refused. Platforms without /proc keep the PID-only rule.
+    {
+      const expectStartIdentity = process.platform === "linux";
+      assert.equal(
+        Object.hasOwn(leaseTemplate, "pidStartedAt"),
+        true,
+        "leases record the holder's process start identity field",
+      );
+      if (expectStartIdentity) {
+        assert.match(String(leaseTemplate.pidStartedAt), /^\d+$/u, "Linux leases carry a /proc start time");
+      } else {
+        assert.equal(leaseTemplate.pidStartedAt, null, "no start identity outside Linux");
+      }
+
+      if (leaseTemplate.hostId && expectStartIdentity) {
+        mkdirSync(leasePath(dir));
+        writeFileSync(
+          ownerPath(dir),
+          JSON.stringify({
+            ...leaseTemplate,
+            pid: process.pid,
+            pidStartedAt: "1",
+            token: "reused-pid-token",
+            acquiredAt: "2026-08-13T00:00:00.000Z",
+          }),
+        );
+        const afterPidReuse = await createFileNativeDB();
+        assert.notEqual(
+          readJson<LeaseRecord>(ownerPath(dir)).token,
+          "reused-pid-token",
+          "a live PID with a different start identity is a reused PID, so the lease is reclaimed",
+        );
+        await afterPidReuse._fileStore.close();
+
+        mkdirSync(leasePath(dir));
+        writeFileSync(
+          ownerPath(dir),
+          JSON.stringify({
+            ...leaseTemplate,
+            pid: process.pid,
+            token: "live-holder-token",
+            acquiredAt: "2026-08-13T00:00:00.000Z",
+          }),
+        );
+        await assert.rejects(
+          createFileNativeDB(),
+          StorageWriterLeaseError,
+          "a live PID with the same start identity is the real holder and stays refused",
+        );
+        rmSync(leasePath(dir), { recursive: true });
+      }
+
+      if (leaseTemplate.hostId) {
+        // A lease without the start identity (written by an older build) keeps
+        // the conservative PID-only rule.
+        mkdirSync(leasePath(dir));
+        writeFileSync(
+          ownerPath(dir),
+          JSON.stringify({
+            ...leaseTemplate,
+            pid: process.pid,
+            pidStartedAt: null,
+            token: "legacy-live-pid-token",
+          }),
+        );
+        await assert.rejects(createFileNativeDB(), StorageWriterLeaseError);
+        rmSync(leasePath(dir), { recursive: true });
+      }
+    }
+
+    // MARINARA_WRITER_LEASE_HOST_ID supplies a stable host identity where the
+    // platform has none (slim container images without /etc/machine-id). It
+    // is read once at module load, so prove it through a child process.
+    {
+      const overrideDir = useTempStorage("writer-lock-host-override");
+      const overrideId = "writer-lock-regression-host";
+      const tsxCli = join(process.cwd(), "node_modules", ".bin", process.platform === "win32" ? "tsx.CMD" : "tsx");
+      const script = join(overrideDir, "lease-probe.mts");
+      const storeModule = join(process.cwd(), "src", "db", "file-backed-store.ts").replace(/\\/gu, "/");
+      writeFileSync(
+        script,
+        [
+          `const { createFileNativeDB } = await import(${JSON.stringify(`file:///${storeModule}`)});`,
+          "const db = await createFileNativeDB();",
+          "const { readFileSync } = await import('node:fs');",
+          "const { join } = await import('node:path');",
+          "process.stdout.write(readFileSync(join(process.env.FILE_STORAGE_DIR, '.writer-lease', 'owner.json'), 'utf8'));",
+          "await db._fileStore.close();",
+        ].join("\n"),
+      );
+      const child = spawn(tsxCli, [script], {
+        env: { ...process.env, FILE_STORAGE_DIR: overrideDir, MARINARA_WRITER_LEASE_HOST_ID: overrideId },
+        stdio: ["ignore", "pipe", "pipe"],
+        shell: process.platform === "win32",
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+      child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+      const exitCode = await new Promise<number | null>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code) => resolve(code));
+      });
+      assert.equal(exitCode, 0, `host-id override probe failed: ${stderr.slice(0, 400)}`);
+      const overridden = JSON.parse(stdout) as LeaseRecord;
+      const expectedHostId = createHash("sha256")
+        .update(`marinara-writer-lease-v2\n${process.platform}\n${overrideId.toLowerCase()}`)
+        .digest("hex");
+      assert.equal(overridden.version, 2);
+      assert.equal(overridden.hostId, expectedHostId, "the override feeds the v2 host identity hash");
+      assert.notEqual(overridden.hostId, leaseTemplate.hostId, "the override replaces the platform machine id");
     }
 
     if (process.platform !== "win32") {

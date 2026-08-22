@@ -99,6 +99,10 @@ type StorageWriterLeaseRecord = {
   hostname: string;
   token: string;
   acquiredAt: string;
+  // Identity of the writer *process* beyond its PID (Linux: /proc start time).
+  // Containers reuse low PIDs on every restart, so a live PID alone cannot
+  // tell "the lease holder is still running" from "a new process got its PID".
+  pidStartedAt?: string | null;
 };
 
 type ActiveStorageWriterLease = { path: string; token: string };
@@ -1174,6 +1178,14 @@ const CURRENT_LEGACY_HOST_ID = (() => {
 })();
 
 function readStableMachineId() {
+  // Operator-provided stable identity for hosts without a machine id (slim
+  // container images ship no /etc/machine-id, which would otherwise make every
+  // restart look like a different host and strand leases after a crash).
+  // Must be unique per physical host; never share one value across machines
+  // that mount the same storage.
+  const override = process.env.MARINARA_WRITER_LEASE_HOST_ID?.trim();
+  if (override) return override;
+
   if (process.platform === "darwin") {
     try {
       const output = execFileSync("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"], {
@@ -1269,7 +1281,10 @@ function parseWriterLease(path: string): { raw: string; record: StorageWriterLea
       (record.hostId !== null && typeof record.hostId !== "string") ||
       typeof record.hostname !== "string" ||
       typeof record.token !== "string" ||
-      typeof record.acquiredAt !== "string"
+      typeof record.acquiredAt !== "string" ||
+      (record.pidStartedAt !== undefined &&
+        record.pidStartedAt !== null &&
+        typeof record.pidStartedAt !== "string")
     ) {
       throw new Error("invalid lease fields");
     }
@@ -1286,6 +1301,32 @@ function pidDefinitelyExited(pid: number) {
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "ESRCH";
   }
+}
+
+// Linux exposes each process's start time (clock ticks since boot) as field 22
+// of /proc/<pid>/stat. Combined with the PID it identifies one process
+// instance: a lease whose PID is alive but whose start time differs belongs to
+// a process that died and had its PID reused (typical after a container
+// restart, where PIDs are handed out from 1 again). Returns null where the
+// identity is unavailable so callers fall back to the PID-only rule.
+function processStartIdentity(pid: number): string | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // The comm field is parenthesised and may contain spaces; fields resume
+    // after the last ")". State is field 3, so start time (field 22) is index 19.
+    const rest = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+    const startTime = rest[19];
+    return startTime && /^\d+$/u.test(startTime) ? startTime : null;
+  } catch {
+    return null;
+  }
+}
+
+function writerProcessReplaced(record: StorageWriterLeaseRecord) {
+  if (typeof record.pidStartedAt !== "string" || !record.pidStartedAt) return false;
+  const current = processStartIdentity(record.pid);
+  return current !== null && current !== record.pidStartedAt;
 }
 
 function isTermuxPrivateHomeStorage(rootDir: string) {
@@ -1631,6 +1672,7 @@ class FileTableStore {
           hostname: CURRENT_HOSTNAME,
           token,
           acquiredAt: new Date().toISOString(),
+          pidStartedAt: processStartIdentity(process.pid),
         };
         writeFileSync(writerLeaseOwnerPath(path), JSON.stringify(record, null, 2), {
           encoding: "utf8",
@@ -1662,7 +1704,8 @@ class FileTableStore {
         throw err;
       }
       const sameHost = writerLeaseBelongsToCurrentHost(existing.record) || isTermuxPrivateHomeStorage(this.rootDir);
-      if (!sameHost || !pidDefinitelyExited(existing.record.pid)) {
+      const holderGone = pidDefinitelyExited(existing.record.pid) || writerProcessReplaced(existing.record);
+      if (!sameHost || !holderGone) {
         throw new StorageWriterLeaseError(
           `Another Marinara Engine process (PID ${existing.record.pid}, host ${existing.record.hostname}) may be using ${this.rootDir}. ` +
             `Close it before retrying. If it no longer exists, verify every process is stopped and remove only ${path}.`,
@@ -1691,8 +1734,8 @@ class FileTableStore {
       }
       rmSync(stalePath, { recursive: true });
       logger.warn(
-        { previousPid: existing.record.pid, path },
-        "[file-storage] Reclaimed the writer lease after confirming its same-host PID exited.",
+        { previousPid: existing.record.pid, path, pidReused: !pidDefinitelyExited(existing.record.pid) },
+        "[file-storage] Reclaimed the writer lease after confirming its same-host writer process exited.",
       );
     }
     throw new StorageWriterLeaseError(`The storage writer lease at ${path} changed repeatedly; retry startup.`);

@@ -66,6 +66,7 @@ import {
   type ImagePromptMode,
   type ImageStyleProfile,
   type ImageStyleProfileSettings,
+  type PersonalExtension,
   type QuoteFormat,
   type Theme,
   type VideoGenerationUserSettings,
@@ -156,7 +157,11 @@ import { PromptOverridesEditor } from "./settings/PromptOverridesEditor";
 import { BackgroundPicker } from "./settings/BackgroundPicker";
 import { CustomGenerationParametersSettings } from "./settings/CustomGenerationParametersSettings";
 import { ExternalExtensionsSettings, PersonalExtensionsSettings } from "./settings/PersonalExtensionsSettings";
-import { usePersonalExtensionPolicy, useSetExternalExtensionsEnabled } from "../../hooks/use-personal-extensions";
+import {
+  personalExtensionKeys,
+  usePersonalExtensionPolicy,
+  useSetExternalExtensionsEnabled,
+} from "../../hooks/use-personal-extensions";
 import { useAgentImportPolicy, useSetAgentImportsEnabled } from "../../hooks/use-agents";
 import { DraftNumberInput } from "../ui/DraftNumberInput";
 import { ExportFormatDialog, type ExportFormatChoice } from "../ui/ExportFormatDialog";
@@ -7298,6 +7303,8 @@ function AdvancedSettings() {
   const [exportProfileDialogOpen, setExportProfileDialogOpen] = useState(false);
   const [refreshingSpa, setRefreshingSpa] = useState(false);
   const [adminSecret, setAdminSecret] = useState(() => localStorage.getItem(ADMIN_SECRET_STORAGE_KEY) ?? "");
+  const adminSecretInputRef = useRef<HTMLInputElement>(null);
+  const [verifyingAdminSecret, setVerifyingAdminSecret] = useState(false);
   const { data: extensionPolicy, isLoading: extensionPolicyLoading } = usePersonalExtensionPolicy();
   const setExternalExtensionsEnabled = useSetExternalExtensionsEnabled();
   const { data: agentImportPolicy, isLoading: agentImportPolicyLoading } = useAgentImportPolicy();
@@ -7667,16 +7674,52 @@ function AdvancedSettings() {
     },
   });
 
-  const saveAdminSecret = useCallback(() => {
-    const trimmed = adminSecret.trim();
-    if (trimmed) {
-      localStorage.setItem(ADMIN_SECRET_STORAGE_KEY, trimmed);
-      toast.success(localizeUi("ui.panels.advancedsettings.adminSecretSavedForThisBrowser"));
-    } else {
-      localStorage.removeItem(ADMIN_SECRET_STORAGE_KEY);
-      toast.info(localizeUi("ui.panels.advancedsettings.adminSecretCleared"));
+  const saveAdminSecret = useCallback(async () => {
+    // Mobile password managers can update the visible DOM value without
+    // emitting the event React uses to update this controlled state. Read the
+    // field itself so Save always persists exactly what the user can see.
+    const trimmed = (adminSecretInputRef.current?.value ?? adminSecret).trim();
+    setAdminSecret(trimmed);
+    const listQueryKey = personalExtensionKeys.list();
+    const policyQueryKey = personalExtensionKeys.policy();
+    setVerifyingAdminSecret(true);
+    try {
+      // Stop requests that started with the previous key before allowing the
+      // replacement to affect cache state. Their late responses must never
+      // repopulate privileged data after the replacement has been rejected.
+      await Promise.all([qc.cancelQueries({ queryKey: listQueryKey }), qc.cancelQueries({ queryKey: policyQueryKey })]);
+      if (trimmed) {
+        localStorage.setItem(ADMIN_SECRET_STORAGE_KEY, trimmed);
+        // A newly entered key has not earned access to data cached under the
+        // previous key. Hide that data before verifying the replacement.
+        qc.setQueryData<PersonalExtension[]>(listQueryKey, []);
+        void qc.resetQueries({ queryKey: policyQueryKey });
+        try {
+          const extensions = await api.get<PersonalExtension[]>("/personal-extensions");
+          qc.setQueryData(listQueryKey, extensions);
+          await qc.invalidateQueries({ queryKey: policyQueryKey });
+          toast.success(localizeUi("ui.panels.advancedsettings.adminSecretSavedForThisBrowser"));
+        } catch (error) {
+          void qc.resetQueries({ queryKey: listQueryKey });
+          void qc.resetQueries({ queryKey: policyQueryKey });
+          toast.error(
+            error instanceof ApiError && error.status === 403
+              ? localizeUi("ui.panels.advancedsettings.adminSecretServerVerificationFailed")
+              : error instanceof Error
+                ? error.message
+                : localizeUi("ui.panels.extensionsettings.personalExtensionsCouldNotBeLoaded"),
+          );
+        }
+      } else {
+        localStorage.removeItem(ADMIN_SECRET_STORAGE_KEY);
+        void qc.resetQueries({ queryKey: listQueryKey });
+        void qc.invalidateQueries({ queryKey: policyQueryKey });
+        toast.info(localizeUi("ui.panels.advancedsettings.adminSecretCleared"));
+      }
+    } finally {
+      setVerifyingAdminSecret(false);
     }
-  }, [adminSecret, localizeUi]);
+  }, [adminSecret, localizeUi, qc]);
 
   type UpdateChannelId = "stable" | "staging";
   const [updateChannel, setUpdateChannel] = useState<UpdateChannelId | null>(null);
@@ -7836,7 +7879,13 @@ function AdvancedSettings() {
       >
         <div className="flex min-w-0 flex-col gap-2">
           <input
+            ref={adminSecretInputRef}
             type="password"
+            name="marinara-admin-secret"
+            autoComplete="off"
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
             value={adminSecret}
             onChange={(e) => setAdminSecret(e.target.value)}
             placeholder={localizeUi("ui.panels.advancedsettings.adminSecret")}
@@ -7844,11 +7893,16 @@ function AdvancedSettings() {
           />
           <button
             type="button"
-            onClick={saveAdminSecret}
+            onClick={() => void saveAdminSecret()}
+            disabled={verifyingAdminSecret}
             className={cn(SETTINGS_PRIMARY_BUTTON_CLASS, "w-full gap-2 whitespace-nowrap")}
           >
             <span className="flex min-w-0 items-center justify-center gap-1.5">
-              <Save size="0.75rem" className="shrink-0" />
+              {verifyingAdminSecret ? (
+                <Loader2 size="0.75rem" className="shrink-0 animate-spin" />
+              ) : (
+                <Save size="0.75rem" className="shrink-0" />
+              )}
               {localizeUi("ui.noodle.noodlehome.save")}
             </span>
           </button>

@@ -6871,6 +6871,7 @@
   "ui.panels.advancedsettings.adminSecret": "ADMIN_SECRET",
   "ui.panels.advancedsettings.adminSecretCleared": "管理员密钥已清除",
   "ui.panels.advancedsettings.adminSecretSavedForThisBrowser": "管理员密钥已保存到此浏览器",
+  "ui.panels.advancedsettings.adminSecretServerVerificationFailed": "密钥已保存，但服务器拒绝了该密钥。请检查后重新保存。",
   "ui.panels.advancedsettings.allSelectedDataWasClearedRuntimeCachesWereReset": "所有选定数据均已清除，运行时缓存已立即重置。",
   "ui.panels.advancedsettings.andMayIncludeUnreleasedDevelopmentCommitsNotJustTagged": "，其中可能包含尚未发布的开发提交，而不只是带标签的发行版本。",
   "ui.panels.advancedsettings.androidApkAssetsAreWebviewShellsNotStandaloneApps": "Android APK 是 WebView 外壳，并非独立应用。请先在 Termux 中启动 Marinara。",

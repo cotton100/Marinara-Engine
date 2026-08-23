@@ -18,7 +18,7 @@ export const personalExtensionKeys = {
 export function usePersonalExtensions() {
   return useQuery({
     queryKey: personalExtensionKeys.list(),
-    queryFn: () => api.get<PersonalExtension[]>("/personal-extensions"),
+    queryFn: ({ signal }) => api.get<PersonalExtension[]>("/personal-extensions", { signal }),
     staleTime: 30_000,
   });
 }
@@ -26,15 +26,24 @@ export function usePersonalExtensions() {
 export function usePersonalExtensionRuntime() {
   return useQuery({
     queryKey: personalExtensionKeys.runtime(),
-    queryFn: () => api.get<PersonalClientExtensionRuntime[]>("/personal-extensions/runtime/client"),
+    queryFn: ({ signal }) =>
+      api.get<PersonalClientExtensionRuntime[]>("/personal-extensions/runtime/client", { signal }),
     staleTime: 30_000,
+    retry: 3,
+    refetchOnMount: "always",
+    refetchOnReconnect: "always",
+    refetchOnWindowFocus: "always",
+    // A phone can foreground the PWA before its VPN route is ready. Keep
+    // retrying only while the runtime request is failing; stop entirely after
+    // the first authoritative response, including a legitimate empty list.
+    refetchInterval: (query) => (query.state.status === "error" ? 5_000 : false),
   });
 }
 
 export function usePersonalExtensionPolicy() {
   return useQuery({
     queryKey: personalExtensionKeys.policy(),
-    queryFn: () => api.get<PersonalExtensionPolicy>("/personal-extensions/policy"),
+    queryFn: ({ signal }) => api.get<PersonalExtensionPolicy>("/personal-extensions/policy", { signal }),
     staleTime: 30_000,
   });
 }

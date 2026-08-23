@@ -5776,6 +5776,156 @@ test("Personal Extensions default to the Professor Mari-only locked workflow", a
   expect(warningColors.warning).toBe(warningColors.accent);
 });
 
+test("mobile Personal Extensions recover after DOM-only admin autofill", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chromium", "Mobile admin autofill recovery runs once.");
+
+  const adminSecret = "mobile-admin-secret-regression";
+  const rejectedSecret = "mobile-admin-secret-rejected";
+  const cachedExtensionName = "Cached Admin Extension";
+  const extensionFixture = {
+    id: "cached-admin-extension",
+    name: cachedExtensionName,
+    version: "1.0.0",
+    description: "Privileged cache regression fixture",
+    runtime: "client",
+    capabilities: [],
+    css: null,
+    js: "void 0;",
+    serverJs: null,
+    enabled: false,
+    contentHash: `sha256:${"a".repeat(64)}`,
+    approvedHash: null,
+    source: "professor_mari",
+    revisions: [],
+    installedAt: "2026-08-23T00:00:00.000Z",
+    createdAt: "2026-08-23T00:00:00.000Z",
+    updatedAt: "2026-08-23T00:00:00.000Z",
+  };
+  const observedSecrets: Array<string | null> = [];
+  let delayNextAuthorizedRequest = false;
+  let delayedAuthorizedRequests = 0;
+  let releaseDelayedAuthorizedRequest = () => {};
+  await page.route("**/api/personal-extensions", async (route) => {
+    const receivedSecret = route.request().headers()["x-admin-secret"] ?? null;
+    observedSecrets.push(receivedSecret);
+    const isDelayedAuthorizedRequest = receivedSecret === adminSecret && delayNextAuthorizedRequest;
+    if (isDelayedAuthorizedRequest) {
+      delayNextAuthorizedRequest = false;
+      delayedAuthorizedRequests += 1;
+      await new Promise<void>((resolve) => {
+        releaseDelayedAuthorizedRequest = resolve;
+      });
+    }
+    try {
+      await route.fulfill({
+        status: receivedSecret === adminSecret ? 200 : 403,
+        contentType: "application/json",
+        body: JSON.stringify(
+          receivedSecret === adminSecret
+            ? [extensionFixture]
+            : { error: "Invalid or missing X-Admin-Secret header" },
+        ),
+      });
+    } catch (error) {
+      // The fixed client aborts the delayed request when the key changes.
+      if (!isDelayedAuthorizedRequest) throw error;
+    }
+  });
+
+  await page.goto("/");
+  await page.locator('[data-tour="panel-settings"]').click();
+  await page.getByRole("tab", { name: "Addons" }).click();
+  const accessError = page.getByText("Personal Extension management needs localhost or Admin Access on this device.", {
+    exact: true,
+  });
+  await expect(accessError).toBeVisible();
+
+  await page.getByRole("tab", { name: "Advanced" }).click();
+  const adminInput = page.getByPlaceholder("ADMIN_SECRET");
+  await expect(adminInput).toBeVisible();
+  await adminInput.evaluate((element, value) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    if (!setter) throw new Error("HTMLInputElement value setter is unavailable");
+    setter.call(element, value);
+  }, `  ${adminSecret}  `);
+  await expect(adminInput).toHaveValue(`  ${adminSecret}  `);
+
+  await adminInput.locator("..").getByRole("button", { name: "Save" }).click();
+  await expect
+    .poll(() => observedSecrets.filter((value) => value === adminSecret).length, { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("marinara_admin_secret"))).toBe(adminSecret);
+
+  await page.getByRole("tab", { name: "Addons" }).click();
+  await expect(accessError).toHaveCount(0);
+  await expect(page.getByText(cachedExtensionName, { exact: true })).toBeVisible();
+
+  // Start a list request under the old valid key, hold its response, then
+  // replace the key. A late privileged response must not refill the cache.
+  delayNextAuthorizedRequest = true;
+  await page.reload();
+  const settingsButton = page.locator('[data-tour="panel-settings"]');
+  if ((await settingsButton.getAttribute("aria-pressed")) !== "true") {
+    await settingsButton.click();
+  }
+  const addonsTab = page.getByRole("tab", { name: "Addons" });
+  await expect(addonsTab).toBeVisible();
+  if ((await addonsTab.getAttribute("aria-selected")) !== "true") {
+    await addonsTab.click();
+  }
+  await expect.poll(() => delayedAuthorizedRequests).toBe(1);
+  await page.getByRole("tab", { name: "Advanced" }).click();
+  await expect(adminInput).toBeVisible();
+  await adminInput.evaluate((element, value) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    if (!setter) throw new Error("HTMLInputElement value setter is unavailable");
+    setter.call(element, value);
+  }, rejectedSecret);
+  await adminInput.locator("..").getByRole("button", { name: "Save" }).click();
+  await expect
+    .poll(() => observedSecrets.filter((value) => value === rejectedSecret).length, { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  releaseDelayedAuthorizedRequest();
+  await page.getByRole("tab", { name: "Addons" }).click();
+  await expect(page.getByText(cachedExtensionName, { exact: true })).toHaveCount(0);
+  await expect(accessError).toBeVisible();
+
+  await page.getByRole("tab", { name: "Advanced" }).click();
+  await adminInput.fill(adminSecret);
+  await adminInput.locator("..").getByRole("button", { name: "Save" }).click();
+  await page.getByRole("tab", { name: "Addons" }).click();
+  await expect(page.getByText(cachedExtensionName, { exact: true })).toBeVisible();
+
+  const authorizedBeforeReload = observedSecrets.filter((value) => value === adminSecret).length;
+  await page.reload();
+  await page.evaluate(async () => {
+    const { api } = await import("/src/lib/api-client.ts");
+    await api.get("/personal-extensions");
+  });
+  expect(observedSecrets.filter((value) => value === adminSecret).length).toBeGreaterThan(authorizedBeforeReload);
+});
+
+test("mobile Personal Extension runtime keeps recovering after startup network failures", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chromium", "Mobile runtime recovery runs once.");
+
+  let runtimeRequests = 0;
+  await page.route("**/api/personal-extensions/runtime/client", async (route) => {
+    runtimeRequests += 1;
+    await route.fulfill({
+      status: runtimeRequests >= 5 ? 200 : 503,
+      contentType: "application/json",
+      body: JSON.stringify(runtimeRequests >= 5 ? [] : { error: "Tailnet route is not ready" }),
+    });
+  });
+
+  await page.goto("/");
+  await expect.poll(() => runtimeRequests, { timeout: 20_000 }).toBeGreaterThanOrEqual(5);
+  await page.waitForTimeout(6_000);
+  expect(runtimeRequests).toBe(5);
+});
+
 test("external Agent imports require the Danger Zone gate and explicit capabilities", async ({
   page,
   request,

@@ -7,6 +7,7 @@ import {
   characters,
   chats,
   personalExtensionCoordination,
+  personalExtensionOperationJournal,
   type PersonalExtensionCoordinationRow,
 } from "../../db/schema/index.js";
 import { resolveEmbeddedCharacterId } from "../lorebook/character-book-sync.js";
@@ -516,10 +517,11 @@ export const proveCmbOperationVectorizeTransition: PersonalExtensionOperationVec
 };
 
 /**
- * Operator recovery may close a dispatching journal only while the exact CMB
- * ensemble still carries the durable generic ambiguity marker. The marker is
- * deliberately not removed here: recovery closes stale server authority, not
- * the user's manual reconciliation obligation.
+ * Operator recovery may close a dispatching journal only with one of two
+ * server-owned proofs: the exact CMB ensemble still carries its durable
+ * ambiguity marker, or one older mutation journal was superseded by a later
+ * fully-ready protected state. Recovery closes only stale server authority;
+ * it neither removes a current marker nor rewrites user storage or lorebooks.
  */
 export const proveCmbBlockedJournalRecovery: PersonalExtensionBlockedJournalRecoveryProof = async (tx, evidence) => {
   try {
@@ -540,9 +542,10 @@ export const proveCmbBlockedJournalRecovery: PersonalExtensionBlockedJournalReco
     const storageRevisions = evidence.resourceRevisions.filter((resource) => resource.kind === "extension-storage");
     const lorebookRevisions = evidence.resourceRevisions.filter((resource) => resource.kind === "lorebook");
     const storageRevision = storageRevisions[0];
+    const lorebookRevision = lorebookRevisions[0];
     const reasons = ensemble.runtime.manualRecoveryReasons;
     const setupReasons = reasons.filter((reason) => SETUP_RECOVERY_REASONS.has(reason));
-    return (
+    const markerStillCurrent =
       storageRevisions.length === 1 &&
       storageRevision?.resourceId === evidence.journal.extensionId &&
       storageRevision.presence === "present" &&
@@ -553,8 +556,57 @@ export const proveCmbBlockedJournalRecovery: PersonalExtensionBlockedJournalReco
         ? lorebookRevisions.length === 0
         : lorebookRevisions.every(
             (resource) => resource.resourceId === ensemble.lorebookId && resource.presence === "present",
-          ))
-    );
+          ));
+    if (markerStillCurrent) return true;
+
+    // A crash can durably commit the operation's later protected writes while
+    // leaving an older dispatching journal behind. Once that journal is
+    // orphaned and coordination is blocked, it prevents reactivation and later
+    // admission. The journal is safely superseded only when it is the sole
+    // unresolved record, both protected resources advanced, the exact target
+    // reports a later successful sync, and the current CMB resources already
+    // passed the full server-owned validation above.
+    if (
+      evidence.journal.operationKind !== "mutation" ||
+      evidence.journal.fence >= evidence.coordination.fence ||
+      storageRevisions.length !== 1 ||
+      storageRevision?.resourceId !== evidence.journal.extensionId ||
+      storageRevision.presence !== "present" ||
+      typeof storageRevision.resourceRevision !== "number" ||
+      fresh.configRevision <= storageRevision.resourceRevision ||
+      ensemble.lorebookId === "" ||
+      lorebookRevisions.length !== 1 ||
+      lorebookRevision?.resourceId !== ensemble.lorebookId ||
+      lorebookRevision.presence !== "present" ||
+      typeof lorebookRevision.resourceRevision !== "number" ||
+      !ensemble.autoSync ||
+      ensemble.runtime.semanticStatus !== "ready" ||
+      ensemble.runtime.pendingEmbeddingProfile !== null ||
+      ensemble.runtime.manualRecoveryReasons.length !== 0 ||
+      !sameEmbeddingProfile(ensemble.runtime.lastSuccessfulEmbeddingProfile, ensemble.embedding) ||
+      !exactIsoTimestamp(ensemble.runtime.lastSuccessfulSyncAt)
+    ) {
+      return false;
+    }
+    const registry = parsePersonalExtensionProtectedResourceRegistry(evidence.coordination.protectedLorebookRegistry);
+    const currentLorebookRevision = registry.lorebooks[ensemble.lorebookId]?.resourceRevision;
+    const lastSuccessfulSyncAt = ensemble.runtime.lastSuccessfulSyncAt;
+    if (
+      registry.extensionStorage.resourceRevision !== fresh.configRevision ||
+      typeof currentLorebookRevision !== "number" ||
+      currentLorebookRevision <= lorebookRevision.resourceRevision ||
+      typeof lastSuccessfulSyncAt !== "string" ||
+      Date.parse(lastSuccessfulSyncAt) <= Date.parse(evidence.journal.updatedAt)
+    ) {
+      return false;
+    }
+    const unresolved = (
+      await tx
+        .select()
+        .from(personalExtensionOperationJournal)
+        .where(eq(personalExtensionOperationJournal.extensionId, evidence.journal.extensionId))
+    ).filter((journal) => journal.phase !== "final");
+    return unresolved.length === 1 && unresolved[0]?.operationDigest === evidence.journal.operationDigest;
   } catch {
     return false;
   }

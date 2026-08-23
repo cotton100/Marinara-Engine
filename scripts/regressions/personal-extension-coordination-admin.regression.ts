@@ -1111,6 +1111,148 @@ try {
     "dispatching recovery must preserve the manual mutation-ambiguous marker",
   );
 
+  const supersededBase = (await coordinationRow())!;
+  const supersededRegistry = JSON.parse(supersededBase.protectedLorebookRegistry) as {
+    version: number;
+    extensionStorage: { resourceRevision: number };
+    lorebooks: Record<string, { resourceRevision: number }>;
+  };
+  const supersededJournalStorageRevision = supersededBase.configRevision;
+  const supersededJournalLorebookRevision = supersededRegistry.lorebooks[lorebook.id]!.resourceRevision;
+  const supersededCurrentRevision = supersededJournalStorageRevision + 2;
+  const supersededCurrentLorebookRevision = supersededJournalLorebookRevision + 44;
+  supersededRegistry.extensionStorage.resourceRevision = supersededCurrentRevision;
+  supersededRegistry.lorebooks[lorebook.id]!.resourceRevision = supersededCurrentLorebookRevision;
+  const supersededJournalAt = "2026-08-22T18:35:44.448Z";
+  const supersededSuccessfulAt = "2026-08-22T18:37:52.923Z";
+  const supersededConfig = config();
+  supersededConfig.ensembles[0]!.runtime.lastSuccessfulSyncAt = supersededSuccessfulAt;
+  await setConfigValue(supersededConfig);
+  const supersededBlockedFence = supersededBase.fence + 2;
+  await db
+    .update(personalExtensionCoordination)
+    .set({
+      mode: "blocked",
+      fence: supersededBlockedFence,
+      configRevision: supersededCurrentRevision,
+      protectedLorebookRegistry: JSON.stringify(supersededRegistry),
+      updatedAt: supersededSuccessfulAt,
+    })
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  const supersededDigest = "e".repeat(64);
+  await db.insert(personalExtensionOperationJournal).values({
+    operationDigest: supersededDigest,
+    extensionId: EXTENSION_ID,
+    targetEnsembleId: ENSEMBLE_ID,
+    operationKind: "mutation",
+    fence: supersededBase.fence,
+    phase: "dispatching",
+    protectedResourceRevisions: JSON.stringify([
+      {
+        kind: "extension-storage",
+        resourceId: EXTENSION_ID,
+        presence: "present",
+        resourceRevision: supersededJournalStorageRevision,
+      },
+      {
+        kind: "lorebook",
+        resourceId: lorebook.id,
+        presence: "present",
+        resourceRevision: supersededJournalLorebookRevision,
+      },
+    ]),
+    preparedAt: supersededJournalAt,
+    dispatchingAt: supersededJournalAt,
+    finalAt: null,
+    updatedAt: supersededJournalAt,
+  });
+  await fileDb._fileStore.flushStrict();
+  const supersededStorageBeforeRecovery = await settings.get(STORAGE_KEY);
+  const supersededRecovery = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-blocked"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(supersededRecovery.statusCode, 200, supersededRecovery.body);
+  assert.equal(supersededRecovery.json().mode, "inactive");
+  assert.equal((await coordinationRow())?.fence, supersededBlockedFence + 1);
+  assert.equal(
+    (
+      await db
+        .select()
+        .from(personalExtensionOperationJournal)
+        .where(eq(personalExtensionOperationJournal.operationDigest, supersededDigest))
+    ).length,
+    0,
+    "a later fully-ready protected state must supersede its single stale dispatching journal",
+  );
+  assert.equal(
+    await settings.get(STORAGE_KEY),
+    supersededStorageBeforeRecovery,
+    "superseded recovery must not rewrite current CMB storage",
+  );
+
+  const missingSuccessDigest = "f".repeat(64);
+  const missingSuccessFence = (await coordinationRow())!.fence + 1;
+  await setConfig();
+  await db
+    .update(personalExtensionCoordination)
+    .set({ mode: "blocked", fence: missingSuccessFence, updatedAt: new Date().toISOString() })
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  await db.insert(personalExtensionOperationJournal).values({
+    operationDigest: missingSuccessDigest,
+    extensionId: EXTENSION_ID,
+    targetEnsembleId: ENSEMBLE_ID,
+    operationKind: "mutation",
+    fence: missingSuccessFence - 1,
+    phase: "dispatching",
+    protectedResourceRevisions: JSON.stringify([
+      {
+        kind: "extension-storage",
+        resourceId: EXTENSION_ID,
+        presence: "present",
+        resourceRevision: supersededCurrentRevision - 1,
+      },
+      {
+        kind: "lorebook",
+        resourceId: lorebook.id,
+        presence: "present",
+        resourceRevision: supersededCurrentLorebookRevision - 1,
+      },
+    ]),
+    preparedAt: supersededJournalAt,
+    dispatchingAt: supersededJournalAt,
+    finalAt: null,
+    updatedAt: supersededJournalAt,
+  });
+  const missingSuccessRecovery = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-blocked"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(missingSuccessRecovery.statusCode, 409, missingSuccessRecovery.body);
+  assert.equal(missingSuccessRecovery.json().code, "coordination-validation-failed");
+  assert.equal((await coordinationRow())?.mode, "blocked");
+  assert.equal(
+    (
+      await db
+        .select()
+        .from(personalExtensionOperationJournal)
+        .where(eq(personalExtensionOperationJournal.operationDigest, missingSuccessDigest))
+    ).length,
+    1,
+    "a later revision without a later successful-sync proof must remain blocked",
+  );
+  await db
+    .delete(personalExtensionOperationJournal)
+    .where(eq(personalExtensionOperationJournal.operationDigest, missingSuccessDigest));
+  await db
+    .update(personalExtensionCoordination)
+    .set({ mode: "inactive", updatedAt: new Date().toISOString() })
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+
   await setConfig();
   const missingMarkerDigest = "d".repeat(64);
   const missingMarkerAt = new Date().toISOString();

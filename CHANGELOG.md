@@ -6,6 +6,7 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ### Fixed
 
+- Personal Extension coordination can now request a strict lorebook-entry projection that replaces raw embedding arrays with `missing`, `ready`, or `invalid`, reducing sync payloads while leaving the existing entry contract unchanged.
 - Mobile Admin Access now verifies a replacement key before saving it, preserves the last working key when verification fails, and restores Personal Extension access without allowing delayed requests to overwrite the recovered state.
 
 ## [2.4.3]

@@ -612,6 +612,14 @@ export async function lorebooksRoutes(app: FastifyInstance) {
     }
   });
 
+  app.get<{ Params: { id: string } }>("/:id/coordination/entry-projections", async (req, reply) => {
+    try {
+      return await storage.listEntryProjectionsFenced(readCoordinationAuthority(req.headers), req.params.id);
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
   app.post<{ Params: { id: string }; Body: unknown }>("/:id/coordination/entries", async (req, reply) => {
     try {
       const input = personalExtensionCoordinationLorebookEntryCreateRequestSchema.parse(req.body);

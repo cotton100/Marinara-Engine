@@ -28,6 +28,7 @@ import {
   personalExtensionCoordinationOperationGrantSchema,
   personalExtensionCoordinationReleaseResponseSchema,
   personalExtensionCoordinationRevisionedStorageResponseSchema,
+  personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema,
   personalExtensionCoordinationRevisionedLorebookEntryListResponseSchema,
   personalExtensionCoordinationRevisionedLorebookEntryResponseSchema,
   personalExtensionCoordinationRevisionedLorebookListResponseSchema,
@@ -46,6 +47,7 @@ import {
   type PersonalExtensionCoordinationLorebook,
   type PersonalExtensionCoordinationLorebookClearVectorsResponse,
   type PersonalExtensionCoordinationLorebookEntry,
+  type PersonalExtensionCoordinationLorebookEntryProjection,
   type PersonalExtensionCoordinationLorebookVectorizeRequest,
   type PersonalExtensionCoordinationLorebookVectorizeResponse,
   type PersonalExtensionCoordinationDirtyResponse,
@@ -332,6 +334,9 @@ export interface PersonalExtensionCoordinationFacade {
     listEntries(
       input: PersonalExtensionCoordinationLorebookIdInput,
     ): Promise<PersonalExtensionCoordinationLorebookEntry[]>;
+    listEntryProjections(
+      input: PersonalExtensionCoordinationLorebookIdInput,
+    ): Promise<PersonalExtensionCoordinationLorebookEntryProjection[]>;
     getEntry(
       input: PersonalExtensionCoordinationLorebookEntryIdInput,
     ): Promise<PersonalExtensionCoordinationLorebookEntry>;
@@ -1304,6 +1309,26 @@ async function listLorebookEntries(
   return response.items;
 }
 
+async function listLorebookEntryProjections(
+  facade: PersonalExtensionCoordinationFacade,
+  input: PersonalExtensionCoordinationLorebookIdInput,
+) {
+  const privateState = privateStateFor(facade);
+  const parsed = fixedInput<{ lorebookId: unknown; signal?: unknown }>(input, ["lorebookId", "signal"], ["lorebookId"]);
+  const lorebookId = closedIdentifier(parsed.lorebookId);
+  const signal = readSignal(parsed.signal);
+  const response = await lorebookRequest(
+    privateState,
+    `/${encodedIdentifier(lorebookId)}/coordination/entry-projections`,
+    "GET",
+    personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema,
+    { signal },
+  );
+  if (response.items.some((entry) => entry.lorebookId !== lorebookId)) throw genericUnavailable();
+  rememberLorebookRevision(privateState, lorebookId, response.resourceRevision);
+  return response.items;
+}
+
 async function getLorebookEntry(
   facade: PersonalExtensionCoordinationFacade,
   input: PersonalExtensionCoordinationLorebookEntryIdInput,
@@ -2076,6 +2101,8 @@ export function issuePersonalExtensionCoordinationFacade(options: {
     list: (requestOptions?: PersonalExtensionCoordinationSignalOptions) => listLorebooks(facade, requestOptions),
     get: (input: PersonalExtensionCoordinationLorebookIdInput) => getLorebook(facade, input),
     listEntries: (input: PersonalExtensionCoordinationLorebookIdInput) => listLorebookEntries(facade, input),
+    listEntryProjections: (input: PersonalExtensionCoordinationLorebookIdInput) =>
+      listLorebookEntryProjections(facade, input),
     getEntry: (input: PersonalExtensionCoordinationLorebookEntryIdInput) => getLorebookEntry(facade, input),
   };
   const events = {

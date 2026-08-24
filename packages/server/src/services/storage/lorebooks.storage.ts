@@ -30,6 +30,7 @@ import {
 import { collectEffectivelyDisabledFolderIds, collectFolderSubtreeIds } from "@marinara-engine/shared";
 import {
   personalExtensionCoordinationLorebookEntrySchema,
+  personalExtensionCoordinationLorebookEntryProjectionSchema,
   personalExtensionCoordinationLorebookSchema,
 } from "@marinara-engine/shared";
 import { normalizeTimestampOverrides, type TimestampOverrides } from "../import/import-timestamps.js";
@@ -161,6 +162,9 @@ const COORDINATION_LOREBOOK_KEYS: readonly string[] = Object.freeze(
 const COORDINATION_ENTRY_KEYS: readonly string[] = Object.freeze(
   Object.keys(personalExtensionCoordinationLorebookEntrySchema.shape),
 );
+const COORDINATION_ENTRY_PROJECTION_KEYS: readonly string[] = Object.freeze(
+  Object.keys(personalExtensionCoordinationLorebookEntryProjectionSchema.shape),
+);
 
 function projectOntoContract<T>(value: T, keys: readonly string[]): T {
   const source = value as unknown as Record<string, unknown>;
@@ -173,6 +177,33 @@ function projectOntoContract<T>(value: T, keys: readonly string[]): T {
 
 const coordinationLorebookView = <T>(value: T): T => projectOntoContract(value, COORDINATION_LOREBOOK_KEYS);
 const coordinationEntryView = <T>(value: T): T => projectOntoContract(value, COORDINATION_ENTRY_KEYS);
+
+function coordinationEmbeddingState(value: unknown): "missing" | "ready" | "invalid" {
+  let parsed = value;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return "invalid";
+    }
+  }
+  if (parsed === null) return "missing";
+  if (!Array.isArray(parsed) || parsed.length === 0) return "invalid";
+  for (let index = 0; index < parsed.length; index += 1) {
+    if (!Object.hasOwn(parsed, index) || typeof parsed[index] !== "number" || !Number.isFinite(parsed[index])) {
+      return "invalid";
+    }
+  }
+  return "ready";
+}
+
+function coordinationEntryProjectionRow(row: Record<string, unknown>) {
+  const value = parseEntryRow({ ...row, embedding: null });
+  return projectOntoContract(
+    { ...value, embeddingState: coordinationEmbeddingState(row.embedding) },
+    COORDINATION_ENTRY_PROJECTION_KEYS,
+  );
+}
 
 function parseLorebookRow(row: Record<string, unknown>) {
   const characterIds = resolveLinkIds(row.characterIds, row.characterId);
@@ -818,6 +849,24 @@ export function createLorebooksStorage(db: DB) {
           .orderBy(lorebookEntries.order);
         return {
           items: rows.map((row) => coordinationEntryView(parseEntryRow(row as Record<string, unknown>))),
+          resourceRevision,
+        };
+      });
+    },
+
+    async listEntryProjectionsFenced(context: PersonalExtensionLeaseAuthority, lorebookId: string) {
+      return getPersonalExtensionCoordinationService(db).runFencedResourceRead(context, async (readDb, registry) => {
+        const resourceRevision = registeredLorebookRevision(registry, lorebookId);
+        const bookRows = await readDb.select({ id: lorebooks.id }).from(lorebooks).where(eq(lorebooks.id, lorebookId));
+        if (!bookRows[0]) throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
+        const rows = await readDb
+          .select()
+          .from(lorebookEntries)
+          .where(eq(lorebookEntries.lorebookId, lorebookId))
+          .orderBy(lorebookEntries.order);
+        return {
+          projection: "embedding-state-v1" as const,
+          items: rows.map((row) => coordinationEntryProjectionRow(row as Record<string, unknown>)),
           resourceRevision,
         };
       });

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   personalExtensionCoordinationLorebookEntrySchema,
+  personalExtensionCoordinationLorebookEntryProjectionSchema,
   personalExtensionCoordinationLorebookSchema,
+  personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema,
   personalExtensionCoordinationRevisionedLorebookResponseSchema,
 } from "../../packages/shared/dist/index.js";
 
@@ -178,6 +180,11 @@ function entryFixture(name = "Protected entry") {
   };
 }
 
+function entryProjectionFixture(name = "Protected entry", embeddingState: "missing" | "ready" | "invalid" = "missing") {
+  const { embedding: _embedding, ...entry } = entryFixture(name);
+  return { ...entry, embeddingState };
+}
+
 assert.equal(
   personalExtensionCoordinationLorebookSchema.safeParse(lorebookFixture()).success,
   true,
@@ -187,6 +194,19 @@ assert.equal(
   personalExtensionCoordinationLorebookEntrySchema.safeParse(entryFixture()).success,
   true,
   "the facade regression must use the exact closed lorebook entry response shape",
+);
+assert.equal(
+  personalExtensionCoordinationLorebookEntryProjectionSchema.safeParse(entryProjectionFixture()).success,
+  true,
+  "the facade regression must use the exact closed lorebook entry projection shape",
+);
+assert.equal(
+  personalExtensionCoordinationLorebookEntryProjectionSchema.safeParse({
+    ...entryProjectionFixture(),
+    embedding: [0.1, 0.2],
+  }).success,
+  false,
+  "the compact projection contract must reject raw embeddings",
 );
 
 class MemoryStorage implements Storage {
@@ -357,6 +377,19 @@ const trustedFetch: typeof fetch = async (input, init = {}) => {
     }
     if (url === `/api/lorebooks/${LOREBOOK_ID}/coordination/entries` && method === "GET") {
       return json(200, { items: [entryFixture()], resourceRevision: lorebookRevision });
+    }
+    if (url === `/api/lorebooks/${LOREBOOK_ID}/coordination/entry-projections` && method === "GET") {
+      const payload = {
+        projection: "embedding-state-v1",
+        items: [entryProjectionFixture()],
+        resourceRevision: lorebookRevision,
+      };
+      assert.equal(
+        personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema.safeParse(payload).success,
+        true,
+        "the fake compact projection response must satisfy the exact closed wire schema",
+      );
+      return json(200, payload);
     }
     if (url === `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}` && method === "GET") {
       return json(200, { value: entryFixture(), resourceRevision: lorebookRevision });
@@ -1214,6 +1247,7 @@ assert.deepEqual(await facade.storage.get(), { value: { ensemble: "fixture" }, c
 assert.deepEqual(await facade.lorebooks.list(), [lorebookFixture()]);
 assert.deepEqual(await facade.lorebooks.get({ lorebookId: LOREBOOK_ID }), lorebookFixture());
 assert.deepEqual(await facade.lorebooks.listEntries({ lorebookId: LOREBOOK_ID }), [entryFixture()]);
+assert.deepEqual(await facade.lorebooks.listEntryProjections({ lorebookId: LOREBOOK_ID }), [entryProjectionFixture()]);
 assert.deepEqual(await facade.lorebooks.getEntry({ lorebookId: LOREBOOK_ID, entryId: ENTRY_ID }), entryFixture());
 blockNextRequest = true;
 accelerateNextDeadline = true;
@@ -1639,6 +1673,7 @@ assert.deepEqual(
     `/api/personal-extensions/${EXTENSION_ID}/coordination/storage`,
     "/api/lorebooks/coordination",
     `/api/lorebooks/${LOREBOOK_ID}/coordination`,
+    `/api/lorebooks/${LOREBOOK_ID}/coordination/entry-projections`,
     `/api/lorebooks/${LOREBOOK_ID}/coordination/entries`,
     `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}`,
     `/api/lorebooks/${LOREBOOK_ID}/coordination/vectorize`,

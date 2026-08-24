@@ -265,6 +265,14 @@ export const personalExtensionCoordinationLorebookEntrySchema = z
   })
   .strict();
 
+export const personalExtensionCoordinationLorebookEntryProjectionSchema =
+  personalExtensionCoordinationLorebookEntrySchema
+    .omit({ embedding: true })
+    .extend({
+      embeddingState: z.enum(["missing", "ready", "invalid"]),
+    })
+    .strict();
+
 export const personalExtensionCoordinationRevisionedLorebookResponseSchema = z
   .object({
     value: personalExtensionCoordinationLorebookSchema,
@@ -288,6 +296,14 @@ export const personalExtensionCoordinationRevisionedLorebookEntryResponseSchema 
 export const personalExtensionCoordinationRevisionedLorebookEntryListResponseSchema = z
   .object({
     items: z.array(personalExtensionCoordinationLorebookEntrySchema),
+    resourceRevision: personalExtensionCoordinationFenceSchema,
+  })
+  .strict();
+
+export const personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema = z
+  .object({
+    projection: z.literal("embedding-state-v1"),
+    items: z.array(personalExtensionCoordinationLorebookEntryProjectionSchema),
     resourceRevision: personalExtensionCoordinationFenceSchema,
   })
   .strict();
@@ -674,6 +690,9 @@ export type PersonalExtensionCoordinationLorebook = z.infer<typeof personalExten
 export type PersonalExtensionCoordinationLorebookEntry = z.infer<
   typeof personalExtensionCoordinationLorebookEntrySchema
 >;
+export type PersonalExtensionCoordinationLorebookEntryProjection = z.infer<
+  typeof personalExtensionCoordinationLorebookEntryProjectionSchema
+>;
 export type PersonalExtensionCoordinationRevisionedLorebookResponse = z.infer<
   typeof personalExtensionCoordinationRevisionedLorebookResponseSchema
 >;
@@ -685,6 +704,9 @@ export type PersonalExtensionCoordinationRevisionedLorebookEntryResponse = z.inf
 >;
 export type PersonalExtensionCoordinationRevisionedLorebookEntryListResponse = z.infer<
   typeof personalExtensionCoordinationRevisionedLorebookEntryListResponseSchema
+>;
+export type PersonalExtensionCoordinationRevisionedLorebookEntryProjectionListResponse = z.infer<
+  typeof personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema
 >;
 export type PersonalExtensionCoordinationLorebookDeleteResponse = z.infer<
   typeof personalExtensionCoordinationLorebookDeleteResponseSchema

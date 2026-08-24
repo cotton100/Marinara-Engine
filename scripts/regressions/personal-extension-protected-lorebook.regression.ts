@@ -12,6 +12,7 @@ import {
   PERSONAL_EXTENSION_COORDINATION_HOLDER_HEADER,
   PERSONAL_EXTENSION_COORDINATION_LEASE_TOKEN_HEADER,
   personalExtensionCoordinationRevisionedLorebookEntryListResponseSchema,
+  personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema,
   personalExtensionCoordinationRevisionedLorebookEntryResponseSchema,
   personalExtensionCoordinationRevisionedLorebookListResponseSchema,
   personalExtensionCoordinationRevisionedLorebookResponseSchema,
@@ -535,6 +536,74 @@ try {
     "fenced entry list must include the guarded entry",
   );
   assertContractShape("list entries", personalExtensionCoordinationRevisionedLorebookEntryListResponseSchema, guardedEntriesList.json());
+  const missingProjectionResponse = await app.inject({
+    method: "GET",
+    url: `${guardedUrl(protectedBook.id)}/entry-projections`,
+    headers: guardedHeaders,
+  });
+  assert.equal(missingProjectionResponse.statusCode, 200, missingProjectionResponse.body);
+  assertContractShape(
+    "list entry projections",
+    personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema,
+    missingProjectionResponse.json(),
+  );
+  assert.equal(missingProjectionResponse.json().projection, "embedding-state-v1");
+  const missingProjection = missingProjectionResponse
+    .json()
+    .items.find((entry: { id: string }) => entry.id === protectedEntry.id);
+  assert.equal(missingProjection?.embeddingState, "missing");
+  assert.equal(Object.hasOwn(missingProjection ?? {}, "embedding"), false, "compact projections must omit raw vectors");
+
+  const largeEmbedding = Array.from({ length: 4096 }, () => 0.12345678901234567);
+  await db
+    .update(lorebookEntries)
+    .set({ embedding: JSON.stringify(largeEmbedding) })
+    .where(eq(lorebookEntries.id, protectedEntry.id));
+  const largeRawResponse = await app.inject({
+    method: "GET",
+    url: `${guardedUrl(protectedBook.id)}/entries`,
+    headers: guardedHeaders,
+  });
+  const largeProjectionResponse = await app.inject({
+    method: "GET",
+    url: `${guardedUrl(protectedBook.id)}/entry-projections`,
+    headers: guardedHeaders,
+  });
+  assert.equal(largeRawResponse.statusCode, 200, largeRawResponse.body);
+  assert.equal(largeProjectionResponse.statusCode, 200, largeProjectionResponse.body);
+  assertContractShape(
+    "large list entry projections",
+    personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema,
+    largeProjectionResponse.json(),
+  );
+  const readyProjection = largeProjectionResponse
+    .json()
+    .items.find((entry: { id: string }) => entry.id === protectedEntry.id);
+  assert.equal(readyProjection?.embeddingState, "ready");
+  assert.equal(Object.hasOwn(readyProjection ?? {}, "embedding"), false, "ready projections must still omit vectors");
+  assert.ok(
+    Buffer.byteLength(largeProjectionResponse.body) * 10 < Buffer.byteLength(largeRawResponse.body),
+    "the compact projection must reduce a large-vector list payload by at least 90%",
+  );
+
+  for (const invalidEmbedding of ["[]", "not-json"]) {
+    await db
+      .update(lorebookEntries)
+      .set({ embedding: invalidEmbedding })
+      .where(eq(lorebookEntries.id, protectedEntry.id));
+    const invalidProjectionResponse = await app.inject({
+      method: "GET",
+      url: `${guardedUrl(protectedBook.id)}/entry-projections`,
+      headers: guardedHeaders,
+    });
+    assert.equal(invalidProjectionResponse.statusCode, 200, invalidProjectionResponse.body);
+    const invalidProjection = invalidProjectionResponse
+      .json()
+      .items.find((entry: { id: string }) => entry.id === protectedEntry.id);
+    assert.equal(invalidProjection?.embeddingState, "invalid");
+    assert.equal(Object.hasOwn(invalidProjection ?? {}, "embedding"), false);
+  }
+  await db.update(lorebookEntries).set({ embedding: null }).where(eq(lorebookEntries.id, protectedEntry.id));
   const guardedGetEntry = await app.inject({
     method: "GET",
     url: `${guardedUrl(protectedBook.id)}/entries/${encodeURIComponent(guardedEntryId)}`,

@@ -4,6 +4,10 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+### Fixed
+
+- Mobile Admin Access now verifies a replacement key before saving it, preserves the last working key when verification fails, and restores Personal Extension access without allowing delayed requests to overwrite the recovered state.
+
 ## [2.4.3]
 
 ### Added

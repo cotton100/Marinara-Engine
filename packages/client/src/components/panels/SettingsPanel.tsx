@@ -67,6 +67,7 @@ import {
   type ImageStyleProfile,
   type ImageStyleProfileSettings,
   type PersonalExtension,
+  type PersonalExtensionPolicy,
   type QuoteFormat,
   type Theme,
   type VideoGenerationUserSettings,
@@ -7679,6 +7680,7 @@ function AdvancedSettings() {
     // emitting the event React uses to update this controlled state. Read the
     // field itself so Save always persists exactly what the user can see.
     const trimmed = (adminSecretInputRef.current?.value ?? adminSecret).trim();
+    const previousSecret = localStorage.getItem(ADMIN_SECRET_STORAGE_KEY)?.trim() ?? "";
     setAdminSecret(trimmed);
     const listQueryKey = personalExtensionKeys.list();
     const policyQueryKey = personalExtensionKeys.policy();
@@ -7689,25 +7691,69 @@ function AdvancedSettings() {
       // repopulate privileged data after the replacement has been rejected.
       await Promise.all([qc.cancelQueries({ queryKey: listQueryKey }), qc.cancelQueries({ queryKey: policyQueryKey })]);
       if (trimmed) {
-        localStorage.setItem(ADMIN_SECRET_STORAGE_KEY, trimmed);
         // A newly entered key has not earned access to data cached under the
         // previous key. Hide that data before verifying the replacement.
         qc.setQueryData<PersonalExtension[]>(listQueryKey, []);
         void qc.resetQueries({ queryKey: policyQueryKey });
         try {
-          const extensions = await api.get<PersonalExtension[]>("/personal-extensions");
+          // Send the candidate explicitly. It must not replace the browser's
+          // last known key until the server has accepted it.
+          const extensions = await api.get<PersonalExtension[]>("/personal-extensions", {
+            headers: { "X-Admin-Secret": trimmed },
+          });
+          // Queries can refetch while the explicit verification is in flight.
+          // Cancel that second generation before committing the accepted key
+          // and its authoritative list to cache.
+          await Promise.all([
+            qc.cancelQueries({ queryKey: listQueryKey }),
+            qc.cancelQueries({ queryKey: policyQueryKey }),
+          ]);
+          localStorage.setItem(ADMIN_SECRET_STORAGE_KEY, trimmed);
           qc.setQueryData(listQueryKey, extensions);
           await qc.invalidateQueries({ queryKey: policyQueryKey });
           toast.success(localizeUi("ui.panels.advancedsettings.adminSecretSavedForThisBrowser"));
         } catch (error) {
-          void qc.resetQueries({ queryKey: listQueryKey });
-          void qc.resetQueries({ queryKey: policyQueryKey });
+          // Mobile autofill may have replaced only the DOM value. Put both the
+          // controlled state and visible field back on the key that remains in
+          // storage, then re-verify it before restoring privileged data.
+          setAdminSecret(previousSecret);
+          if (adminSecretInputRef.current) adminSecretInputRef.current.value = previousSecret;
+          let restoredPreviousAccess = false;
+          if (previousSecret && previousSecret !== trimmed) {
+            try {
+              const headers = { "X-Admin-Secret": previousSecret };
+              const [extensions, policy] = await Promise.all([
+                api.get<PersonalExtension[]>("/personal-extensions", { headers }),
+                api.get<PersonalExtensionPolicy>("/personal-extensions/policy", { headers }),
+              ]);
+              await Promise.all([
+                qc.cancelQueries({ queryKey: listQueryKey }),
+                qc.cancelQueries({ queryKey: policyQueryKey }),
+              ]);
+              qc.setQueryData(listQueryKey, extensions);
+              qc.setQueryData(policyQueryKey, policy);
+              restoredPreviousAccess = true;
+            } catch {
+              // The previous key is no longer accepted either. Keep privileged
+              // data hidden and let the user provide the current server key.
+            }
+          }
+          if (!restoredPreviousAccess) {
+            void qc.resetQueries({ queryKey: listQueryKey });
+            void qc.resetQueries({ queryKey: policyQueryKey });
+          }
+          const isRejectedKey =
+            error instanceof ApiError &&
+            error.status === 403 &&
+            error.message === "Invalid or missing X-Admin-Secret header";
           toast.error(
-            error instanceof ApiError && error.status === 403
+            isRejectedKey
               ? localizeUi("ui.panels.advancedsettings.adminSecretServerVerificationFailed")
-              : error instanceof Error
-                ? error.message
-                : localizeUi("ui.panels.extensionsettings.personalExtensionsCouldNotBeLoaded"),
+              : error instanceof ApiError && error.status === 403
+                ? localizeUi("ui.panels.advancedsettings.adminSecretServerVerificationUnavailable")
+                : error instanceof Error
+                  ? error.message
+                  : localizeUi("ui.panels.extensionsettings.personalExtensionsCouldNotBeLoaded"),
           );
         }
       } else {
@@ -7882,7 +7928,7 @@ function AdvancedSettings() {
             ref={adminSecretInputRef}
             type="password"
             name="marinara-admin-secret"
-            autoComplete="off"
+            autoComplete="new-password"
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}

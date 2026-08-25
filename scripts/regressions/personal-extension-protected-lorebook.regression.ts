@@ -553,6 +553,16 @@ try {
     .items.find((entry: { id: string }) => entry.id === protectedEntry.id);
   assert.equal(missingProjection?.embeddingState, "missing");
   assert.equal(Object.hasOwn(missingProjection ?? {}, "embedding"), false, "compact projections must omit raw vectors");
+  const ordinaryMissingProjectionResponse = await app.inject({
+    method: "GET",
+    url: `/api/lorebooks/${protectedBook.id}/entry-projections`,
+  });
+  assert.equal(ordinaryMissingProjectionResponse.statusCode, 200, ordinaryMissingProjectionResponse.body);
+  assert.deepEqual(
+    ordinaryMissingProjectionResponse.json(),
+    missingProjectionResponse.json().items,
+    "ordinary missing projections must match the fenced row shape",
+  );
 
   const largeEmbedding = Array.from({ length: 4096 }, () => 0.12345678901234567);
   await db
@@ -569,8 +579,18 @@ try {
     url: `${guardedUrl(protectedBook.id)}/entry-projections`,
     headers: guardedHeaders,
   });
+  const ordinaryRawResponse = await app.inject({
+    method: "GET",
+    url: `/api/lorebooks/${protectedBook.id}/entries`,
+  });
+  const ordinaryProjectionResponse = await app.inject({
+    method: "GET",
+    url: `/api/lorebooks/${protectedBook.id}/entry-projections`,
+  });
   assert.equal(largeRawResponse.statusCode, 200, largeRawResponse.body);
   assert.equal(largeProjectionResponse.statusCode, 200, largeProjectionResponse.body);
+  assert.equal(ordinaryRawResponse.statusCode, 200, ordinaryRawResponse.body);
+  assert.equal(ordinaryProjectionResponse.statusCode, 200, ordinaryProjectionResponse.body);
   assertContractShape(
     "large list entry projections",
     personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema,
@@ -581,9 +601,27 @@ try {
     .items.find((entry: { id: string }) => entry.id === protectedEntry.id);
   assert.equal(readyProjection?.embeddingState, "ready");
   assert.equal(Object.hasOwn(readyProjection ?? {}, "embedding"), false, "ready projections must still omit vectors");
+  const ordinaryProjection = ordinaryProjectionResponse
+    .json()
+    .find((entry: { id: string }) => entry.id === protectedEntry.id);
+  assert.equal(ordinaryProjection?.embeddingState, "ready");
+  assert.equal(
+    Object.hasOwn(ordinaryProjection ?? {}, "embedding"),
+    false,
+    "ordinary read-only projections must omit vectors",
+  );
+  assert.deepEqual(
+    ordinaryProjectionResponse.json(),
+    largeProjectionResponse.json().items,
+    "ordinary projections must reuse the fenced projection row shape without its authority envelope",
+  );
   assert.ok(
     Buffer.byteLength(largeProjectionResponse.body) * 10 < Buffer.byteLength(largeRawResponse.body),
     "the compact projection must reduce a large-vector list payload by at least 90%",
+  );
+  assert.ok(
+    Buffer.byteLength(ordinaryProjectionResponse.body) * 10 < Buffer.byteLength(ordinaryRawResponse.body),
+    "the ordinary compact projection must reduce a large-vector list payload by at least 90%",
   );
 
   for (const invalidEmbedding of ["[]", "not-json"]) {
@@ -602,6 +640,16 @@ try {
       .items.find((entry: { id: string }) => entry.id === protectedEntry.id);
     assert.equal(invalidProjection?.embeddingState, "invalid");
     assert.equal(Object.hasOwn(invalidProjection ?? {}, "embedding"), false);
+    const ordinaryInvalidProjectionResponse = await app.inject({
+      method: "GET",
+      url: `/api/lorebooks/${protectedBook.id}/entry-projections`,
+    });
+    assert.equal(ordinaryInvalidProjectionResponse.statusCode, 200, ordinaryInvalidProjectionResponse.body);
+    assert.deepEqual(
+      ordinaryInvalidProjectionResponse.json(),
+      invalidProjectionResponse.json().items,
+      "ordinary invalid projections must match the fenced row shape",
+    );
   }
   await db.update(lorebookEntries).set({ embedding: null }).where(eq(lorebookEntries.id, protectedEntry.id));
   const guardedGetEntry = await app.inject({

@@ -1222,6 +1222,15 @@ export function createLorebooksStorage(db: DB) {
       return rows.map((r) => parseEntryRow(r as Record<string, unknown>));
     },
 
+    async listEntryProjections(lorebookId: string) {
+      const rows = await db
+        .select()
+        .from(lorebookEntries)
+        .where(eq(lorebookEntries.lorebookId, lorebookId))
+        .orderBy(lorebookEntries.order);
+      return rows.map((row) => coordinationEntryProjectionRow(row as Record<string, unknown>));
+    },
+
     /** Get all entries across multiple lorebooks (for prompt injection). */
     async listEntriesByLorebooks(lorebookIds: string[]) {
       if (lorebookIds.length === 0) return [];

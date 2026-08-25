@@ -1010,6 +1010,24 @@ export function createChatsStorage(db: DB) {
       });
     },
 
+    /** Latest messages with only the fields required by transcript-tail consumers. */
+    async listMessageTail(chatId: string, limit: number) {
+      const rows = await db
+        .select({
+          id: messages.id,
+          chatId: messages.chatId,
+          role: messages.role,
+          characterId: messages.characterId,
+          content: messages.content,
+          createdAt: messages.createdAt,
+        })
+        .from(messages)
+        .where(eq(messages.chatId, chatId))
+        .orderBy(desc(messages.createdAt), desc(messages.id))
+        .limit(limit);
+      return rows.reverse();
+    },
+
     /** Bounded message snapshots for surfaces that do not need cursors or swipe metadata. */
     async listMessagePreviews(chatId: string, limit: number) {
       const rows = await db

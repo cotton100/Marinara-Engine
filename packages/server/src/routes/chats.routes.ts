@@ -1749,6 +1749,21 @@ export async function chatsRoutes(app: FastifyInstance) {
     },
   );
 
+  // Compact exact tail for consumers that do not need message metadata or swipe counts.
+  app.get<{ Params: { id: string }; Querystring: { limit?: string } }>("/:id/message-tail", async (req, reply) => {
+    const rawLimit = req.query.limit;
+    const limit = rawLimit === undefined || typeof rawLimit !== "string" ? 250 : Number(rawLimit);
+    if (
+      (rawLimit !== undefined && (typeof rawLimit !== "string" || !/^[1-9]\d*$/u.test(rawLimit))) ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 250
+    ) {
+      return reply.status(400).send({ error: "limit must be an integer between 1 and 250" });
+    }
+    return storage.listMessageTail(req.params.id, limit);
+  });
+
   // Total message count for a chat (lightweight, for absolute numbering)
   app.get<{ Params: { id: string } }>("/:id/message-count", async (req) => {
     return { count: await storage.countMessages(req.params.id) };

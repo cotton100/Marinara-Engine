@@ -943,6 +943,10 @@ export async function lorebooksRoutes(app: FastifyInstance) {
     return storage.listEntries(req.params.id);
   });
 
+  app.get<{ Params: { id: string } }>("/:id/entry-projections", async (req) => {
+    return storage.listEntryProjections(req.params.id);
+  });
+
   app.get<{ Params: { id: string; entryId: string } }>("/:id/entries/:entryId", async (req, reply) => {
     const entry = await storage.getEntry(req.params.entryId);
     if (!entry) return reply.status(404).send({ error: "Entry not found" });

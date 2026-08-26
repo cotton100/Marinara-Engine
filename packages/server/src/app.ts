@@ -42,6 +42,7 @@ import { sidecarProcessService } from "./services/sidecar/sidecar-process.servic
 import { startServerAutonomousScheduler } from "./services/conversation/server-autonomous-scheduler.service.js";
 import { preparePersonalExtensionTrust } from "./services/setup/personal-extension-trust.js";
 import { personalServerExtensionRuntime } from "./services/extensions/personal-server-extension-runtime.js";
+import { getPersonalExtensionCoordinationService } from "./services/extensions/personal-extension-coordination.service.js";
 import { runWithGenerationFallbackNotifier } from "./services/generation/fallback-notification.js";
 import { createReplyFallbackNotifier } from "./routes/generate/fallback-notification.js";
 import { initializeCapabilityAgentRegistry } from "./services/capability-packages/capability-agent-registry.service.js";
@@ -54,6 +55,7 @@ import { androidLocalAuthHook, androidLocalLoginRoute } from "./middleware/andro
 import { arch, platform, release } from "node:os";
 import { execFileSync } from "node:child_process";
 import { getRuntimeMemorySnapshot } from "./utils/runtime-memory.js";
+import { installProfileAssetMutationRequestGate } from "./services/import/profile-asset-mutation-gate.js";
 
 const isLite = process.env.MARINARA_LITE === "true" || process.env.MARINARA_LITE === "1";
 const MAX_UPLOAD_BYTES = 256 * 1024 * 1024;
@@ -120,6 +122,20 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   // ── Storage ──
   const db = await getDB();
   app.decorate("db", db);
+  try {
+    const recovered = await getPersonalExtensionCoordinationService(db).recoverStaleTransitions();
+    if (recovered.blocked > 0) {
+      app.log.warn(
+        "Moved %d interrupted Personal Extension coordination transition(s) to blocked recovery",
+        recovered.blocked,
+      );
+    }
+  } catch (error) {
+    // Transitional rows already reject both legacy and guarded writers. A
+    // failed strict recovery must therefore remain fail-closed without making
+    // the rest of the local server unavailable.
+    app.log.error(error, "Failed to durably block interrupted Personal Extension coordination transitions");
+  }
   app.addHook("onClose", async () => {
     try {
       const stopResults = await Promise.allSettled([
@@ -226,6 +242,10 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
   // APK-managed Termux installs use a per-install secret so unrelated Android
   // apps cannot inherit the server's ordinary loopback trust.
   app.addHook("onRequest", androidLocalAuthHook);
+  // A profile restore owns an exclusive snapshot/promotion/rollback window.
+  // Put every ordinary HTTP mutation on the shared side before route handlers
+  // can touch profile assets, including future upload or generation routes.
+  installProfileAssetMutationRequestGate(app);
 
   // ── Prevent caching of API JSON responses ──
   // Without explicit Cache-Control, browsers apply heuristic caching which

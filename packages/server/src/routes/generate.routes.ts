@@ -223,6 +223,11 @@ import { eq } from "../db/file-query.js";
 import { PROFESSOR_MARI_ID, type GenerationParameterSendMap } from "@marinara-engine/shared";
 import { chunkAndEmbedMessages } from "../services/memory-recall.js";
 import {
+  getMemoryRecallSourceDirtyPublisher,
+  runMemoryRecallMutationWithDirtyHint,
+} from "../services/memory-recall-source-dirty.js";
+import { runWithDetachedProfileAssetMutation } from "../services/import/profile-asset-mutation-gate.js";
+import {
   isMemoryRecallVectorizerAvailable,
   resolveMemoryRecallEmbeddingSource,
 } from "../services/memory-recall-embedding.js";
@@ -772,6 +777,7 @@ function replaceConversationContextMacro(
 
 export async function generateRoutes(app: FastifyInstance) {
   const isDebug = logger.isLevelEnabled("debug");
+  const memoryRecallSourceDirty = getMemoryRecallSourceDirtyPublisher(app.db);
 
   const chats = createChatsStorage(app.db);
   const connections = createConnectionsStorage(app.db);
@@ -10521,15 +10527,21 @@ export async function generateRoutes(app: FastifyInstance) {
             charNameMap[ci.id] = ci.name;
           }
           if (memoryRecallVectorizerAvailable) {
-            chunkAndEmbedMessages(
-              app.db,
-              input.chatId,
-              { userName: personaName, characterNames: charNameMap },
-              {
-                embeddingSource: memoryRecallEmbeddingSource,
-                readBehindMessageCount:
-                  typeof contextMessageLimit === "number" && contextMessageLimit > 0 ? contextMessageLimit : undefined,
-              },
+            void runWithDetachedProfileAssetMutation(() =>
+              runMemoryRecallMutationWithDirtyHint(memoryRecallSourceDirty, input.chatId, () =>
+                chunkAndEmbedMessages(
+                  app.db,
+                  input.chatId,
+                  { userName: personaName, characterNames: charNameMap },
+                  {
+                    embeddingSource: memoryRecallEmbeddingSource,
+                    readBehindMessageCount:
+                      typeof contextMessageLimit === "number" && contextMessageLimit > 0
+                        ? contextMessageLimit
+                        : undefined,
+                  },
+                ),
+              ),
             ).catch((err) => logger.error(err, "[memory-recall] Background chunking failed"));
           }
         }

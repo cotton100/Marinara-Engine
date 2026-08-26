@@ -40,6 +40,8 @@ import {
   lorebookEntries,
   lorebooks,
   oocInfluences,
+  personalExtensionCoordination,
+  personalExtensionOperationJournal,
   spatialContextSnapshots,
 } from "../../packages/server/src/db/schema/index.js";
 import { createChatsStorage } from "../../packages/server/src/services/storage/chats.storage.js";
@@ -70,6 +72,102 @@ for (const table of FILE_BACKED_TABLES) {
     strategy,
     `${table} reuses its validated shard strategy instead of recomputing it per row`,
   );
+}
+
+// The current production custom tables were flat in storage format 4. Their
+// non-`id` primary keys must become the shard keys during the format-5 upgrade,
+// while the original monoliths remain available as byte-for-byte rollback
+// evidence.
+{
+  const dir = tempStorageDir();
+  const tablesDir = join(dir, "tables");
+  mkdirSync(tablesDir, { recursive: true });
+  const timestamp = "2026-08-26T00:00:00.000Z";
+  const coordinationRows = ["coordination-a", "coordination-b"].map((extensionId, index) => ({
+    extensionId,
+    contentHash: `sha256:coordination-${index}`,
+    mode: "inactive",
+    serverBootId: `boot-${index}`,
+    fence: index,
+    leaseTokenDigest: null,
+    holderSessionId: null,
+    expiresAt: null,
+    configRevision: 0,
+    protectedLorebookRegistry: "{}",
+    handoffRequestId: null,
+    handoffRequester: null,
+    handoffDeadlineAt: null,
+    activeOperations: "[]",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  }));
+  const journalRows = ["journal-a", "journal-b"].map((operationDigest, index) => ({
+    operationDigest,
+    extensionId: coordinationRows[index]!.extensionId,
+    targetEnsembleId: `ensemble-${index}`,
+    operationKind: "mutation",
+    fence: index + 1,
+    phase: "final",
+    protectedResourceRevisions: "[]",
+    preparedAt: timestamp,
+    dispatchingAt: timestamp,
+    finalAt: timestamp,
+    updatedAt: timestamp,
+  }));
+  writeFileSync(join(tablesDir, "personal_extension_coordination.json"), JSON.stringify(coordinationRows));
+  writeFileSync(join(tablesDir, "personal_extension_operation_journal.json"), JSON.stringify(journalRows));
+  writeFileSync(
+    join(dir, "manifest.json"),
+    JSON.stringify({
+      version: 4,
+      savedAt: timestamp,
+      backend: "file-native",
+      tables: {
+        personal_extension_coordination: coordinationRows.length,
+        personal_extension_operation_journal: journalRows.length,
+      },
+    }),
+  );
+
+  const db = await createFileNativeDB();
+  try {
+    assert.deepEqual(
+      (await db.select().from(personalExtensionCoordination)).map((row) => row.extensionId).sort(),
+      coordinationRows.map((row) => row.extensionId).sort(),
+    );
+    assert.deepEqual(
+      (await db.select().from(personalExtensionOperationJournal)).map((row) => row.operationDigest).sort(),
+      journalRows.map((row) => row.operationDigest).sort(),
+    );
+
+    for (const row of coordinationRows) {
+      const shardPath = join(tablesDir, "personal_extension_coordination", `${encodeShardKey(row.extensionId)}.json`);
+      assert.ok(existsSync(shardPath), `coordination row ${row.extensionId} migrated by extensionId`);
+      assert.equal(
+        (JSON.parse(readFileSync(shardPath, "utf8")) as Array<{ extensionId: string }>)[0]?.extensionId,
+        row.extensionId,
+      );
+    }
+    for (const row of journalRows) {
+      const shardPath = join(
+        tablesDir,
+        "personal_extension_operation_journal",
+        `${encodeShardKey(row.operationDigest)}.json`,
+      );
+      assert.ok(existsSync(shardPath), `journal row ${row.operationDigest} migrated by operationDigest`);
+      assert.equal(
+        (JSON.parse(readFileSync(shardPath, "utf8")) as Array<{ operationDigest: string }>)[0]?.operationDigest,
+        row.operationDigest,
+      );
+    }
+    for (const table of ["personal_extension_coordination", "personal_extension_operation_journal"]) {
+      assert.equal(existsSync(join(tablesDir, `${table}.json`)), false, `${table} monolith renamed away`);
+      assert.ok(existsSync(join(tablesDir, `${table}.json.pre-shard`)), `${table} original preserved`);
+    }
+  } finally {
+    await db._fileStore.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // Representative non-chat owners prove that the generic strategy writes and

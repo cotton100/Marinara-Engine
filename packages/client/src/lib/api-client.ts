@@ -217,7 +217,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const headers = new Headers(init?.headers);
   for (const [name, value] of Object.entries(getAdminSecretHeader())) {
-    headers.set(name, value);
+    // An explicit per-request key is used to verify a replacement before it
+    // is persisted. Otherwise, keep using the key saved for this browser.
+    if (!headers.has(name)) headers.set(name, value);
   }
   const method = (init?.method ?? "GET").toUpperCase();
   if (UNSAFE_METHODS.has(method)) {

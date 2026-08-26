@@ -1,10 +1,16 @@
 import { randomBytes } from "node:crypto";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
+import { ZodError } from "zod";
 import {
   approvePersonalExtensionSchema,
   createPersonalExtensionSchema,
   externalExtensionsPolicyUpdateSchema,
   personalExtensionStoragePatchSchema,
+  PERSONAL_EXTENSION_COORDINATION_HOLDER_HEADER,
+  PERSONAL_EXTENSION_COORDINATION_HTTP_STATUS,
+  personalExtensionCoordinationHolderSessionIdSchema,
+  personalExtensionCoordinationStorageDeleteRequestSchema,
+  personalExtensionCoordinationStoragePatchRequestSchema,
   rollbackPersonalExtensionSchema,
   updatePersonalExtensionSchema,
   PERSONAL_EXTENSION_CONTRIBUTION_KINDS,
@@ -24,6 +30,8 @@ import {
 import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
 import { createPersonalExtensionsStorage } from "../services/extensions/personal-extension-storage.service.js";
 import { createPersonalExtensionSettingsStorage } from "../services/extensions/personal-extension-settings.service.js";
+import { PersonalExtensionCoordinationKernelError } from "../services/extensions/personal-extension-coordination-kernel.service.js";
+import { getPersonalExtensionCoordinationService } from "../services/extensions/personal-extension-coordination.service.js";
 import { createAppSettingsStorage } from "../services/storage/app-settings.storage.js";
 import { createCharactersStorage } from "../services/storage/characters.storage.js";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
@@ -196,23 +204,14 @@ function hasFullPageAccess(extension: Pick<PersonalExtension, "capabilities">) {
 }
 
 export function fullPageExtensionSource(extension: PersonalExtension) {
-  const identity = JSON.stringify({
-    id: extension.id,
-    name: extension.name,
-    contentHash: extension.contentHash,
-  }).replace(/</gu, "\\u003c");
-  return `(() => {
+  const id = JSON.stringify(extension.id).replace(/</gu, "\\u003c");
+  const contentHash = JSON.stringify(extension.contentHash).replace(/</gu, "\\u003c");
+  return `export const extensionId = ${id};
+export const contentHash = ${contentHash};
+export default async function main(marinara) {
   "use strict";
-  const extension = ${identity};
-  const run = window.__marinaraRunFullPageExtension;
-  if (typeof run !== "function") {
-    throw new Error("Marinara full-page extension host is unavailable");
-  }
-  run(extension, async (marinara) => {
-    "use strict";
 ${extension.js ?? ""}
-  });
-})();`;
+}`;
 }
 
 export function browserWorkerSource(extension: PersonalExtension) {
@@ -1122,7 +1121,11 @@ export function sandboxDocument(extension: PersonalExtension, nonce: string) {
 
 export async function personalExtensionsRoutes(app: FastifyInstance) {
   const storage = createPersonalExtensionsStorage(app.db);
-  const settings = createPersonalExtensionSettingsStorage(createAppSettingsStorage(app.db));
+  const coordination = getPersonalExtensionCoordinationService(app.db);
+  const settings = createPersonalExtensionSettingsStorage(createAppSettingsStorage(app.db), {
+    db: app.db,
+    coordination,
+  });
   const charactersStorage = createCharactersStorage(app.db);
   const chatsStorage = createChatsStorage(app.db);
 
@@ -1136,8 +1139,23 @@ export async function personalExtensionsRoutes(app: FastifyInstance) {
         error: "External Extensions are locked. Set ENABLE_EXTERNAL_EXTENSIONS=true in .env first.",
       });
     }
+    if (!input.enabled) {
+      try {
+        // Disable first while every affected extension shares the coordination
+        // lifecycle mutex. If any one is non-inactive, neither extension rows
+        // nor the global execution policy may change.
+        await storage.disableExternal();
+      } catch (error) {
+        if (error instanceof PersonalExtensionCoordinationKernelError) {
+          return reply.status(PERSONAL_EXTENSION_COORDINATION_HTTP_STATUS[error.code]).send({
+            code: error.code,
+            error: "Personal extension coordination must be deactivated before changing this policy.",
+          });
+        }
+        throw error;
+      }
+    }
     const policy = await setExternalExtensionsEnabled(app.db, input.enabled);
-    if (!policy.externalExtensionsEnabled) await storage.disableExternal();
     await personalServerExtensionRuntime.enforceExternalPolicy();
     return policy;
   });
@@ -1324,24 +1342,106 @@ export async function personalExtensionsRoutes(app: FastifyInstance) {
     return extension;
   };
 
+  const sendStorageCoordinationError = (error: unknown, reply: FastifyReply) => {
+    const code =
+      error instanceof PersonalExtensionCoordinationKernelError
+        ? error.code
+        : error instanceof ZodError
+          ? "invalid-request"
+          : "coordination-unavailable";
+    return reply.status(PERSONAL_EXTENSION_COORDINATION_HTTP_STATUS[code]).send({
+      code,
+      error: "Personal extension coordination storage request was rejected.",
+    });
+  };
+
   app.get<{ Params: { id: string } }>("/:id/storage", async (req, reply) => {
     const extension = await browserStorageExtension(req.params.id);
     if (!extension) return reply.status(404).send({ error: "Personal Extension not found" });
     return { value: await settings.get(extension.id) };
   });
 
+  app.get<{ Params: { id: string } }>("/:id/coordination/storage", async (req, reply) => {
+    const extension = await browserStorageExtension(req.params.id);
+    if (!extension) return reply.status(404).send({ error: "Personal Extension not found" });
+    try {
+      return await settings.getRevisioned(extension.id);
+    } catch (error) {
+      return sendStorageCoordinationError(error, reply);
+    }
+  });
+
   app.patch<{ Params: { id: string } }>("/:id/storage", async (req, reply) => {
     const extension = await browserStorageExtension(req.params.id);
     if (!extension) return reply.status(404).send({ error: "Personal Extension not found" });
-    const patch = personalExtensionStoragePatchSchema.parse(req.body ?? {});
-    return { value: await settings.patch(extension.id, patch) };
+    try {
+      const patch = personalExtensionStoragePatchSchema.parse(req.body ?? {});
+      return { value: await settings.patchLegacy(extension.id, patch) };
+    } catch (error) {
+      return sendStorageCoordinationError(error, reply);
+    }
   });
 
   app.delete<{ Params: { id: string } }>("/:id/storage", async (req, reply) => {
     const extension = await browserStorageExtension(req.params.id);
     if (!extension) return reply.status(404).send({ error: "Personal Extension not found" });
-    await settings.remove(extension.id);
-    return { value: {} };
+    try {
+      await settings.removeLegacy(extension.id);
+      return { value: {} };
+    } catch (error) {
+      return sendStorageCoordinationError(error, reply);
+    }
+  });
+
+  app.patch<{ Params: { id: string }; Body: unknown }>("/:id/coordination/storage", async (req, reply) => {
+    const extension = await browserStorageExtension(req.params.id);
+    if (!extension) return reply.status(404).send({ error: "Personal Extension not found" });
+    try {
+      const input = personalExtensionCoordinationStoragePatchRequestSchema.parse(req.body);
+      const holderSessionId = personalExtensionCoordinationHolderSessionIdSchema.parse(
+        req.headers[PERSONAL_EXTENSION_COORDINATION_HOLDER_HEADER],
+      );
+      return await settings.patchFenced(
+        {
+          extensionId: extension.id,
+          holderSessionId,
+          serverBootId: input.serverBootId,
+          contentHash: input.contentHash,
+          fence: input.fence,
+          leaseToken: input.leaseToken,
+          operationHandle: input.operationHandle,
+        },
+        input.expectedConfigRevision,
+        input.patch,
+      );
+    } catch (error) {
+      return sendStorageCoordinationError(error, reply);
+    }
+  });
+
+  app.delete<{ Params: { id: string }; Body: unknown }>("/:id/coordination/storage", async (req, reply) => {
+    const extension = await browserStorageExtension(req.params.id);
+    if (!extension) return reply.status(404).send({ error: "Personal Extension not found" });
+    try {
+      const input = personalExtensionCoordinationStorageDeleteRequestSchema.parse(req.body);
+      const holderSessionId = personalExtensionCoordinationHolderSessionIdSchema.parse(
+        req.headers[PERSONAL_EXTENSION_COORDINATION_HOLDER_HEADER],
+      );
+      return await settings.removeFenced(
+        {
+          extensionId: extension.id,
+          holderSessionId,
+          serverBootId: input.serverBootId,
+          contentHash: input.contentHash,
+          fence: input.fence,
+          leaseToken: input.leaseToken,
+          operationHandle: input.operationHandle,
+        },
+        input.expectedConfigRevision,
+      );
+    } catch (error) {
+      return sendStorageCoordinationError(error, reply);
+    }
   });
 
   app.post<{ Params: { id: string }; Body: { chatId?: unknown } }>("/:id/context", async (req, reply) => {
@@ -1376,8 +1476,13 @@ export async function personalExtensionsRoutes(app: FastifyInstance) {
     if (!ID_PATTERN.test(req.params.id)) return reply.status(404).send({ error: "Personal Extension not found" });
     const existing = await storage.getById(req.params.id);
     if (!existing) return reply.status(404).send({ error: "Personal Extension not found" });
-    await settings.remove(existing.id);
-    await storage.remove(existing.id);
+    try {
+      await storage.remove(existing.id, async (tx) => {
+        await createPersonalExtensionSettingsStorage(createAppSettingsStorage(tx)).remove(existing.id);
+      });
+    } catch (error) {
+      return sendStorageCoordinationError(error, reply);
+    }
     if (existing.runtime === "server") await personalServerExtensionRuntime.unloadExtension(existing.id);
     return reply.status(204).send();
   });

@@ -31,6 +31,7 @@ import { createLLMProvider } from "../services/llm/provider-registry.js";
 import { resolveBaseUrl } from "../services/generation/connection-base-url.js";
 import { resolveStoredChatOptions, resolveStoredMaxTokens } from "../services/generation/generation-parameters.js";
 import { clampGenerationMaxOutputTokens } from "../services/generation/output-token-limits.js";
+import { runWithDetachedProfileAssetMutation } from "../services/import/profile-asset-mutation-gate.js";
 
 // OpenAI built-in voices used as fallback when the provider has no /audio/voices endpoint
 const OPENAI_FALLBACK_VOICES = ["alloy", "ash", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"];
@@ -207,11 +208,11 @@ function scheduleGameAssetManifestRebuild(): void {
   if (gameAssetManifestRebuildTimer) clearTimeout(gameAssetManifestRebuildTimer);
   gameAssetManifestRebuildTimer = setTimeout(() => {
     gameAssetManifestRebuildTimer = null;
-    try {
+    void runWithDetachedProfileAssetMutation(async () => {
       buildAssetManifest();
-    } catch (error) {
+    }).catch((error) => {
       logger.error(error, "Failed to rebuild the game asset manifest after generating audio");
-    }
+    });
   }, 500);
   gameAssetManifestRebuildTimer.unref();
 }

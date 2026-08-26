@@ -1,11 +1,32 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { open, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "../../packages/server/src/db/file-query.js";
 import { fileTable, isFileUniqueConstraintError, text } from "../../packages/server/src/db/file-schema.js";
-import { createFileNativeDB, encodeShardKey } from "../../packages/server/src/db/file-backed-store.js";
-import { appSettings, customStickers, noodleInteractions } from "../../packages/server/src/db/schema/index.js";
+import {
+  createFileNativeDB,
+  encodeShardKey,
+  FileNativeStrictDurabilityUnsupportedError,
+} from "../../packages/server/src/db/file-backed-store.js";
+import { closeDB, flushDBStrict, isDBStrictDurabilitySupported } from "../../packages/server/src/db/connection.js";
+import {
+  appSettings,
+  customStickers,
+  noodleInteractions,
+  personalExtensionOperationJournal,
+} from "../../packages/server/src/db/schema/index.js";
+import { createAppSettingsStorage } from "../../packages/server/src/services/storage/app-settings.storage.js";
+
+async function fsyncTestFile(path: string) {
+  const handle = await open(path, "r+");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
 
 const appSettingsShardPath = (root: string, key: string) =>
   join(root, "tables", "app_settings", `${encodeShardKey(key)}.json`);
@@ -13,6 +34,8 @@ const readAppSettingsRows = (root: string, keys: string[]) =>
   keys.flatMap(
     (key) => JSON.parse(readFileSync(appSettingsShardPath(root, key), "utf8")) as Array<{ key: string; value: string }>,
   );
+const isAppSettingsTempPath = (path: string) =>
+  path.includes(join("tables", "app_settings")) && path.includes(".json.tmp-");
 
 const storageDir = mkdtempSync(join(tmpdir(), "marinara-file-close-"));
 process.env.FILE_STORAGE_DIR = storageDir;
@@ -312,4 +335,518 @@ try {
   console.info("File-backed unique-key regression passed.");
 } finally {
   rmSync(uniqueStorageDir, { recursive: true, force: true });
+}
+
+const unsupportedStrictStorageDir = mkdtempSync(join(tmpdir(), "marinara-file-strict-unsupported-"));
+process.env.FILE_STORAGE_DIR = unsupportedStrictStorageDir;
+try {
+  const db = await createFileNativeDB();
+  await db.insert(appSettings).values({ key: "strict-platform", value: "pending", updatedAt: "2026-08-15" });
+
+  if (process.platform === "win32") {
+    assert.equal(db._fileStore.isStrictDurabilitySupported(), false);
+    await assert.rejects(
+      db._fileStore.flushStrict(),
+      (error) =>
+        error instanceof FileNativeStrictDurabilityUnsupportedError &&
+        error.code === "FILE_STORAGE_STRICT_DURABILITY_UNSUPPORTED",
+    );
+    assert.equal(
+      existsSync(appSettingsShardPath(unsupportedStrictStorageDir, "strict-platform")),
+      false,
+      "unsupported strict flush must fail before it writes any snapshot",
+    );
+    await db._fileStore.flush();
+  } else {
+    assert.equal(db._fileStore.isStrictDurabilitySupported(), true);
+    await db._fileStore.flushStrict();
+  }
+
+  const rows = readAppSettingsRows(unsupportedStrictStorageDir, ["strict-platform"]);
+  assert.equal(
+    rows.some((row) => row.key === "strict-platform"),
+    true,
+  );
+  await db._fileStore.close();
+  console.info("File-backed strict durability platform capability regression passed.");
+} finally {
+  rmSync(unsupportedStrictStorageDir, { recursive: true, force: true });
+}
+
+type StrictFailureOperation = "writeFile" | "rename" | "flushFile" | "flushDirectory";
+
+for (const operation of ["writeFile", "rename", "flushFile", "flushDirectory"] as const) {
+  const strictFailureStorageDir = mkdtempSync(join(tmpdir(), `marinara-file-strict-${operation}-`));
+  process.env.FILE_STORAGE_DIR = strictFailureStorageDir;
+  const expectedFailure = new Error(`simulated strict ${operation} failure`);
+  let failingOperation: StrictFailureOperation | null = null;
+  try {
+    const db = await createFileNativeDB({
+      fileOperations: {
+        writeFile: async (path, content) => {
+          if (failingOperation === "writeFile") throw expectedFailure;
+          await writeFile(path, content);
+        },
+        rename: async (from, to) => {
+          if (failingOperation === "rename") throw expectedFailure;
+          await rename(from, to);
+        },
+        flushFile: async (path) => {
+          if (failingOperation === "flushFile") throw expectedFailure;
+          await fsyncTestFile(path);
+        },
+        // Supplying this hook models a runtime with a real directory-fsync
+        // implementation while keeping the regression portable on Windows.
+        flushDirectory: async () => {
+          if (failingOperation === "flushDirectory") throw expectedFailure;
+        },
+      },
+    });
+    assert.equal(db._fileStore.isStrictDurabilitySupported(), true);
+    await db.insert(appSettings).values({
+      key: `strict-${operation}`,
+      value: "baseline",
+      updatedAt: "2026-08-15",
+    });
+    await db._fileStore.flushStrict();
+    await db
+      .update(appSettings)
+      .set({ value: "retry-me" })
+      .where(eq(appSettings.key, `strict-${operation}`));
+    failingOperation = operation;
+    await assert.rejects(db._fileStore.flushStrict(), (error) => error === expectedFailure);
+
+    failingOperation = null;
+    await db._fileStore.flushStrict();
+    const rows = readAppSettingsRows(strictFailureStorageDir, [`strict-${operation}`]) as Array<{
+      key: string;
+      value: string;
+    }>;
+    assert.equal(
+      rows.find((row) => row.key === `strict-${operation}`)?.value,
+      "retry-me",
+      `${operation} failure must retain dirty state for a later strict retry`,
+    );
+    await db._fileStore.close();
+  } finally {
+    failingOperation = null;
+    rmSync(strictFailureStorageDir, { recursive: true, force: true });
+  }
+}
+console.info("File-backed strict durability operation failure regressions passed.");
+
+const strictShardDeleteDir = mkdtempSync(join(tmpdir(), "marinara-file-strict-shard-delete-"));
+process.env.FILE_STORAGE_DIR = strictShardDeleteDir;
+const journalDir = join(strictShardDeleteDir, "tables", "personal_extension_operation_journal");
+let rejectJournalDirFlush = false;
+let journalDirFlushAttempts = 0;
+try {
+  const expectedFailure = new Error("simulated strict journal directory fsync failure");
+  const hooks = {
+    fileOperations: {
+      flushDirectory: async (path: string) => {
+        if (path !== journalDir) return;
+        journalDirFlushAttempts++;
+        if (rejectJournalDirFlush) throw expectedFailure;
+      },
+    },
+  };
+  const db = await createFileNativeDB(hooks);
+  const operationDigest = "strict-delete-operation";
+  await db.insert(personalExtensionOperationJournal).values({
+    operationDigest,
+    extensionId: "strict-delete-extension",
+    targetEnsembleId: "strict-delete-ensemble",
+    operationKind: "mutation",
+    fence: 1,
+    phase: "final",
+    protectedResourceRevisions: "[]",
+    preparedAt: "2026-08-26T00:00:00.000Z",
+    dispatchingAt: null,
+    finalAt: "2026-08-26T00:00:01.000Z",
+    updatedAt: "2026-08-26T00:00:01.000Z",
+  });
+  await db._fileStore.flushStrict();
+  const shardPath = join(journalDir, `${encodeShardKey(operationDigest)}.json`);
+  assert.equal(existsSync(shardPath), true);
+
+  journalDirFlushAttempts = 0;
+  await db
+    .delete(personalExtensionOperationJournal)
+    .where(eq(personalExtensionOperationJournal.operationDigest, operationDigest));
+  rejectJournalDirFlush = true;
+  await assert.rejects(db._fileStore.flushStrict(), (error) => error === expectedFailure);
+  assert.equal(existsSync(shardPath), false, "unlink lands before the failed directory fsync");
+
+  rejectJournalDirFlush = false;
+  await db._fileStore.flushStrict();
+  assert.equal(journalDirFlushAttempts, 2, "retry must fsync the shard directory even when the file is already absent");
+  await db._fileStore.close();
+
+  const reopened = await createFileNativeDB(hooks);
+  assert.deepEqual(
+    await reopened
+      .select()
+      .from(personalExtensionOperationJournal)
+      .where(eq(personalExtensionOperationJournal.operationDigest, operationDigest)),
+    [],
+  );
+  await reopened._fileStore.close();
+  console.info("File-backed strict sharded deletion retry regression passed.");
+} finally {
+  rejectJournalDirFlush = false;
+  rmSync(strictShardDeleteDir, { recursive: true, force: true });
+}
+
+const bestEffortShardMetadataDir = mkdtempSync(join(tmpdir(), "marinara-file-best-effort-shard-metadata-"));
+process.env.FILE_STORAGE_DIR = bestEffortShardMetadataDir;
+const shardTablesDir = join(bestEffortShardMetadataDir, "tables");
+const bestEffortJournalDir = join(shardTablesDir, "personal_extension_operation_journal");
+let rejectShardParentFlush = false;
+let rejectShardDeleteFlush = false;
+let shardParentFlushAttempts = 0;
+let shardDeleteFlushAttempts = 0;
+try {
+  const db = await createFileNativeDB({
+    fileOperations: {
+      flushDirectory: async (path: string) => {
+        if (path === shardTablesDir) {
+          shardParentFlushAttempts++;
+          if (rejectShardParentFlush) throw new Error("simulated best-effort shard parent fsync failure");
+        }
+        if (path === bestEffortJournalDir) {
+          shardDeleteFlushAttempts++;
+          if (rejectShardDeleteFlush) throw new Error("simulated best-effort shard deletion fsync failure");
+        }
+      },
+    },
+  });
+  // Populate the ordinary flat files first so the targeted tables/ flush below
+  // can only be the new journal shard-directory entry.
+  await db._fileStore.flushStrict();
+  shardParentFlushAttempts = 0;
+  shardDeleteFlushAttempts = 0;
+
+  const operationDigest = "best-effort-shard-metadata";
+  await db.insert(personalExtensionOperationJournal).values({
+    operationDigest,
+    extensionId: "best-effort-shard-extension",
+    targetEnsembleId: "best-effort-shard-ensemble",
+    operationKind: "mutation",
+    fence: 1,
+    phase: "final",
+    protectedResourceRevisions: "[]",
+    preparedAt: "2026-08-26T00:00:00.000Z",
+    dispatchingAt: null,
+    finalAt: "2026-08-26T00:00:01.000Z",
+    updatedAt: "2026-08-26T00:00:01.000Z",
+  });
+  rejectShardParentFlush = true;
+  await db._fileStore.flush();
+  assert.equal(shardParentFlushAttempts, 1, "best-effort create must observe the injected parent fsync failure");
+  rejectShardParentFlush = false;
+  await db._fileStore.flushStrict();
+  assert.equal(
+    shardParentFlushAttempts,
+    2,
+    "strict flush must re-prove a shard directory entry after best-effort parent fsync failure",
+  );
+
+  const shardPath = join(bestEffortJournalDir, `${encodeShardKey(operationDigest)}.json`);
+  assert.equal(existsSync(shardPath), true);
+  shardDeleteFlushAttempts = 0;
+  await db
+    .delete(personalExtensionOperationJournal)
+    .where(eq(personalExtensionOperationJournal.operationDigest, operationDigest));
+  rejectShardDeleteFlush = true;
+  await db._fileStore.flush();
+  assert.equal(existsSync(shardPath), false, "best-effort unlink lands before directory fsync");
+  assert.equal(shardDeleteFlushAttempts, 1, "best-effort delete must observe the injected directory fsync failure");
+  rejectShardDeleteFlush = false;
+  await db._fileStore.flushStrict();
+  assert.equal(
+    shardDeleteFlushAttempts,
+    2,
+    "strict flush must re-prove a shard deletion after best-effort directory fsync failure",
+  );
+  await db._fileStore.close();
+  console.info("File-backed best-effort shard metadata retry regressions passed.");
+} finally {
+  rejectShardParentFlush = false;
+  rejectShardDeleteFlush = false;
+  rmSync(bestEffortShardMetadataDir, { recursive: true, force: true });
+}
+
+const bestEffortCompatibilityDir = mkdtempSync(join(tmpdir(), "marinara-file-best-effort-fsync-"));
+process.env.FILE_STORAGE_DIR = bestEffortCompatibilityDir;
+let rejectBestEffortSync = true;
+let appSettingsWrites = 0;
+try {
+  const db = await createFileNativeDB({
+    fileOperations: {
+      writeFile: async (path, content) => {
+        if (isAppSettingsTempPath(path)) appSettingsWrites++;
+        await writeFile(path, content);
+      },
+      flushFile: async (path) => {
+        if (rejectBestEffortSync && isAppSettingsTempPath(path)) {
+          throw new Error("simulated best-effort file fsync failure");
+        }
+        await fsyncTestFile(path);
+      },
+      flushDirectory: async () => {
+        if (rejectBestEffortSync) throw new Error("simulated best-effort directory fsync failure");
+      },
+    },
+  });
+  await db.insert(appSettings).values({ key: "best-effort-compatible", value: "one", updatedAt: "2026-08-15" });
+  await db._fileStore.flush();
+  const writesAfterBestEffortFlush = appSettingsWrites;
+  assert.equal(writesAfterBestEffortFlush, 1);
+
+  rejectBestEffortSync = false;
+  await db._fileStore.flushStrict();
+  assert.equal(
+    appSettingsWrites,
+    writesAfterBestEffortFlush + 1,
+    "strict flush must rewrite data whose prior best-effort fsync was not proven",
+  );
+  const rows = readAppSettingsRows(bestEffortCompatibilityDir, ["best-effort-compatible"]);
+  assert.equal(
+    rows.some((row) => row.key === "best-effort-compatible"),
+    true,
+  );
+  await db._fileStore.close();
+  console.info("File-backed best-effort fsync compatibility regression passed.");
+} finally {
+  rejectBestEffortSync = false;
+  rmSync(bestEffortCompatibilityDir, { recursive: true, force: true });
+}
+
+const strictRollbackStorageDir = mkdtempSync(join(tmpdir(), "marinara-file-strict-rollback-"));
+process.env.FILE_STORAGE_DIR = strictRollbackStorageDir;
+let rejectStrictRollbackWrite = false;
+try {
+  const rollbackFlushFailure = new Error("simulated strict rollback write failure");
+  const transactionFailure = new Error("simulated failure after strict transaction flush");
+  const db = await createFileNativeDB({
+    fileOperations: {
+      writeFile: async (path, content) => {
+        if (rejectStrictRollbackWrite) throw rollbackFlushFailure;
+        await writeFile(path, content);
+      },
+      flushDirectory: async () => {},
+    },
+  });
+  await db.insert(appSettings).values({ key: "strict-rollback", value: "live", updatedAt: "2026-08-15" });
+  await db._fileStore.flushStrict();
+
+  await assert.rejects(
+    db.transaction(async (tx) => {
+      await tx.update(appSettings).set({ value: "temporary" }).where(eq(appSettings.key, "strict-rollback"));
+      await tx._fileStore.flushStrict();
+      rejectStrictRollbackWrite = true;
+      throw transactionFailure;
+    }),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.includes(transactionFailure) &&
+      error.errors.includes(rollbackFlushFailure),
+  );
+
+  const restoredRows = await db.select().from(appSettings).where(eq(appSettings.key, "strict-rollback"));
+  assert.equal(restoredRows[0]?.value, "live", "failed durable rollback must still restore the in-memory snapshot");
+  rejectStrictRollbackWrite = false;
+  await db._fileStore.flushStrict();
+  const persistedRows = readAppSettingsRows(strictRollbackStorageDir, ["strict-rollback"]) as Array<{
+    key: string;
+    value: string;
+  }>;
+  assert.equal(persistedRows.find((row) => row.key === "strict-rollback")?.value, "live");
+  await db._fileStore.close();
+  console.info("File-backed strict transaction rollback recovery regression passed.");
+} finally {
+  rejectStrictRollbackWrite = false;
+  rmSync(strictRollbackStorageDir, { recursive: true, force: true });
+}
+
+const exclusiveReadBarrierStorageDir = mkdtempSync(join(tmpdir(), "marinara-file-exclusive-read-barrier-"));
+process.env.FILE_STORAGE_DIR = exclusiveReadBarrierStorageDir;
+let pauseExistingSettingRead = false;
+let releaseExistingSettingRead!: () => void;
+const existingSettingReadRelease = new Promise<void>((resolve) => {
+  releaseExistingSettingRead = resolve;
+});
+let existingSettingReadEntered!: () => void;
+const existingSettingReadEntry = new Promise<void>((resolve) => {
+  existingSettingReadEntered = resolve;
+});
+try {
+  const db = await createFileNativeDB({
+    afterTableRead: async (table) => {
+      if (table !== "app_settings" || !pauseExistingSettingRead) return;
+      pauseExistingSettingRead = false;
+      existingSettingReadEntered();
+      await existingSettingReadRelease;
+    },
+    fileOperations: { flushDirectory: async () => {} },
+  });
+  const settings = createAppSettingsStorage(db as never);
+  const transactionFailure = new Error("simulated restore data-phase rollback");
+  let releaseDataPhase!: () => void;
+  const dataPhaseRelease = new Promise<void>((resolve) => {
+    releaseDataPhase = resolve;
+  });
+  let dataPhaseEntered!: () => void;
+  const dataPhaseEntry = new Promise<void>((resolve) => {
+    dataPhaseEntered = resolve;
+  });
+
+  const restore = db._fileStore.runExclusiveTransactions(async () => {
+    await db.transaction(async (tx) => {
+      await tx.insert(appSettings).values({
+        key: "exclusive-read-branch",
+        value: "transient-backup",
+        updatedAt: "2026-08-16",
+      });
+      dataPhaseEntered();
+      await dataPhaseRelease;
+      throw transactionFailure;
+    });
+  });
+  await dataPhaseEntry;
+
+  let externalWriteSettled = false;
+  const externalWrite = settings.set("exclusive-read-branch", "user-write").finally(() => {
+    externalWriteSettled = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    externalWriteSettled,
+    false,
+    "an external read-then-write must not branch on transient rows from an exclusive restore sequence",
+  );
+
+  releaseDataPhase();
+  await assert.rejects(restore, (error) => error === transactionFailure);
+  await externalWrite;
+  assert.equal(
+    await settings.get("exclusive-read-branch"),
+    "user-write",
+    "the external writer must re-read after rollback and insert its value",
+  );
+
+  await settings.set("exclusive-existing-branch", "live");
+  pauseExistingSettingRead = true;
+  const existingSettingWrite = settings.set("exclusive-existing-branch", "user-write");
+  await existingSettingReadEntry;
+
+  let exclusiveEnteredBeforeReadWriteFinished = false;
+  const deleteExistingSetting = db._fileStore.runExclusiveTransactions(async () => {
+    exclusiveEnteredBeforeReadWriteFinished = true;
+    await db.transaction(async (tx) => {
+      await tx.delete(appSettings).where(eq(appSettings.key, "exclusive-existing-branch"));
+    });
+  });
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const exclusiveOvertookReadWrite = exclusiveEnteredBeforeReadWriteFinished;
+  releaseExistingSettingRead();
+  await Promise.all([existingSettingWrite, deleteExistingSetting]);
+  assert.equal(
+    exclusiveOvertookReadWrite,
+    false,
+    "an exclusive restore must not overtake a read-modify-write after it has read an existing row",
+  );
+  assert.equal(
+    await settings.get("exclusive-existing-branch"),
+    null,
+    "the later exclusive delete must run after the complete setting write",
+  );
+
+  await settings.set("exclusive-active-transaction", "live");
+  let releaseActiveTransaction!: () => void;
+  const activeTransactionRelease = new Promise<void>((resolve) => {
+    releaseActiveTransaction = resolve;
+  });
+  let activeTransactionEntered!: () => void;
+  const activeTransactionEntry = new Promise<void>((resolve) => {
+    activeTransactionEntered = resolve;
+  });
+  const activeTransaction = db.transaction(async (tx) => {
+    activeTransactionEntered();
+    await activeTransactionRelease;
+    const rows = await tx.select().from(appSettings).where(eq(appSettings.key, "exclusive-active-transaction"));
+    assert.equal(rows[0]?.value, "live");
+    await tx
+      .update(appSettings)
+      .set({ value: "transaction-finished" })
+      .where(eq(appSettings.key, "exclusive-active-transaction"));
+  });
+  await activeTransactionEntry;
+  const queuedExclusive = db._fileStore.runExclusiveTransactions(async () => undefined);
+  releaseActiveTransaction();
+  await Promise.race([
+    Promise.all([activeTransaction, queuedExclusive]),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("an active transaction deadlocked with a queued exclusive sequence")), 1_000),
+    ),
+  ]);
+
+  const fifoOrder: string[] = [];
+  let releaseFirstExclusive!: () => void;
+  const firstExclusiveRelease = new Promise<void>((resolve) => {
+    releaseFirstExclusive = resolve;
+  });
+  let firstExclusiveEntered!: () => void;
+  const firstExclusiveEntry = new Promise<void>((resolve) => {
+    firstExclusiveEntered = resolve;
+  });
+  const firstExclusive = db._fileStore.runExclusiveTransactions(async () => {
+    fifoOrder.push("exclusive-1-start");
+    firstExclusiveEntered();
+    await firstExclusiveRelease;
+    fifoOrder.push("exclusive-1-end");
+  });
+  await firstExclusiveEntry;
+  const queuedTransaction = db.transaction(async (tx) => {
+    await tx.insert(appSettings).values({
+      key: "exclusive-fifo-transaction",
+      value: "committed",
+      updatedAt: "2026-08-16",
+    });
+    fifoOrder.push("transaction");
+  });
+  const secondExclusive = db._fileStore.runExclusiveTransactions(async () => {
+    fifoOrder.push("exclusive-2");
+  });
+  releaseFirstExclusive();
+  await Promise.race([
+    Promise.all([firstExclusive, queuedTransaction, secondExclusive]),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("exclusive/transaction FIFO queue deadlocked")), 1_000),
+    ),
+  ]);
+  assert.deepEqual(fifoOrder, ["exclusive-1-start", "exclusive-1-end", "transaction", "exclusive-2"]);
+
+  await db._fileStore.close();
+  console.info("File-backed exclusive read/write admission regression passed.");
+} finally {
+  releaseExistingSettingRead();
+  rmSync(exclusiveReadBarrierStorageDir, { recursive: true, force: true });
+}
+
+const strictConnectionStorageDir = mkdtempSync(join(tmpdir(), "marinara-file-strict-connection-"));
+process.env.FILE_STORAGE_DIR = strictConnectionStorageDir;
+try {
+  const supported = await isDBStrictDurabilitySupported();
+  assert.equal(supported, process.platform !== "win32");
+  if (supported) {
+    await flushDBStrict();
+  } else {
+    await assert.rejects(flushDBStrict(), FileNativeStrictDurabilityUnsupportedError);
+  }
+  console.info("File-backed strict connection export regression passed.");
+} finally {
+  await closeDB();
+  rmSync(strictConnectionStorageDir, { recursive: true, force: true });
 }

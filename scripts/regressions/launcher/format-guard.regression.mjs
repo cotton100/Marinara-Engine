@@ -506,6 +506,57 @@ function shardedStorageFixture() {
   }
 }
 
+// Custom coordination tables use non-`id` primary keys. Prove the launcher
+// rollback path preserves them instead of deduplicating every row as keyless.
+{
+  const dir = shardedStorageFixture();
+  const tablesDir = join(dir, "tables");
+  const coordinationDir = join(tablesDir, "personal_extension_coordination");
+  const journalDir = join(tablesDir, "personal_extension_operation_journal");
+  mkdirSync(coordinationDir, { recursive: true });
+  mkdirSync(journalDir, { recursive: true });
+  writeFileSync(
+    join(coordinationDir, "coordination-a.json"),
+    JSON.stringify([
+      { extensionId: "extension-a", mode: "inactive", createdAt: "2026-08-26T00:00:00.000Z" },
+      { extensionId: "extension-b", mode: "inactive", createdAt: "2026-08-26T00:00:01.000Z" },
+    ]),
+  );
+  writeFileSync(
+    join(journalDir, "journal-a.json"),
+    JSON.stringify([
+      { operationDigest: "digest-a", extensionId: "extension-a", createdAt: "2026-08-26T00:00:02.000Z" },
+      { operationDigest: "digest-b", extensionId: "extension-b", createdAt: "2026-08-26T00:00:03.000Z" },
+    ]),
+  );
+  try {
+    await unshardLauncherStorage({ env: { FILE_STORAGE_DIR: dir }, probeServer: false });
+    const coordination = JSON.parse(readFileSync(join(tablesDir, "personal_extension_coordination.json"), "utf8"));
+    const journal = JSON.parse(readFileSync(join(tablesDir, "personal_extension_operation_journal.json"), "utf8"));
+    assert.deepEqual(
+      coordination.map((entry) => entry.extensionId),
+      ["extension-a", "extension-b"],
+      "coordination rows survive unshard using extensionId as their primary key",
+    );
+    assert.deepEqual(
+      journal.map((entry) => entry.operationDigest),
+      ["digest-a", "digest-b"],
+      "operation journals survive unshard using operationDigest as their primary key",
+    );
+    const tableEntries = readdirSync(tablesDir);
+    assert.ok(
+      tableEntries.some((name) => name.startsWith("personal_extension_coordination.post-unshard-")),
+      "coordination shards are retained as post-unshard rollback evidence",
+    );
+    assert.ok(
+      tableEntries.some((name) => name.startsWith("personal_extension_operation_journal.post-unshard-")),
+      "journal shards are retained as post-unshard rollback evidence",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ── unshard: duplicates keep-first, bak-only shards recovered ──
 
 {

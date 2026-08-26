@@ -13,6 +13,7 @@ import type { DB } from "../../db/connection.js";
 import { installedExtensions } from "../../db/schema/index.js";
 import { newId, now } from "../../utils/id-generator.js";
 import { computePersonalExtensionHash } from "./personal-extension-hash.js";
+import { createPersonalExtensionCoordinationKernel } from "./personal-extension-coordination-kernel.service.js";
 
 type ExtensionRow = typeof installedExtensions.$inferSelect;
 type ExtensionInsert = typeof installedExtensions.$inferInsert;
@@ -136,11 +137,13 @@ function normalizePayload(input: CreatePersonalExtensionInput, source: PersonalE
 }
 
 export function createPersonalExtensionsStorage(db: DB) {
-  const getById = async (id: string) => {
-    const rows = await db.select().from(installedExtensions).where(eq(installedExtensions.id, id));
+  const coordination = createPersonalExtensionCoordinationKernel(db);
+  const getByIdFrom = async (source: DB, id: string) => {
+    const rows = await source.select().from(installedExtensions).where(eq(installedExtensions.id, id));
     const row = rows[0];
     return row ? mapExtension(row) : null;
   };
+  const getById = (id: string) => getByIdFrom(db, id);
 
   const getByName = async (name: string) => {
     const normalizedName = name.trim().toLowerCase();
@@ -154,10 +157,11 @@ export function createPersonalExtensionsStorage(db: DB) {
     return row ? mapExtension(row) : null;
   };
 
-  const list = async () => {
-    const rows = await db.select().from(installedExtensions).orderBy(desc(installedExtensions.installedAt));
+  const listFrom = async (source: DB) => {
+    const rows = await source.select().from(installedExtensions).orderBy(desc(installedExtensions.installedAt));
     return rows.map(mapExtension);
   };
+  const list = () => listFrom(db);
 
   return {
     list,
@@ -191,113 +195,132 @@ export function createPersonalExtensionsStorage(db: DB) {
     },
 
     async update(id: string, data: UpdatePersonalExtensionInput) {
-      const existing = await getById(id);
-      if (!existing) return null;
-      const runtime = data.runtime ?? existing.runtime;
-      const payload = normalizePayload(
-        {
-          name: data.name ?? existing.name,
-          version: data.version === undefined ? existing.version : data.version,
-          description: data.description ?? existing.description,
-          runtime,
-          capabilities:
-            runtime === "client" ? (data.capabilities === undefined ? existing.capabilities : data.capabilities) : [],
-          css: runtime === "client" ? (data.css === undefined ? existing.css : data.css) : null,
-          js: runtime === "client" ? (data.js === undefined ? existing.js : data.js) : null,
-          serverJs: runtime === "server" ? (data.serverJs === undefined ? existing.serverJs : data.serverJs) : null,
-        },
-        existing.source,
-      );
-      const contentHash = computePersonalExtensionHash(payload);
-      const executableChanged = contentHash !== existing.contentHash;
-      const revisions = executableChanged
-        ? [
-            revisionFrom(existing),
-            ...existing.revisions.filter((revision) => revision.contentHash !== existing.contentHash),
-          ].slice(0, MAX_REVISIONS)
-        : existing.revisions;
-      const update: Partial<ExtensionInsert> = {
-        ...payload,
-        capabilities: JSON.stringify(payload.capabilities),
-        contentHash,
-        revisions: JSON.stringify(revisions),
-        updatedAt: now(),
-      };
-      if (executableChanged) {
-        update.enabled = "false";
-        update.approvedHash = null;
-      } else if (data.enabled === false) {
-        update.enabled = "false";
-      }
-      await db.update(installedExtensions).set(update).where(eq(installedExtensions.id, id));
-      return getById(id);
+      return coordination.runExtensionLifecycleMutation(id, async (tx) => {
+        const existing = await getByIdFrom(tx, id);
+        if (!existing) return null;
+        const runtime = data.runtime ?? existing.runtime;
+        const payload = normalizePayload(
+          {
+            name: data.name ?? existing.name,
+            version: data.version === undefined ? existing.version : data.version,
+            description: data.description ?? existing.description,
+            runtime,
+            capabilities:
+              runtime === "client" ? (data.capabilities === undefined ? existing.capabilities : data.capabilities) : [],
+            css: runtime === "client" ? (data.css === undefined ? existing.css : data.css) : null,
+            js: runtime === "client" ? (data.js === undefined ? existing.js : data.js) : null,
+            serverJs: runtime === "server" ? (data.serverJs === undefined ? existing.serverJs : data.serverJs) : null,
+          },
+          existing.source,
+        );
+        const contentHash = computePersonalExtensionHash(payload);
+        const executableChanged = contentHash !== existing.contentHash;
+        const revisions = executableChanged
+          ? [
+              revisionFrom(existing),
+              ...existing.revisions.filter((revision) => revision.contentHash !== existing.contentHash),
+            ].slice(0, MAX_REVISIONS)
+          : existing.revisions;
+        const update: Partial<ExtensionInsert> = {
+          ...payload,
+          capabilities: JSON.stringify(payload.capabilities),
+          contentHash,
+          revisions: JSON.stringify(revisions),
+          updatedAt: now(),
+        };
+        if (executableChanged) {
+          update.enabled = "false";
+          update.approvedHash = null;
+        } else if (data.enabled === false) {
+          update.enabled = "false";
+        }
+        await tx.update(installedExtensions).set(update).where(eq(installedExtensions.id, id));
+        return getByIdFrom(tx, id);
+      });
     },
 
     async approve(id: string, contentHash: string) {
-      const existing = await getById(id);
-      if (!existing) return null;
-      if (existing.contentHash !== contentHash) {
-        throw new Error("Extension content changed before approval. Review the current code and try again.");
-      }
-      await db
-        .update(installedExtensions)
-        .set({ contentHash, approvedHash: contentHash, enabled: "true", updatedAt: now() })
-        .where(eq(installedExtensions.id, id));
-      return getById(id);
+      return coordination.runExtensionLifecycleMutation(id, async (tx) => {
+        const existing = await getByIdFrom(tx, id);
+        if (!existing) return null;
+        if (existing.contentHash !== contentHash) {
+          throw new Error("Extension content changed before approval. Review the current code and try again.");
+        }
+        await tx
+          .update(installedExtensions)
+          .set({ contentHash, approvedHash: contentHash, enabled: "true", updatedAt: now() })
+          .where(eq(installedExtensions.id, id));
+        return getByIdFrom(tx, id);
+      });
     },
 
     async disable(id: string) {
-      const existing = await getById(id);
-      if (!existing) return null;
-      await db
-        .update(installedExtensions)
-        .set({ enabled: "false", updatedAt: now() })
-        .where(eq(installedExtensions.id, id));
-      return getById(id);
+      return coordination.runExtensionLifecycleMutation(id, async (tx) => {
+        const existing = await getByIdFrom(tx, id);
+        if (!existing) return null;
+        await tx
+          .update(installedExtensions)
+          .set({ enabled: "false", updatedAt: now() })
+          .where(eq(installedExtensions.id, id));
+        return getByIdFrom(tx, id);
+      });
     },
 
     async disableExternal() {
       const extensions = await list();
-      const external = extensions.filter((extension) => extension.source !== "professor_mari" && extension.enabled);
-      for (const extension of external) {
-        await db
-          .update(installedExtensions)
-          .set({ enabled: "false", updatedAt: now() })
-          .where(eq(installedExtensions.id, extension.id));
-      }
-      return external.length;
+      const externalIds = extensions
+        .filter((extension) => extension.source !== "professor_mari")
+        .map((extension) => extension.id);
+      return coordination.runExtensionLifecycleMutations(externalIds, async (tx) => {
+        const external = (await listFrom(tx)).filter(
+          (extension) =>
+            externalIds.includes(extension.id) && extension.source !== "professor_mari" && extension.enabled,
+        );
+        for (const extension of external) {
+          await tx
+            .update(installedExtensions)
+            .set({ enabled: "false", updatedAt: now() })
+            .where(eq(installedExtensions.id, extension.id));
+        }
+        return external.length;
+      });
     },
 
     async rollback(id: string, contentHash: string) {
-      const existing = await getById(id);
-      if (!existing) return null;
-      const revision = existing.revisions.find((candidate) => candidate.contentHash === contentHash);
-      if (!revision) throw new Error("Extension revision not found");
-      const nextRevisions = [
-        revisionFrom(existing),
-        ...existing.revisions.filter((candidate) => candidate.contentHash !== contentHash),
-      ].slice(0, MAX_REVISIONS);
-      await db
-        .update(installedExtensions)
-        .set({
-          version: revision.version,
-          runtime: revision.runtime,
-          capabilities: JSON.stringify(revision.capabilities),
-          css: revision.runtime === "client" ? revision.css : null,
-          js: revision.runtime === "client" ? revision.js : null,
-          serverJs: revision.runtime === "server" ? revision.serverJs : null,
-          enabled: "false",
-          contentHash: revision.contentHash,
-          approvedHash: null,
-          revisions: JSON.stringify(nextRevisions),
-          updatedAt: now(),
-        })
-        .where(eq(installedExtensions.id, id));
-      return getById(id);
+      return coordination.runExtensionLifecycleMutation(id, async (tx) => {
+        const existing = await getByIdFrom(tx, id);
+        if (!existing) return null;
+        const revision = existing.revisions.find((candidate) => candidate.contentHash === contentHash);
+        if (!revision) throw new Error("Extension revision not found");
+        const nextRevisions = [
+          revisionFrom(existing),
+          ...existing.revisions.filter((candidate) => candidate.contentHash !== contentHash),
+        ].slice(0, MAX_REVISIONS);
+        await tx
+          .update(installedExtensions)
+          .set({
+            version: revision.version,
+            runtime: revision.runtime,
+            capabilities: JSON.stringify(revision.capabilities),
+            css: revision.runtime === "client" ? revision.css : null,
+            js: revision.runtime === "client" ? revision.js : null,
+            serverJs: revision.runtime === "server" ? revision.serverJs : null,
+            enabled: "false",
+            contentHash: revision.contentHash,
+            approvedHash: null,
+            revisions: JSON.stringify(nextRevisions),
+            updatedAt: now(),
+          })
+          .where(eq(installedExtensions.id, id));
+        return getByIdFrom(tx, id);
+      });
     },
 
-    async remove(id: string) {
-      await db.delete(installedExtensions).where(eq(installedExtensions.id, id));
+    async remove(id: string, beforeRemove?: (tx: DB) => Promise<void>) {
+      await coordination.runExtensionRetirementMutation(id, async (tx) => {
+        await beforeRemove?.(tx);
+        await tx.delete(installedExtensions).where(eq(installedExtensions.id, id));
+      });
     },
   };
 }

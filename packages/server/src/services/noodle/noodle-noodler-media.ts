@@ -6,6 +6,7 @@ import { DATA_DIR } from "../../utils/data-dir.js";
 import { assertInsideDir } from "../../utils/security.js";
 import { getSharp } from "../../utils/sharp.js";
 import { stageImageToDisk } from "../image/image-generation.js";
+import { runWithProfileAssetMutation } from "../import/profile-asset-mutation-gate.js";
 
 // NoodleR-owned media lives under the gallery data dir but in a namespace whose
 // path contains a slash, so the public gallery serve routes (which reject slashes in the
@@ -80,22 +81,24 @@ const TEASER_SUFFIX = ".teaser.jpg";
  * decoded — callers must fail closed and serve nothing rather than the original.
  */
 export async function readNoodlerLockedTeaser(absolutePath: string): Promise<Buffer | null> {
-  const teaserPath = `${absolutePath}${TEASER_SUFFIX}`;
-  if (existsSync(teaserPath)) return readFileSync(teaserPath);
-  const sharp = await getSharp();
-  if (!sharp) return null;
-  try {
-    const teaser: Buffer = await sharp(absolutePath)
-      .resize({ width: TEASER_WIDTH, withoutEnlargement: true })
-      .blur(2)
-      .jpeg({ quality: 60 })
-      .toBuffer();
-    writeFileSync(teaserPath, teaser);
-    return teaser;
-  } catch (error) {
-    logger.warn(error, "[noodler] Failed to build locked teaser for %s", absolutePath);
-    return null;
-  }
+  return runWithProfileAssetMutation(async () => {
+    const teaserPath = `${absolutePath}${TEASER_SUFFIX}`;
+    if (existsSync(teaserPath)) return readFileSync(teaserPath);
+    const sharp = await getSharp();
+    if (!sharp) return null;
+    try {
+      const teaser: Buffer = await sharp(absolutePath)
+        .resize({ width: TEASER_WIDTH, withoutEnlargement: true })
+        .blur(2)
+        .jpeg({ quality: 60 })
+        .toBuffer();
+      writeFileSync(teaserPath, teaser);
+      return teaser;
+    } catch (error) {
+      logger.warn(error, "[noodler] Failed to build locked teaser for %s", absolutePath);
+      return null;
+    }
+  });
 }
 
 export function readNoodlerMediaPath(post: Pick<NoodlerManagedPost, "metadata">): string | null {

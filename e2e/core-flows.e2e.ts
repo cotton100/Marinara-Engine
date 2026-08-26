@@ -6567,6 +6567,203 @@ test("Personal Extensions default to the Professor Mari-only locked workflow", a
   expect(warningColors.warning).toBe(warningColors.accent);
 });
 
+test("mobile Personal Extensions recover after DOM-only admin autofill without replacing a valid key", async ({
+  page,
+}, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chromium", "Mobile admin autofill recovery runs once.");
+
+  const adminSecret = "mobile-admin-secret-regression";
+  const rejectedSecret = "mobile-admin-secret-rejected";
+  const unrelatedForbiddenSecret = "mobile-admin-secret-unrelated-forbidden";
+  const cachedExtensionName = "Cached Admin Extension";
+  const staleExtensionName = "Stale Delayed Admin Extension";
+  const extensionFixture = {
+    id: "cached-admin-extension",
+    name: cachedExtensionName,
+    version: "1.0.0",
+    description: "Privileged cache regression fixture",
+    runtime: "client",
+    capabilities: [],
+    css: null,
+    js: "void 0;",
+    serverJs: null,
+    enabled: false,
+    contentHash: `sha256:${"a".repeat(64)}`,
+    approvedHash: null,
+    source: "professor_mari",
+    revisions: [],
+    installedAt: "2026-08-23T00:00:00.000Z",
+    createdAt: "2026-08-23T00:00:00.000Z",
+    updatedAt: "2026-08-23T00:00:00.000Z",
+  };
+  const policyFixture = {
+    externalExtensionsEnvEnabled: true,
+    externalExtensionsEnabled: true,
+    serverSandboxAvailable: false,
+    serverSandboxBackend: null,
+    serverSandboxReason: "Browser-only regression fixture",
+  };
+  const observedSecrets: Array<string | null> = [];
+  const observedPolicySecrets: Array<string | null> = [];
+  let nextAuthorizedDelay: "candidate" | "stale-query" | null = null;
+  let delayedAuthorizedRequests = 0;
+  let releaseDelayedAuthorizedRequest = () => {};
+  await page.route("**/api/personal-extensions", async (route) => {
+    const receivedSecret = route.request().headers()["x-admin-secret"] ?? null;
+    observedSecrets.push(receivedSecret);
+    const delayedKind = receivedSecret === adminSecret ? nextAuthorizedDelay : null;
+    const isDelayedAuthorizedRequest = delayedKind !== null;
+    if (isDelayedAuthorizedRequest) {
+      nextAuthorizedDelay = null;
+      delayedAuthorizedRequests += 1;
+      await new Promise<void>((resolve) => {
+        releaseDelayedAuthorizedRequest = resolve;
+      });
+    }
+    try {
+      await route.fulfill({
+        status: receivedSecret === adminSecret ? 200 : 403,
+        contentType: "application/json",
+        body: JSON.stringify(
+          receivedSecret === adminSecret
+            ? [delayedKind === "stale-query" ? { ...extensionFixture, name: staleExtensionName } : extensionFixture]
+            : {
+                error:
+                  receivedSecret === unrelatedForbiddenSecret
+                    ? "Forbidden"
+                    : "Invalid or missing X-Admin-Secret header",
+              },
+        ),
+      });
+    } catch (error) {
+      // The fixed client aborts the delayed request when the key changes.
+      if (!isDelayedAuthorizedRequest) throw error;
+    }
+  });
+  await page.route("**/api/personal-extensions/policy", async (route) => {
+    observedPolicySecrets.push(route.request().headers()["x-admin-secret"] ?? null);
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(policyFixture) });
+  });
+
+  await page.goto("/");
+  await page.locator('[data-tour="panel-settings"]').click();
+  await page.getByRole("tab", { name: "Addons" }).click();
+  const accessError = page
+    .locator("#settings-section-personal-extensions")
+    .getByText("Personal Extension management needs localhost or Admin Access on this device.", { exact: true });
+  await expect(accessError).toBeVisible();
+
+  await page.getByRole("tab", { name: "Advanced" }).click();
+  const adminInput = page.getByPlaceholder("ADMIN_SECRET");
+  await expect(adminInput).toBeVisible();
+  await adminInput.evaluate((element, value) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    if (!setter) throw new Error("HTMLInputElement value setter is unavailable");
+    setter.call(element, value);
+  }, `  ${adminSecret}  `);
+  await expect(adminInput).toHaveValue(`  ${adminSecret}  `);
+
+  nextAuthorizedDelay = "candidate";
+  await adminInput.locator("..").getByRole("button", { name: "Save" }).click();
+  await expect.poll(() => delayedAuthorizedRequests).toBe(1);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("marinara_admin_secret"))).toBeNull();
+  releaseDelayedAuthorizedRequest();
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("marinara_admin_secret"))).toBe(adminSecret);
+
+  await page.getByRole("tab", { name: "Addons" }).click();
+  await expect(accessError).toHaveCount(0);
+  await expect(page.getByText(cachedExtensionName, { exact: true })).toBeVisible();
+
+  // Start a list request under the old valid key, hold its response, then
+  // replace the key. A late privileged response must not refill the cache.
+  nextAuthorizedDelay = "stale-query";
+  await page.reload();
+  const settingsButton = page.locator('[data-tour="panel-settings"]');
+  if ((await settingsButton.getAttribute("aria-pressed")) !== "true") {
+    await settingsButton.click();
+  }
+  const addonsTab = page.getByRole("tab", { name: "Addons" });
+  await expect(addonsTab).toBeVisible();
+  if ((await addonsTab.getAttribute("aria-selected")) !== "true") {
+    await addonsTab.click();
+  }
+  await expect.poll(() => delayedAuthorizedRequests).toBe(2);
+  const authorizedBeforeRejectedSave = observedSecrets.filter((value) => value === adminSecret).length;
+  const policyRequestsBeforeRejectedSave = observedPolicySecrets.filter((value) => value === adminSecret).length;
+  await page.getByRole("tab", { name: "Advanced" }).click();
+  await expect(adminInput).toBeVisible();
+  await adminInput.evaluate((element, value) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    if (!setter) throw new Error("HTMLInputElement value setter is unavailable");
+    setter.call(element, value);
+  }, rejectedSecret);
+  await adminInput.locator("..").getByRole("button", { name: "Save" }).click();
+  await expect
+    .poll(() => observedSecrets.filter((value) => value === rejectedSecret).length, { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  await expect
+    .poll(() => observedSecrets.filter((value) => value === adminSecret).length, { timeout: 10_000 })
+    .toBeGreaterThan(authorizedBeforeRejectedSave);
+  await expect
+    .poll(() => observedPolicySecrets.filter((value) => value === adminSecret).length, { timeout: 10_000 })
+    .toBeGreaterThan(policyRequestsBeforeRejectedSave);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("marinara_admin_secret"))).toBe(adminSecret);
+  await expect(
+    page.getByText("The server rejected this key. The previously saved key was not changed.", { exact: true }),
+  ).toBeVisible();
+  releaseDelayedAuthorizedRequest();
+  await page.getByRole("tab", { name: "Addons" }).click();
+  await expect(page.getByText(cachedExtensionName, { exact: true })).toBeVisible();
+  await page.waitForTimeout(250);
+  await expect(page.getByText(staleExtensionName, { exact: true })).toHaveCount(0);
+  await expect(accessError).toHaveCount(0);
+  await expect(page.locator("#settings-section-external-extensions")).toBeVisible();
+
+  // An unrelated 403 must not be mislabeled as a rejected key, and must not
+  // replace the valid key that was already stored for this browser.
+  await page.getByRole("tab", { name: "Advanced" }).click();
+  await adminInput.fill(unrelatedForbiddenSecret);
+  await adminInput.locator("..").getByRole("button", { name: "Save" }).click();
+  await expect
+    .poll(() => observedSecrets.filter((value) => value === unrelatedForbiddenSecret).length, { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  await expect.poll(() => page.evaluate(() => localStorage.getItem("marinara_admin_secret"))).toBe(adminSecret);
+  await expect(
+    page.getByText("The server could not verify Admin Access. The previously saved key was not changed.", {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page.getByRole("tab", { name: "Addons" }).click();
+  await expect(page.getByText(cachedExtensionName, { exact: true })).toBeVisible();
+
+  const authorizedBeforeReload = observedSecrets.filter((value) => value === adminSecret).length;
+  await page.reload();
+  await page.evaluate(async () => {
+    const { api } = await import("/src/lib/api-client.ts");
+    await api.get("/personal-extensions");
+  });
+  expect(observedSecrets.filter((value) => value === adminSecret).length).toBeGreaterThan(authorizedBeforeReload);
+});
+
+test("mobile Personal Extension runtime recovers through bounded startup retries", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "mobile-chromium", "Mobile runtime recovery runs once.");
+
+  let runtimeRequests = 0;
+  await page.route("**/api/personal-extensions/runtime/client", async (route) => {
+    runtimeRequests += 1;
+    await route.fulfill({
+      status: runtimeRequests >= 5 ? 200 : 503,
+      contentType: "application/json",
+      body: JSON.stringify(runtimeRequests >= 5 ? [] : { error: "Tailnet route is not ready" }),
+    });
+  });
+
+  await page.goto("/");
+  await expect.poll(() => runtimeRequests, { timeout: 20_000 }).toBeGreaterThanOrEqual(5);
+  await page.waitForTimeout(6_000);
+  expect(runtimeRequests).toBe(5);
+});
+
 test("external Agent imports require the Danger Zone gate and explicit capabilities", async ({
   page,
   request,

@@ -2,7 +2,7 @@
 // Storage: Noodle Fake Social Media
 // ──────────────────────────────────────────────
 import { existsSync } from "node:fs";
-import { and, desc, eq, gt, inArray, isNull, lt, or } from "../../db/file-query.js";
+import { and, desc, eq, gt, inArray, isNull, lt, ne, or } from "../../db/file-query.js";
 import {
   createNoodlePoll,
   DEFAULT_NOODLER_CREATOR_REPLIES_PER_24_HOURS,
@@ -191,6 +191,22 @@ type DigestRow = typeof noodleActivityDigests.$inferSelect;
 type RefreshRunRow = typeof noodleRefreshRuns.$inferSelect;
 type SubscriptionRow = typeof noodleAccountSubscriptions.$inferSelect;
 type PostUnlockRow = typeof noodlePostUnlocks.$inferSelect;
+type NoodleCompanionAuthorSnapshot = Pick<NoodleAuthorSnapshot, "displayName">;
+type NoodleCompanionSnapshot = {
+  schemaVersion: 1;
+  accounts: Array<Pick<NoodleAccount, "id" | "kind" | "entityId" | "handle" | "displayName">>;
+  posts: Array<
+    Pick<NoodlePost, "id" | "authorAccountId" | "content" | "createdAt"> & {
+      authorSnapshot: NoodleCompanionAuthorSnapshot | null;
+    }
+  >;
+  interactions: Array<
+    Pick<
+      NoodleInteraction,
+      "id" | "postId" | "parentInteractionId" | "actorAccountId" | "type" | "content" | "createdAt"
+    > & { actorSnapshot: NoodleCompanionAuthorSnapshot | null }
+  >;
+};
 type PublicCreateInteractionCommand = Omit<NoodleCreateInteractionInput, "actorKind" | "actorEntityId"> & {
   actorAccountId: string;
 };
@@ -454,6 +470,11 @@ function parseAuthorSnapshot(value: unknown): NoodleAuthorSnapshot | null {
     avatarUrl: typeof parsed.avatarUrl === "string" && parsed.avatarUrl ? parsed.avatarUrl : null,
     avatarCrop: normalizeAvatarCrop(parsed.avatarCrop),
   };
+}
+
+function companionAuthorSnapshot(value: unknown): NoodleCompanionAuthorSnapshot | null {
+  const snapshot = parseAuthorSnapshot(value);
+  return snapshot ? { displayName: snapshot.displayName } : null;
 }
 
 function normalizeBool(value: unknown): boolean {
@@ -3708,6 +3729,93 @@ export function createNoodleStorage(db: DB) {
         .from(noodlePostUnlocks)
         .where(eq(noodlePostUnlocks.viewerAccountId, viewerAccountId));
       return rows.map(mapPostUnlock);
+    },
+
+    /**
+     * A side-effect-free projection for local companions that only need the public timeline.
+     * Keep these as direct SELECTs: the normal list/bootstrap paths intentionally reconcile
+     * profile state and schedules, which would turn a polling reader into a writer.
+     */
+    async readOnlyCompanionSnapshot(): Promise<NoodleCompanionSnapshot> {
+      const accountRows = await db
+        .select({
+          id: noodleAccounts.id,
+          kind: noodleAccounts.kind,
+          entityId: noodleAccounts.entityId,
+          handle: noodleAccounts.handle,
+          displayName: noodleAccounts.displayName,
+          updatedAt: noodleAccounts.updatedAt,
+        })
+        .from(noodleAccounts)
+        .where(and(eq(noodleAccounts.platform, "noodle"), ne(noodleAccounts.id, NOODLE_SETTINGS_KEY)))
+        .orderBy(desc(noodleAccounts.updatedAt));
+      const accountIds = accountRows.map((row) => row.id);
+      if (accountIds.length === 0) return { schemaVersion: 1, accounts: [], posts: [], interactions: [] };
+
+      const postRows = await db
+        .select({
+          id: noodlePosts.id,
+          authorAccountId: noodlePosts.authorAccountId,
+          content: noodlePosts.content,
+          authorSnapshot: noodlePosts.authorSnapshot,
+          createdAt: noodlePosts.createdAt,
+        })
+        .from(noodlePosts)
+        .where(inArray(noodlePosts.authorAccountId, accountIds))
+        .orderBy(desc(noodlePosts.createdAt))
+        .limit(160);
+      const postIds = postRows.map((row) => row.id);
+      const interactionRows =
+        postIds.length === 0
+          ? []
+          : await db
+              .select({
+                id: noodleInteractions.id,
+                postId: noodleInteractions.postId,
+                parentInteractionId: noodleInteractions.parentInteractionId,
+                actorAccountId: noodleInteractions.actorAccountId,
+                type: noodleInteractions.type,
+                content: noodleInteractions.content,
+                actorSnapshot: noodleInteractions.actorSnapshot,
+                createdAt: noodleInteractions.createdAt,
+              })
+              .from(noodleInteractions)
+              .where(inArray(noodleInteractions.postId, postIds))
+              .orderBy(noodleInteractions.createdAt);
+      const accountIdSet = new Set(accountIds);
+
+      return {
+        schemaVersion: 1,
+        accounts: accountRows.map((row) => ({
+          id: row.id,
+          kind: normalizeAccountKind(row.kind),
+          entityId: row.entityId,
+          handle: row.handle,
+          displayName: row.displayName,
+        })),
+        posts: postRows.map((row) => ({
+          id: row.id,
+          authorAccountId: row.authorAccountId,
+          content: row.content ?? "",
+          createdAt: row.createdAt,
+          authorSnapshot: companionAuthorSnapshot(row.authorSnapshot),
+        })),
+        interactions: interactionRows
+          .filter((row) => accountIdSet.has(row.actorAccountId))
+          .map((row) => ({
+            id: row.id,
+            postId: row.postId,
+            parentInteractionId: row.parentInteractionId ?? null,
+            actorAccountId: row.actorAccountId,
+            type:
+              row.type === "repost" || row.type === "reply" || row.type === "like" || row.type === "vote"
+                ? row.type
+                : "like",
+            content: row.content ?? null,
+            createdAt: row.createdAt,
+            actorSnapshot: companionAuthorSnapshot(row.actorSnapshot),
+          })),
+      };
     },
 
     async bootstrap(): Promise<NoodleBootstrap> {

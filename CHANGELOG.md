@@ -8,6 +8,7 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ### Fixed
 
+- Privileged local companions can now poll an active Noodle timeline without triggering profile reconciliation or schedule writes.
 - Personal Extension sync checks can now use compact chat-tail and lorebook-entry projection reads, avoiding unused message metadata and raw embedding vectors in read-only payloads.
 - Personal Extension coordination can now request a strict lorebook-entry projection that replaces raw embedding arrays with `missing`, `ready`, or `invalid`, reducing sync payloads while leaving the existing entry contract unchanged.
 - Mobile Admin Access now verifies a replacement key before saving it, preserves the last working key when verification fails, and restores Personal Extension access without allowing delayed requests to overwrite the recovered state.

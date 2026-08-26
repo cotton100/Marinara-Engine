@@ -2,7 +2,7 @@
 // Storage: Noodle Fake Social Media
 // ──────────────────────────────────────────────
 import { existsSync } from "node:fs";
-import { and, desc, eq, gt, inArray, isNull, lt, ne, or } from "../../db/file-query.js";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, ne, or } from "../../db/file-query.js";
 import {
   createNoodlePoll,
   DEFAULT_NOODLER_CREATOR_REPLIES_PER_24_HOURS,
@@ -207,6 +207,15 @@ type NoodleCompanionSnapshot = {
     > & { actorSnapshot: NoodleCompanionAuthorSnapshot | null }
   >;
 };
+export const NOODLE_COMPANION_SNAPSHOT_REPLY_LIMIT = 4096;
+export const NOODLE_COMPANION_SNAPSHOT_CAPACITY_ERROR =
+  "Noodle companion snapshot exceeds the supported reply capacity";
+export class NoodleCompanionSnapshotCapacityError extends Error {
+  constructor() {
+    super(NOODLE_COMPANION_SNAPSHOT_CAPACITY_ERROR);
+    this.name = "NoodleCompanionSnapshotCapacityError";
+  }
+}
 type PublicCreateInteractionCommand = Omit<NoodleCreateInteractionInput, "actorKind" | "actorEntityId"> & {
   actorAccountId: string;
 };
@@ -3780,9 +3789,18 @@ export function createNoodleStorage(db: DB) {
                 createdAt: noodleInteractions.createdAt,
               })
               .from(noodleInteractions)
-              .where(inArray(noodleInteractions.postId, postIds))
-              .orderBy(noodleInteractions.createdAt);
-      const accountIdSet = new Set(accountIds);
+              .where(
+                and(
+                  inArray(noodleInteractions.postId, postIds),
+                  inArray(noodleInteractions.actorAccountId, accountIds),
+                  eq(noodleInteractions.type, "reply"),
+                ),
+              )
+              .orderBy(asc(noodleInteractions.createdAt), asc(noodleInteractions.id))
+              .limit(NOODLE_COMPANION_SNAPSHOT_REPLY_LIMIT + 1);
+      if (interactionRows.length > NOODLE_COMPANION_SNAPSHOT_REPLY_LIMIT) {
+        throw new NoodleCompanionSnapshotCapacityError();
+      }
 
       return {
         schemaVersion: 1,
@@ -3800,21 +3818,16 @@ export function createNoodleStorage(db: DB) {
           createdAt: row.createdAt,
           authorSnapshot: companionAuthorSnapshot(row.authorSnapshot),
         })),
-        interactions: interactionRows
-          .filter((row) => accountIdSet.has(row.actorAccountId))
-          .map((row) => ({
-            id: row.id,
-            postId: row.postId,
-            parentInteractionId: row.parentInteractionId ?? null,
-            actorAccountId: row.actorAccountId,
-            type:
-              row.type === "repost" || row.type === "reply" || row.type === "like" || row.type === "vote"
-                ? row.type
-                : "like",
-            content: row.content ?? null,
-            createdAt: row.createdAt,
-            actorSnapshot: companionAuthorSnapshot(row.actorSnapshot),
-          })),
+        interactions: interactionRows.map((row) => ({
+          id: row.id,
+          postId: row.postId,
+          parentInteractionId: row.parentInteractionId ?? null,
+          actorAccountId: row.actorAccountId,
+          type: "reply",
+          content: row.content ?? null,
+          createdAt: row.createdAt,
+          actorSnapshot: companionAuthorSnapshot(row.actorSnapshot),
+        })),
       };
     },
 

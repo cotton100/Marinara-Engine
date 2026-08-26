@@ -163,7 +163,7 @@ try {
   assert.deepEqual(
     snapshot.interactions.map((interaction: { id: string }) => interaction.id),
     ["interaction-early", "interaction-late"],
-    "interactions are oldest first and exclude private actors and posts outside the bounded feed",
+    "replies are oldest first and exclude likes, votes, private actors, and posts outside the bounded feed",
   );
   assert.deepEqual(
     Object.keys(snapshot.interactions[0]).sort(),
@@ -187,6 +187,53 @@ try {
   const after = await storedRows();
   assert.deepEqual(after, before, "repeated snapshot requests must not change Noodle storage rows");
   assert.equal(tableDigest(after), beforeDigest, "repeated snapshot requests must preserve the Noodle table digest");
+
+  await fileDb
+    .insert(noodleInteractions)
+    .values(
+      Array.from({ length: 4094 }, (_, index) =>
+        interactionRow(
+          `capacity-reply-${String(index).padStart(4, "0")}`,
+          `post-${String((index % 160) + 2).padStart(3, "0")}`,
+          index % 2 === 0 ? "account-old" : "account-new",
+          new Date(Date.parse("2026-08-27T04:00:00.000Z") + index).toISOString(),
+        ),
+      ),
+    );
+  await fileDb._fileStore.flush();
+  const atCapacityBefore = await storedRows();
+  const atCapacityDigest = tableDigest(atCapacityBefore);
+  const atCapacity = await app.inject({
+    method: "GET",
+    url: "/api/capability-packages/noodle/snapshot",
+    headers: { "x-admin-secret": adminSecret },
+  });
+  assert.equal(atCapacity.statusCode, 200, atCapacity.body);
+  assert.equal(atCapacity.json().interactions.length, 4096, "the exact reply capacity remains available");
+  await fileDb._fileStore.flush();
+  const atCapacityAfter = await storedRows();
+  assert.deepEqual(atCapacityAfter, atCapacityBefore, "a snapshot at capacity must remain side-effect-free");
+  assert.equal(tableDigest(atCapacityAfter), atCapacityDigest, "a snapshot at capacity must preserve storage digests");
+
+  await fileDb
+    .insert(noodleInteractions)
+    .values(interactionRow("capacity-reply-overflow", "post-161", "account-new", "2026-08-27T05:00:00.000Z"));
+  await fileDb._fileStore.flush();
+  const overflowBefore = await storedRows();
+  const overflowDigest = tableDigest(overflowBefore);
+  const overflow = await app.inject({
+    method: "GET",
+    url: "/api/capability-packages/noodle/snapshot",
+    headers: { "x-admin-secret": adminSecret },
+  });
+  assert.equal(overflow.statusCode, 409, overflow.body);
+  assert.deepEqual(overflow.json(), {
+    error: "Noodle companion snapshot exceeds the supported reply capacity",
+  });
+  await fileDb._fileStore.flush();
+  const overflowAfter = await storedRows();
+  assert.deepEqual(overflowAfter, overflowBefore, "an overflowing snapshot must fail without changing storage rows");
+  assert.equal(tableDigest(overflowAfter), overflowDigest, "an overflowing snapshot must preserve storage digests");
 } finally {
   await app.close();
   await fileDb._fileStore.close();
@@ -292,6 +339,8 @@ async function dbSeed() {
       interactionRow("interaction-early", "post-160", "account-old", "2026-08-27T03:00:01.000Z"),
       interactionRow("interaction-private-actor", "post-161", "account-private", "2026-08-27T03:00:00.000Z"),
       interactionRow("interaction-old-post", "post-000", "account-old", "2026-08-27T03:00:03.000Z"),
+      interactionRow("interaction-like", "post-161", "account-new", "2026-08-27T03:00:04.000Z", "like"),
+      interactionRow("interaction-vote", "post-161", "account-new", "2026-08-27T03:00:05.000Z", "vote"),
     ]);
 }
 
@@ -315,13 +364,19 @@ function accountRow(id: string, entityId: string, handle: string, updatedAt: str
   };
 }
 
-function interactionRow(id: string, postId: string, actorAccountId: string, createdAt: string) {
+function interactionRow(
+  id: string,
+  postId: string,
+  actorAccountId: string,
+  createdAt: string,
+  type: "reply" | "like" | "vote" = "reply",
+) {
   return {
     id,
     postId,
     parentInteractionId: null,
     actorAccountId,
-    type: "reply",
+    type,
     content: id,
     imageUrl: null,
     actorSnapshot:

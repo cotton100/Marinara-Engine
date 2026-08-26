@@ -10,7 +10,11 @@ import { capabilityModuleRuntime } from "../services/capability-packages/capabil
 import { refreshCapabilityAgentRegistry } from "../services/capability-packages/capability-agent-registry.service.js";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
 import { createAgentsStorage } from "../services/storage/agents.storage.js";
-import { createNoodleStorage } from "../services/storage/noodle.storage.js";
+import {
+  createNoodleStorage,
+  NOODLE_COMPANION_SNAPSHOT_CAPACITY_ERROR,
+  NoodleCompanionSnapshotCapacityError,
+} from "../services/storage/noodle.storage.js";
 
 const packageParams = z.object({
   id: z
@@ -87,7 +91,14 @@ export async function capabilityPackagesRoutes(app: FastifyInstance) {
       return reply.status(404).send({ error: "Active Noodle package not found" });
     }
     reply.header("Cache-Control", "private, no-store");
-    return createNoodleStorage(app.db).readOnlyCompanionSnapshot();
+    try {
+      return await createNoodleStorage(app.db).readOnlyCompanionSnapshot();
+    } catch (error) {
+      if (error instanceof NoodleCompanionSnapshotCapacityError) {
+        return reply.status(409).send({ error: NOODLE_COMPANION_SNAPSHOT_CAPACITY_ERROR });
+      }
+      throw error;
+    }
   });
   app.post<{ Params: { id: string; version: string } }>("/:id/updates/:version/decline", async (request, reply) => {
     if (!requirePrivilegedAccess(request, reply, { feature: "Agent update decline" })) return;

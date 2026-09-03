@@ -6149,6 +6149,27 @@ export function ChatSettingsDrawer({
                   )}
                 </div>
 
+                {metadata.autonomousMessages && chatCharIds.length === 1 && (
+                  <SettingsSwitch
+                    label={localizeUi("ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessages")}
+                    description={localizeUi(
+                      "ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessagesDescription",
+                    )}
+                    checked={metadata.autonomousCmbContextRefreshEnabled === true}
+                    onChange={(autonomousCmbContextRefreshEnabled) =>
+                      updateMeta.mutate({ id: chat.id, autonomousCmbContextRefreshEnabled })
+                    }
+                    labelPosition="start"
+                    className={cn(
+                      "justify-between rounded-md px-3 py-2.5 text-left",
+                      metadata.autonomousCmbContextRefreshEnabled === true
+                        ? "bg-[var(--primary)]/10 ring-1 ring-[var(--primary)]/30"
+                        : "bg-[var(--secondary)] hover:bg-[var(--accent)]",
+                    )}
+                    labelClassName="text-xs font-medium"
+                  />
+                )}
+
                 {/* Character exchanges toggle (group chats only) */}
                 {chatCharIds.length > 1 && (
                   <SettingsSwitch

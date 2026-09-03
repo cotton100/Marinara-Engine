@@ -484,6 +484,8 @@ export interface ChatMetadata {
   autonomousDailyBudget?: { date: string; counts: Record<string, number> };
   /** Per-chat override for the daily autonomous check-in cap. Null/omitted uses talkativeness defaults. */
   autonomousDailyCapOverride?: number | null;
+  /** Include the newest CMB shared tail in autonomous prompts. Missing/false preserves the normal prompt path. */
+  autonomousCmbContextRefreshEnabled?: boolean;
   /** Last successful autonomous message timestamp by character and intent key. */
   intentCooldowns?: Record<string, Record<string, string>>;
 

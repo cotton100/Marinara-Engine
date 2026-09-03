@@ -3040,6 +3040,8 @@
   "ui.chat.chatsettingsdrawer.recallRelevantFragmentsFromEarlierInThisChatAnd": "이 채팅의 이전 부분에서 관련된 내용을 회상하여 컨텍스트로 주입합니다.",
   "ui.chat.chatsettingsdrawer.recentMessageTail": "유지할 최근 메시지 수",
   "ui.chat.chatsettingsdrawer.recommendedUseAStrongStateOfTheArtImage": "권장: 스토리보드 이미지에는 강력한 최신 이미지 모델이나 Google Nano Banana 2 Lite와 동급인 모델을 사용하세요.",
+  "ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessages": "선톡 전 CMB 최신 맥락 반영",
+  "ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessagesDescription": "선톡을 만들기 전에 CMB로 연결된 합본 RP·단체대화의 최신 메시지를 최대 5개까지 반영합니다. CMB 맥락을 안전하게 읽을 수 없으면 기존 맥락으로 진행합니다.",
   "ui.chat.chatsettingsdrawer.regenerating": "재생성 중…",
   "ui.chat.chatsettingsdrawer.regeneratingSchedules": "스케줄 재생성 중…",
   "ui.chat.chatsettingsdrawer.removeAgent": "에이전트 삭제",

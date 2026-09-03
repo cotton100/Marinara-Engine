@@ -550,6 +550,7 @@ import { injectCommittedTrackerContext } from "../services/generation/committed-
 import { loadPriorBeholderState } from "../services/agents/beholder-state.js";
 import { injectGameGmPromptRuntime } from "../services/generation/game-gm-prompt-runtime.js";
 import { mergeConversationCharacterMemories } from "../services/generation/conversation-memory-context.js";
+import { buildAutonomousCmbPendingContext } from "../services/conversation/autonomous-cmb-context.service.js";
 import { injectMemoryRecallContext } from "../services/generation/memory-recall-context.js";
 import { shouldSkipAgentByMessageInterval } from "../services/generation/agent-cadence.js";
 import {
@@ -1667,6 +1668,10 @@ export async function generateRoutes(app: FastifyInstance) {
         mode: chatMode,
         allowEmpty: true,
       });
+      const autonomousCmbTargetCharacterId =
+        typeof input.forCharacterId === "string" && allCharacterIds.includes(input.forCharacterId)
+          ? input.forCharacterId
+          : null;
       const isHomeProfessorMariAssistantChat =
         chatMeta.internalAssistant === PROFESSOR_MARI_INTERNAL_CHAT_MARKER && characterIds.includes(PROFESSOR_MARI_ID);
 
@@ -1760,6 +1765,30 @@ export async function generateRoutes(app: FastifyInstance) {
         presetDefaultChoices: resolvedPresetDefaultChoices,
         chatPresetChoices: (chatMeta.presetChoices ?? {}) as Record<string, string | string[]>,
       });
+      const autonomousCmbPendingContextPromise =
+        chatMode === "conversation" &&
+        input.autonomous === true &&
+        input.impersonate !== true &&
+        !input.regenerateMessageId &&
+        !input.continueMessageId &&
+        input.turnGameBots !== true &&
+        chatMeta.autonomousCmbContextRefreshEnabled === true &&
+        autonomousCmbTargetCharacterId
+          ? buildAutonomousCmbPendingContext({
+              db: app.db,
+              targetChatId: input.chatId,
+              targetCharacterId: autonomousCmbTargetCharacterId,
+              timeZone: promptTimeZone,
+              wrapFormat: resolvedPreset ? normalizePromptWrapFormat(resolvedPreset.wrapFormat) : "xml",
+            }).catch((error) => {
+              logger.warn(
+                error,
+                "[autonomous-cmb] Could not prepare pending shared context for chat %s; continuing without it",
+                input.chatId,
+              );
+              return null;
+            })
+          : Promise.resolve(null);
 
       const eligibleCharacterActivityConfigs: typeof characterActivityAgentConfigs = [];
       if (
@@ -3757,11 +3786,19 @@ export async function generateRoutes(app: FastifyInstance) {
           });
         }
 
-        // ── Inject cross-chat awareness (after persona info so it appears right before chat history) ──
-        if (convoAwarenessBlock) {
+        // ── Inject cross-chat awareness and opt-in CMB pending context after persona info. ──
+        const autonomousCmbPendingContextBlock = await autonomousCmbPendingContextPromise;
+        const conversationAwarenessBlocks = [convoAwarenessBlock, autonomousCmbPendingContextBlock].filter(
+          (block): block is string => typeof block === "string" && block.length > 0,
+        );
+        if (conversationAwarenessBlocks.length > 0) {
           const firstUserIdx = finalMessages.findIndex((m) => m.role === "user" || m.role === "assistant");
           const insertAt = firstUserIdx >= 0 ? firstUserIdx : finalMessages.length;
-          finalMessages.splice(insertAt, 0, { role: "system", content: convoAwarenessBlock });
+          finalMessages.splice(
+            insertAt,
+            0,
+            ...conversationAwarenessBlocks.map((content) => ({ role: "system" as const, content })),
+          );
         }
 
         // ── Memory recall: semantic retrieval of relevant past conversation fragments ──

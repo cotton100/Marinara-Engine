@@ -6,6 +6,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ### Added
 
+- Conversation chats can opt autonomous messages into a bounded, read-only CMB shared-tail context without running a full sync or vectorization.
+
 ### Fixed
 
 - Privileged local companions can now poll an active Noodle timeline without triggering profile reconciliation or schedule writes; the read-only projection returns only a bounded reply set and fails closed instead of truncating an oversized timeline.

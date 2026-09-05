@@ -1,5 +1,6 @@
 import {
   normalizeCustomEmojiSelection,
+  normalizeSpeakerName,
   normalizeTextForMatch,
   parseGroupedSpeakerSegments,
   type CustomEmojiSelectionPrefs,
@@ -500,21 +501,19 @@ export function annotateContentWithReactions(
   const promptGroupFor = (clientIndex: number): GroupedSegment | null => {
     if (!clientGroups || !promptGroups) return null;
     const target = clientGroups[clientIndex]!;
-    const norm = normalizeTextForMatch(target.speaker!);
+    const norm = normalizeSpeakerName(target.speaker!);
     const marker =
       target.lines
         .flatMap((chunk) => chunk.split("\n"))
         .map((line) => line.trim())
         .find((line) => line.length > 0) ?? "";
     if (!marker) return null;
-    const sameSpeaker = promptGroups.filter(
-      (g) => isAttributableGroup(g) && normalizeTextForMatch(g.speaker!) === norm,
-    );
+    const sameSpeaker = promptGroups.filter((g) => isAttributableGroup(g) && normalizeSpeakerName(g.speaker!) === norm);
     if (sameSpeaker.length === 0) return null;
     let ordinal = 0;
     for (let i = 0; i < clientIndex; i++) {
       const g = clientGroups[i]!;
-      if (isAttributableGroup(g) && normalizeTextForMatch(g.speaker!) === norm) ordinal++;
+      if (isAttributableGroup(g) && normalizeSpeakerName(g.speaker!) === norm) ordinal++;
     }
     const hasMarkerLine = (g: GroupedSegment) =>
       g.lines.some((chunk) => chunk.split("\n").some((line) => line.trim() === marker));
@@ -558,11 +557,11 @@ export function annotateContentWithReactions(
 
     const storedSpeaker =
       typeof entry.segmentSpeaker === "string" && entry.segmentSpeaker.trim() ? entry.segmentSpeaker : null;
-    const wanted = storedSpeaker !== null ? normalizeTextForMatch(storedSpeaker) : null;
+    const wanted = storedSpeaker !== null ? normalizeSpeakerName(storedSpeaker) : null;
     const segIdx = typeof entry.segment === "number" && Number.isInteger(entry.segment) ? entry.segment : null;
     const seg =
       clientGroups && segIdx !== null && segIdx >= 0 && segIdx < clientGroups.length ? clientGroups[segIdx] : undefined;
-    const segSpeakerNorm = seg?.speaker != null ? normalizeTextForMatch(seg.speaker) : null;
+    const segSpeakerNorm = seg?.speaker != null ? normalizeSpeakerName(seg.speaker) : null;
     const segAligned =
       seg !== undefined &&
       segSpeakerNorm !== null &&
@@ -588,7 +587,7 @@ export function annotateContentWithReactions(
       }
     } else if (wanted !== null && clientGroups) {
       const speakerGroup = clientGroups.find(
-        (g) => isAttributableGroup(g) && normalizeTextForMatch(g.speaker!) === wanted,
+        (g) => isAttributableGroup(g) && normalizeSpeakerName(g.speaker!) === wanted,
       );
       const canonical = speakerGroup ? knownSpeakersByNorm.get(wanted) : undefined;
       if (canonical) {
@@ -644,13 +643,13 @@ export function addMessageReactor(
 ): MessageReaction[] {
   const current = Array.isArray(reactions) ? (reactions as MessageReaction[]) : [];
   const targetSegment = target?.segment ?? null;
-  const targetSpeakerNorm = target?.speaker != null ? normalizeTextForMatch(target.speaker) : null;
+  const targetSpeakerNorm = target?.speaker != null ? normalizeSpeakerName(target.speaker) : null;
   const index = current.findIndex((r) => {
     if (r.emoji !== emoji) return false;
     if ((r.segment ?? null) !== targetSegment) return false;
     if (targetSegment === null) return true;
     if (r.segmentSpeaker === undefined) return true;
-    return (r.segmentSpeaker != null ? normalizeTextForMatch(r.segmentSpeaker) : null) === targetSpeakerNorm;
+    return (r.segmentSpeaker != null ? normalizeSpeakerName(r.segmentSpeaker) : null) === targetSpeakerNorm;
   });
   if (index === -1) {
     const entry: MessageReaction = { emoji, by: [reactor] };

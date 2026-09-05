@@ -6,10 +6,14 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ### Added
 
-- Conversation chats can opt autonomous messages into a bounded, read-only CMB shared-tail context without running a full sync or vectorization.
+- One-to-one and group Conversation chats can opt autonomous messages into a bounded, read-only CMB shared-tail context without running a full sync or vectorization; group prompts exclude the current room and every private DM, and merged-group check-ins stay pinned to the selected speaker whenever a CMB block is actually injected (otherwise existing merged-group behavior is unchanged).
 
 ### Fixed
 
+- CMB-scoped group check-ins now discard other speakers' output before commands and history are saved, validate text rewrites, and show the reply only after speaker validation. All doubled opening braces (including code/templates) and internal macro markers are made literal in these replies to prevent direct macro expansion; ordinary replies and authored card macros are unchanged. Later prompt regex transformations can still reconstruct macro syntax.
+- Encoded Conversation speaker tags now normalize typographic quotes consistently before server and display parsing, preventing a discarded speaker from reappearing after display quote formatting.
+- Conversation speaker names and display aliases now share quote-insensitive comparison across filtering, grouped/bubble card lookup, command ownership and reactions. Names and body text are not rewritten; encoded speaker tags also accept apostrophes inside double-quoted names.
+- CMB regression checks now cover the final single-speaker call and roster-check ordering, including Windows line endings.
 - Privileged local companions can now poll an active Noodle timeline without triggering profile reconciliation or schedule writes; the read-only projection returns only a bounded reply set and fails closed instead of truncating an oversized timeline.
 - Personal Extension sync checks can now use compact chat-tail and lorebook-entry projection reads, avoiding unused message metadata and raw embedding vectors in read-only payloads.
 - Personal Extension coordination can now request a strict lorebook-entry projection that replaces raw embedding arrays with `missing`, `ready`, or `invalid`, reducing sync payloads while leaving the existing entry contract unchanged.

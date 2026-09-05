@@ -6149,7 +6149,7 @@ export function ChatSettingsDrawer({
                   )}
                 </div>
 
-                {metadata.autonomousMessages && chatCharIds.length === 1 && (
+                {metadata.autonomousMessages && chatCharIds.length > 0 && (
                   <SettingsSwitch
                     label={localizeUi("ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessages")}
                     description={localizeUi(

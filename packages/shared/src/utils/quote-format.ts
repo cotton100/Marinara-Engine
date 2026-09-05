@@ -1,3 +1,5 @@
+import { normalizeTextForMatch } from "./text-matching.js";
+
 export const QUOTE_FORMATS = ["straight", "typographic"] as const;
 export type QuoteFormat = (typeof QUOTE_FORMATS)[number];
 
@@ -40,6 +42,11 @@ function formatSingleQuote(previous?: string, next?: string): string {
 
 function toStraightQuotes(value: string): string {
   return value.replace(DOUBLE_QUOTE_RE, STRAIGHT_DOUBLE_QUOTE).replace(SINGLE_QUOTE_RE, STRAIGHT_SINGLE_QUOTE);
+}
+
+/** Comparison key only: names are plain identifiers, not Markdown/HTML. */
+export function normalizeSpeakerName(value: unknown): string {
+  return toStraightQuotes(normalizeTextForMatch(value));
 }
 
 function toTypographicQuotes(value: string): string {

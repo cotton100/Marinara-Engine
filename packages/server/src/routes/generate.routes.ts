@@ -210,6 +210,7 @@ import { buildIntentCooldownPatch, isMessageIntent } from "../services/conversat
 import { buildImpersonateInstruction } from "../services/conversation/impersonate-prompt.js";
 import {
   isRepeatedConversationResponse,
+  retainConversationSpeaker,
   stripConversationPromptTimestamps,
   stripConversationResponseEnvelope,
 } from "../services/conversation/transcript-sanitize.js";
@@ -1669,7 +1670,7 @@ export async function generateRoutes(app: FastifyInstance) {
         allowEmpty: true,
       });
       const autonomousCmbTargetCharacterId =
-        typeof input.forCharacterId === "string" && allCharacterIds.includes(input.forCharacterId)
+        typeof input.forCharacterId === "string" && characterIds.includes(input.forCharacterId)
           ? input.forCharacterId
           : null;
       const isHomeProfessorMariAssistantChat =
@@ -1765,7 +1766,7 @@ export async function generateRoutes(app: FastifyInstance) {
         presetDefaultChoices: resolvedPresetDefaultChoices,
         chatPresetChoices: (chatMeta.presetChoices ?? {}) as Record<string, string | string[]>,
       });
-      const autonomousCmbPendingContextPromise =
+      const autonomousCmbRequestTargetCharacterId =
         chatMode === "conversation" &&
         input.autonomous === true &&
         input.impersonate !== true &&
@@ -1774,21 +1775,24 @@ export async function generateRoutes(app: FastifyInstance) {
         input.turnGameBots !== true &&
         chatMeta.autonomousCmbContextRefreshEnabled === true &&
         autonomousCmbTargetCharacterId
-          ? buildAutonomousCmbPendingContext({
-              db: app.db,
-              targetChatId: input.chatId,
-              targetCharacterId: autonomousCmbTargetCharacterId,
-              timeZone: promptTimeZone,
-              wrapFormat: resolvedPreset ? normalizePromptWrapFormat(resolvedPreset.wrapFormat) : "xml",
-            }).catch((error) => {
-              logger.warn(
-                error,
-                "[autonomous-cmb] Could not prepare pending shared context for chat %s; continuing without it",
-                input.chatId,
-              );
-              return null;
-            })
-          : Promise.resolve(null);
+          ? autonomousCmbTargetCharacterId
+          : null;
+      const autonomousCmbPendingContextPromise = autonomousCmbRequestTargetCharacterId
+        ? buildAutonomousCmbPendingContext({
+            db: app.db,
+            targetChatId: input.chatId,
+            targetCharacterId: autonomousCmbRequestTargetCharacterId,
+            timeZone: promptTimeZone,
+            wrapFormat: resolvedPreset ? normalizePromptWrapFormat(resolvedPreset.wrapFormat) : "xml",
+          }).catch((error) => {
+            logger.warn(
+              error,
+              "[autonomous-cmb] Could not prepare pending shared context for chat %s; continuing without it",
+              input.chatId,
+            );
+            return null;
+          })
+        : Promise.resolve(null);
 
       const eligibleCharacterActivityConfigs: typeof characterActivityAgentConfigs = [];
       if (
@@ -3776,10 +3780,34 @@ export async function generateRoutes(app: FastifyInstance) {
           });
         }
 
+        // A pre-generation activity agent may have removed the scheduled
+        // speaker after the read began. Discard that speaker-scoped block
+        // rather than exposing it to whichever character remains active.
+        const autonomousCmbPendingContextBlock =
+          autonomousCmbRequestTargetCharacterId !== null && characterIds.includes(autonomousCmbRequestTargetCharacterId)
+            ? await autonomousCmbPendingContextPromise
+            : null;
+        const autonomousCmbSingleSpeaker =
+          autonomousCmbRequestTargetCharacterId !== null && autonomousCmbPendingContextBlock !== null;
+        const holdForCmbSpeakerValidation = autonomousCmbSingleSpeaker && allCharacterIds.length > 1;
+        const cmbResponseSpeakers = holdForCmbSpeakerValidation
+          ? [
+              ...charInfo,
+              ...(await loadCharacterPromptInfo({
+                chars,
+                characterIds: allCharacterIds.filter((id) => !characterIds.includes(id)),
+                chatMode,
+              })),
+            ]
+          : [];
+
         if (chatMode === "conversation" && !conversationScopesAwarenessToResponder) {
           convoAwarenessBlock = await mergeConversationCharacterMemories({
             chars,
-            characterIds,
+            characterIds:
+              autonomousCmbSingleSpeaker && autonomousCmbRequestTargetCharacterId
+                ? [autonomousCmbRequestTargetCharacterId]
+                : characterIds,
             awarenessBlock: convoAwarenessBlock,
             timeZone: promptTimeZone,
             wrapFormat,
@@ -3787,7 +3815,6 @@ export async function generateRoutes(app: FastifyInstance) {
         }
 
         // ── Inject cross-chat awareness and opt-in CMB pending context after persona info. ──
-        const autonomousCmbPendingContextBlock = await autonomousCmbPendingContextPromise;
         const conversationAwarenessBlocks = [convoAwarenessBlock, autonomousCmbPendingContextBlock].filter(
           (block): block is string => typeof block === "string" && block.length > 0,
         );
@@ -5662,6 +5689,10 @@ export async function generateRoutes(app: FastifyInstance) {
           }
         };
         const sendTokenTextChunked = async (text: string) => {
+          if (holdForCmbSpeakerValidation) {
+            recordReasoningDuration(text);
+            return;
+          }
           const visibleText = spatialDirectiveStreamFilter?.push(text) ?? text;
           if (visibleText) {
             recordReasoningDuration(visibleText);
@@ -5922,7 +5953,9 @@ export async function generateRoutes(app: FastifyInstance) {
           isGroupChat && usesIndividualGroupGeneration && !input.regenerateMessageId && !input.impersonate;
         const regenGroupChatIndividual = isGroupChat && usesIndividualGroupGeneration && input.regenerateMessageId;
         const explicitlyMentionedConversationCharacterIds =
-          chatMode === "conversation" && isGroupChat && !input.impersonate ? getExplicitlyMentionedCharacterIds() : [];
+          chatMode === "conversation" && isGroupChat && !input.impersonate && !autonomousCmbSingleSpeaker
+            ? getExplicitlyMentionedCharacterIds()
+            : [];
         const mentionedConversationCharacters = charInfo.filter((character) =>
           explicitlyMentionedConversationCharacterIds.includes(character.id),
         );
@@ -6238,7 +6271,9 @@ export async function generateRoutes(app: FastifyInstance) {
           );
           if (chatMode === "conversation" && conversationIsGroup && !input.impersonate) {
             const turnCharacterName =
-              usesIndividualGroupGeneration && groupTurnPromptEnabled && speaksOnlyTargetCharacter && targetCharId
+              speaksOnlyTargetCharacter &&
+              targetCharId &&
+              (usesIndividualGroupGeneration ? groupTurnPromptEnabled : autonomousCmbSingleSpeaker)
                 ? (charInfo.find((character) => character.id === targetCharId)?.name ?? null)
                 : null;
             if (!usesIndividualGroupGeneration || turnCharacterName) {
@@ -6964,6 +6999,16 @@ export async function generateRoutes(app: FastifyInstance) {
               contentReplaced = true;
             }
           }
+          // Validate before commands: persistence and command history must share
+          // the same accepted speaker, including members deactivated by an agent.
+          if (holdForCmbSpeakerValidation) {
+            fullResponse = retainConversationSpeaker(fullResponse, targetCharId, cmbResponseSpeakers);
+            contentReplaced = true;
+            if (!fullResponse.trim()) {
+              sendSseEvent(reply, { type: "content_replace", data: "" });
+              return null;
+            }
+          }
           if (conversationCommandsEnabled && !input.impersonate) {
             const responseBeforeCommandParsing = fullResponse;
             // Merged group conversations carry multiple characters' turns in one
@@ -7178,6 +7223,10 @@ export async function generateRoutes(app: FastifyInstance) {
               speakerNames: charInfo.map((character) => character.name),
               preserveSpeakerPrefix: isGroupChat && !usesIndividualGroupGeneration,
             });
+            if (holdForCmbSpeakerValidation) {
+              // Command removal can expose a new line-leading speaker label.
+              fullResponse = retainConversationSpeaker(fullResponse, targetCharId, cmbResponseSpeakers);
+            }
             if (fullResponse !== beforeStrip) {
               contentReplaced = true;
             }
@@ -7870,9 +7919,14 @@ export async function generateRoutes(app: FastifyInstance) {
           }
 
           // A merged group generation may voice several characters unless a regen
-          // target or a single explicit @mention pins it to exactly one speaker.
+          // target, a single explicit @mention, or an autonomous CMB request pins
+          // it to exactly one speaker. The latter is a privacy boundary: CMB
+          // visibility is evaluated for that selected character only.
           const mergedSpeaksOnlyTarget =
-            !isGroupChat || Boolean(regenGroupChatIndividual) || mentionedConversationCharacters.length === 1;
+            !isGroupChat ||
+            Boolean(regenGroupChatIndividual) ||
+            mentionedConversationCharacters.length === 1 ||
+            autonomousCmbSingleSpeaker;
           const genResult = await generateForCharacter(targetCharId, sentMessages, true, mergedSpeaksOnlyTarget);
           if (genResult) {
             firstSavedMsg ??= genResult.savedMsg;
@@ -7883,9 +7937,12 @@ export async function generateRoutes(app: FastifyInstance) {
             for (let cmdIndex = 0; cmdIndex < genResult.commands.length; cmdIndex++) {
               collectedCommands.push({
                 command: genResult.commands[cmdIndex]!,
-                // Merged group responses attribute each command to its speaker; fall
-                // back to the generation's character when no attribution is available.
-                characterId: genResult.commandCharacterIds?.[cmdIndex] ?? genResult.characterId,
+                // A single-speaker generation owns every command even if the model
+                // emits a conflicting speaker prefix. Multi-speaker merged output
+                // keeps its per-command attribution.
+                characterId: mergedSpeaksOnlyTarget
+                  ? genResult.characterId
+                  : (genResult.commandCharacterIds?.[cmdIndex] ?? genResult.characterId),
                 messageId: genResult.savedMsg?.id ?? "",
                 swipeIndex: genResult.savedSwipeIndex ?? genResult.savedMsg?.activeSwipeIndex ?? 0,
               });
@@ -10141,6 +10198,17 @@ export async function generateRoutes(app: FastifyInstance) {
                   const edData = editorResult.data as Record<string, unknown>;
                   const editedText = typeof edData.editedText === "string" ? edData.editedText : "";
                   let sanitizedEditedText = editedText;
+                  const rewriteCharacterId =
+                    typeof (lastSavedMsg as { characterId?: unknown } | null)?.characterId === "string"
+                      ? (lastSavedMsg as { characterId: string }).characterId
+                      : null;
+                  if (holdForCmbSpeakerValidation) {
+                    sanitizedEditedText = retainConversationSpeaker(
+                      sanitizedEditedText,
+                      rewriteCharacterId,
+                      cmbResponseSpeakers,
+                    );
+                  }
                   if (
                     hierarchicalMapsEnabledForChat &&
                     (requestChatMode === "roleplay" || requestChatMode === "game")
@@ -10174,10 +10242,6 @@ export async function generateRoutes(app: FastifyInstance) {
                       messageId,
                     );
                   }
-                  const rewriteCharacterId =
-                    typeof (lastSavedMsg as { characterId?: unknown } | null)?.characterId === "string"
-                      ? (lastSavedMsg as { characterId: string }).characterId
-                      : null;
                   const repeatsPriorConversationResponse =
                     rewriteAllowed &&
                     !strictEditNeeded &&

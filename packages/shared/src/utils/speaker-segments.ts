@@ -6,7 +6,7 @@
 // reactions to the exact part they were aimed at. Shared so the two sides can
 // never drift: a segment index stored by one is resolvable by the other.
 // ──────────────────────────────────────────────
-import { normalizeTextForMatch } from "./text-matching.js";
+import { formatTextQuotes, normalizeSpeakerName } from "./quote-format.js";
 
 export const CLOCK_TOKEN_SOURCE = String.raw`\d{1,2}[:.]\d{2}(?:\s*(?:am|pm))?`;
 export const FULL_DATE_TOKEN_SOURCE = String.raw`\d{1,2}\.\d{1,2}\.\d{2,4}`;
@@ -63,8 +63,13 @@ export function decodeEncodedSpeakerTags(value: string): string {
     if (/^\/\s*speaker\s*$/i.test(decoded)) {
       replacement = "</speaker>";
     } else {
-      const open = decoded.match(/^speaker\s*=\s*(["'])([^"']*)\1\s*$/i);
-      if (open?.[2]) replacement = `<speaker="${open[2].trim()}">`;
+      // Encoded tags are unprotected text in the display quote-format pass.
+      // Normalize their delimiters the same way before server/display parsing.
+      const open = formatTextQuotes(decoded, "straight").match(/^speaker\s*=\s*(?:"([^"]*)"|'([^']*)')\s*$/i);
+      const name = (open?.[1] ?? open?.[2])?.trim();
+      // Canonical tags use double delimiters. Apostrophes inside names are safe;
+      // embedded double quotes still require a separate attribute-escape contract.
+      if (name && !name.includes('"')) replacement = `<speaker="${name}">`;
     }
     if (replacement !== null) {
       result += value.slice(outputCursor, candidateStart) + replacement;
@@ -123,7 +128,7 @@ export interface GroupedSegment {
  * Parse `<speaker="Name">...</speaker>` tagged segments. Returns null when the
  * content contains no complete tag (callers then fall back to the `Name: `
  * line-prefix format). Unknown speaker names become narration (null speaker);
- * `knownNames` holds normalizeTextForMatch()-normalized character names.
+ * `knownNames` holds normalizeSpeakerName()-normalized character names.
  */
 export function parseSpeakerTags(content: string, knownNames: Set<string>): SpeakerSegment[] | null {
   const decodedContent = decodeEncodedSpeakerTags(content);
@@ -149,7 +154,7 @@ export function parseSpeakerTags(content: string, knownNames: Set<string>): Spea
     const end = bodyEnd + closeTag.length;
     foundTag = true;
     const speakerName = decodedContent.slice(nameStart, nameEnd).trim();
-    const knownSpeaker = knownNames.has(normalizeTextForMatch(speakerName));
+    const knownSpeaker = knownNames.has(normalizeSpeakerName(speakerName));
     if (start > lastIndex) {
       const before = decodedContent.slice(lastIndex, start).trim();
       if (before) segments.push({ speaker: null, text: before, start: lastIndex, end: start });
@@ -173,7 +178,7 @@ export function parseSpeakerTags(content: string, knownNames: Set<string>): Spea
 /**
  * Parse `Name: text` or `Name:\ntext` line-prefixed segments (the fallback format
  * when no speaker tags are present). Returns null when no known name prefixes any line.
- * `knownNames` holds normalizeTextForMatch()-normalized character names.
+ * `knownNames` holds normalizeSpeakerName()-normalized character names.
  */
 export function parseNamePrefixFormat(
   content: string,
@@ -216,7 +221,7 @@ export function parseNamePrefixFormat(
       const sameLineText = rawText.endsWith("\r") ? rawText.slice(0, -1) : rawText;
       if (
         (sameLineText.length === 0 || /^[\t ]/u.test(sameLineText)) &&
-        knownNames.has(normalizeTextForMatch(potentialName))
+        knownNames.has(normalizeSpeakerName(potentialName))
       ) {
         flush();
         currentSpeaker = potentialName;
@@ -234,7 +239,7 @@ export function parseNamePrefixFormat(
   flush();
   if (!found) return null;
   const visibleSegments = segments.filter((s) => s.text.trim());
-  const normalizedLeadingSpeaker = leadingSpeaker ? normalizeTextForMatch(leadingSpeaker) : "";
+  const normalizedLeadingSpeaker = leadingSpeaker ? normalizeSpeakerName(leadingSpeaker) : "";
   if (visibleSegments[0]?.speaker === null && normalizedLeadingSpeaker && knownNames.has(normalizedLeadingSpeaker)) {
     visibleSegments[0] = { ...visibleSegments[0], speaker: leadingSpeaker!.trim() };
   }
@@ -255,7 +260,7 @@ export function groupConsecutiveSegments(segments: SpeakerSegment[]): GroupedSeg
       last &&
       last.speaker &&
       seg.speaker &&
-      normalizeTextForMatch(last.speaker) === normalizeTextForMatch(seg.speaker)
+      normalizeSpeakerName(last.speaker) === normalizeSpeakerName(seg.speaker)
     ) {
       last.lines.push(trimmed);
       last.end = seg.end;

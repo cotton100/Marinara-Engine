@@ -2,7 +2,7 @@
 // Bubble message layout (Messenger-style)
 // ──────────────────────────────────────────────
 import { User } from "lucide-react";
-import { normalizeTextForMatch, splitGroupedSegmentDisplayLines } from "@marinara-engine/shared";
+import { normalizeSpeakerName, splitGroupedSegmentDisplayLines } from "@marinara-engine/shared";
 import { cn } from "../../lib/utils";
 import { PendingTypingDots } from "./PendingTypingDots";
 import {
@@ -223,9 +223,9 @@ export function ConversationMessageBubble({ ctx }: { ctx: MessageRenderContext }
           ) : groupedSegments && !isUser ? (
             <div className="flex flex-col items-start gap-1.5">
               {groupedSegments.slice(0, visibleSegments).map((grp, i) => {
-                const segChar = grp.speaker && charByName ? charByName.get(normalizeTextForMatch(grp.speaker)) : null;
+                const segChar = grp.speaker && charByName ? charByName.get(normalizeSpeakerName(grp.speaker)) : null;
                 const segSelfId =
-                  (grp.speaker && charIdByName ? charIdByName.get(normalizeTextForMatch(grp.speaker)) : null) ??
+                  (grp.speaker && charIdByName ? charIdByName.get(normalizeSpeakerName(grp.speaker)) : null) ??
                   selfCharacterId;
                 const segName = segChar?.convoDisplayName?.trim() || segChar?.name || grp.speaker || "";
                 const displayLines = splitGroupedSegmentDisplayLines(grp);

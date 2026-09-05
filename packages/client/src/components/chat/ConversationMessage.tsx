@@ -9,7 +9,7 @@ import { Phone, PhoneIncoming, PhoneOff, Trash2 } from "lucide-react";
 import { useQueryClient, type InfiniteData } from "@tanstack/react-query";
 import {
   formatTextQuotes,
-  normalizeTextForMatch,
+  normalizeSpeakerName,
   parseGroupedSpeakerSegments,
   type Message,
   type MessageReaction,
@@ -532,7 +532,7 @@ export const ConversationMessage = memo(function ConversationMessage({
           (name): name is string => typeof name === "string" && name.trim().length > 0,
         );
         for (const alias of aliases) {
-          const key = normalizeTextForMatch(alias);
+          const key = normalizeSpeakerName(alias);
           if (id === message.characterId || !byName.has(key)) {
             byName.set(key, v);
             idByName.set(key, id);

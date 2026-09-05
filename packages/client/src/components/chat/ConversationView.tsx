@@ -46,6 +46,7 @@ import { useConversationCustomEmojis } from "../../hooks/use-conversation-custom
 import { useConversationCustomStickers } from "../../hooks/use-conversation-custom-stickers";
 import type { CharacterMap, MessageSelectionToggle, PersonaInfo } from "./chat-area.types";
 import {
+  normalizeSpeakerName,
   normalizeTextForMatch,
   parseGroupedSpeakerSegments,
   stripLeadingMessageTimestamps,
@@ -136,7 +137,7 @@ function getKnownChatMemberNames(characterMap: CharacterMap, chatCharacterIds: s
   for (const id of chatCharacterIds) {
     const character = characterMap.get(id);
     for (const candidate of [character?.name, character?.convoDisplayName]) {
-      if (candidate?.trim()) names.add(normalizeTextForMatch(candidate));
+      if (candidate?.trim()) names.add(normalizeSpeakerName(candidate));
     }
   }
   return names;
@@ -150,7 +151,7 @@ function hasNamePrefixFormat(content: string, knownNames: Set<string>): boolean 
     const colonIdx = line.indexOf(": ");
     if (colonIdx > 0) {
       const name = line.slice(0, colonIdx).trim();
-      if (knownNames.has(normalizeTextForMatch(name))) return true;
+      if (knownNames.has(normalizeSpeakerName(name))) return true;
     }
   }
   return false;

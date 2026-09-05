@@ -74,6 +74,12 @@ type CmbConfig = {
 type SourceDescriptor = {
   chat: ChatRow;
   sourceIndex: number;
+  chatRole: "rp" | "group";
+};
+
+type TargetMapping = {
+  ensemble: CmbEnsemble;
+  targetRole: "dm" | "group";
 };
 
 type PendingMessage = {
@@ -462,7 +468,7 @@ function renderPendingContext(
   wrapFormat: WrapFormat,
 ): string {
   const introduction =
-    "These are the newest shared messages from linked Convo Memory Bridge chats that are not yet confirmed in saved CMB memory. Treat them as recent shared context for this autonomous message, not as messages from the current DM.";
+    "These are the newest shared messages from linked Convo Memory Bridge chats that are not yet confirmed in saved CMB memory. Treat them as recent shared context for this autonomous message, not as messages from the current conversation.";
   const sourceOrder = [...new Set(messagesToRender.map((message) => message.sourceIndex))];
   const blocks: string[] = [];
 
@@ -616,16 +622,30 @@ async function buildAutonomousCmbPendingContextInner({
   const config = parseCmbConfig(isRecord(storageValue) ? storageValue[CMB_STORAGE_KEY] : null);
   if (config === null) return null;
 
-  const mappingMatches = config.ensembles.flatMap((ensemble) =>
-    ensemble.members
-      .filter((member) => member.dmChatId === targetChatId && member.characterId === targetCharacterId)
-      .map((member) => ({ ensemble, member })),
-  );
+  const mappingMatches: TargetMapping[] = [];
+  for (const ensemble of config.ensembles) {
+    const targetMember = ensemble.members.find((member) => member.characterId === targetCharacterId);
+    if (!targetMember) continue;
+    if (targetMember.dmChatId === targetChatId) {
+      mappingMatches.push({ ensemble, targetRole: "dm" });
+    } else if (ensemble.groupConvoChatIds.includes(targetChatId)) {
+      mappingMatches.push({ ensemble, targetRole: "group" });
+    }
+  }
   if (mappingMatches.length !== 1) return null;
-  const { ensemble } = mappingMatches[0]!;
+  const { ensemble, targetRole } = mappingMatches[0]!;
 
-  const sourceIds = [ensemble.rpChatId, ...ensemble.groupConvoChatIds];
-  if (sourceIds.length > MAX_MAPPED_SOURCES || sourceIds.includes(targetChatId)) return null;
+  // Pending raw DM text has not yet passed CMB's per-cast visibility policy,
+  // so even a group speaker's own DM is never promoted into a shared prompt.
+  // Only ensemble-wide RP/group sources qualify, and the current group is
+  // already present in normal history so it is excluded from this shortcut.
+  const sourceSpecs = [
+    { chatId: ensemble.rpChatId, chatRole: "rp" as const },
+    ...ensemble.groupConvoChatIds.map((chatId) => ({ chatId, chatRole: "group" as const })),
+  ].filter((source) => source.chatId !== targetChatId);
+  const sourceIds = sourceSpecs.map((source) => source.chatId);
+  if (sourceIds.length === 0 || sourceIds.length > MAX_MAPPED_SOURCES) return null;
+  if (new Set(sourceIds).size !== sourceIds.length) return null;
   const dmChatIds = new Set(ensemble.members.map((member) => member.dmChatId));
   if (sourceIds.some((chatId) => dmChatIds.has(chatId))) return null;
 
@@ -644,24 +664,25 @@ async function buildAutonomousCmbPendingContextInner({
   const chatById = new Map(chatRows.map((chat) => [chat.id, chat]));
   if (chatById.size !== requestedChatIds.length) return null;
 
+  const memberCharacterIds = ensemble.members.map((member) => member.characterId);
   const targetChat = chatById.get(targetChatId);
   const targetChatState = targetChat ? parseChatState(targetChat) : null;
+  const expectedTargetCharacterIds = targetRole === "dm" ? [targetCharacterId] : memberCharacterIds;
   if (
     !targetChat ||
     targetChat.mode !== "conversation" ||
     targetChatState === null ||
-    !sameStringSet(targetChatState.activeCharacterIds, [targetCharacterId]) ||
+    !sameStringSet(targetChatState.activeCharacterIds, expectedTargetCharacterIds) ||
     targetChatState.metadata.crossChatAwareness !== false
   ) {
     return null;
   }
 
-  const memberCharacterIds = ensemble.members.map((member) => member.characterId);
   const sourceDescriptors: SourceDescriptor[] = [];
-  for (const [sourceIndex, sourceId] of sourceIds.entries()) {
-    const sourceChat = chatById.get(sourceId);
+  for (const [sourceIndex, source] of sourceSpecs.entries()) {
+    const sourceChat = chatById.get(source.chatId);
     const sourceChatState = sourceChat ? parseChatState(sourceChat) : null;
-    const expectedMode = sourceIndex === 0 ? "roleplay" : "conversation";
+    const expectedMode = source.chatRole === "rp" ? "roleplay" : "conversation";
     if (
       !sourceChat ||
       stableString(sourceChat.name, MAX_NAME_CHARS) === null ||
@@ -674,7 +695,7 @@ async function buildAutonomousCmbPendingContextInner({
     ) {
       return null;
     }
-    sourceDescriptors.push({ chat: sourceChat, sourceIndex });
+    sourceDescriptors.push({ chat: sourceChat, sourceIndex, chatRole: source.chatRole });
   }
   if (sourceDescriptors.length === 0) return null;
 
@@ -754,7 +775,7 @@ async function buildAutonomousCmbPendingContextInner({
       descriptor,
       managedEntries,
       ensemble.ensembleId,
-      descriptor.sourceIndex === 0 ? "rp" : "group",
+      descriptor.chatRole,
       targetCharacterId,
       allowedCharacterIds,
       userName,
@@ -777,7 +798,7 @@ async function buildAutonomousCmbPendingContextInner({
 }
 
 /**
- * Read-only, best-effort bridge for autonomous DM generation. Any missing,
+ * Read-only, best-effort bridge for autonomous Conversation generation. Any missing,
  * ambiguous, oversized, or malformed CMB state deliberately degrades to the
  * existing prompt by returning null.
  */

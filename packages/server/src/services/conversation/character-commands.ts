@@ -43,7 +43,7 @@
 import {
   normalizeHapticAction,
   normalizeHapticPattern,
-  normalizeTextForMatch,
+  normalizeSpeakerName,
   stripLeadingMessageTimestamps,
   type HapticDeviceAction,
   type HapticFeedbackPattern,
@@ -1491,15 +1491,17 @@ export function parseCharacterCommands(content: string): {
  */
 export function parseCharacterCommandsBySpeaker(
   content: string,
-  knownCharacters: ReadonlyArray<{ id: string; name: string }>,
+  knownCharacters: ReadonlyArray<{ id: string; name: string; convoDisplayName?: string }>,
   fallbackCharacterId: string | null,
 ): { commands: CharacterCommand[]; commandCharacterIds: (string | null)[]; cleanContent: string } {
   const base = parseCharacterCommands(content);
 
   const nameToId = new Map<string, string>();
   for (const character of knownCharacters) {
-    const key = normalizeTextForMatch(character.name);
-    if (key && !nameToId.has(key)) nameToId.set(key, character.id);
+    for (const name of [character.name, character.convoDisplayName]) {
+      const key = normalizeSpeakerName(name);
+      if (key && !nameToId.has(key)) nameToId.set(key, character.id);
+    }
   }
 
   // Segment the response by leading "Name:" line prefixes, mirroring the client's
@@ -1529,7 +1531,7 @@ export function parseCharacterCommandsBySpeaker(
     if (colonIdx > 0) {
       const rawText = line.slice(colonIdx + 1);
       const sameLineText = rawText.endsWith("\r") ? rawText.slice(0, -1) : rawText;
-      const mappedId = nameToId.get(normalizeTextForMatch(line.slice(0, colonIdx)));
+      const mappedId = nameToId.get(normalizeSpeakerName(line.slice(0, colonIdx)));
       if (mappedId && (sameLineText.length === 0 || /^[\t ]/u.test(sameLineText))) {
         flush();
         inLeadingRegion = false;

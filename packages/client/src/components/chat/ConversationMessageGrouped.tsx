@@ -2,7 +2,7 @@
 // Grouped multi-speaker message layout (merged group chat / Name: text format)
 // ──────────────────────────────────────────────
 import { Fragment, type RefObject } from "react";
-import { normalizeTextForMatch } from "@marinara-engine/shared";
+import { normalizeSpeakerName } from "@marinara-engine/shared";
 import { cn, getAvatarCropStyle } from "../../lib/utils";
 import {
   HiddenFromAIConversationSummary,
@@ -179,9 +179,9 @@ export function ConversationMessageGrouped({
         </div>
       ) : (
         (groupedSegments ?? []).slice(0, visibleSegments).map((grp, i) => {
-          const segChar = grp.speaker && charByName ? charByName.get(normalizeTextForMatch(grp.speaker)) : null;
+          const segChar = grp.speaker && charByName ? charByName.get(normalizeSpeakerName(grp.speaker)) : null;
           const segSelfId =
-            (grp.speaker && charIdByName ? charIdByName.get(normalizeTextForMatch(grp.speaker)) : null) ??
+            (grp.speaker && charIdByName ? charIdByName.get(normalizeSpeakerName(grp.speaker)) : null) ??
             selfCharacterId;
           const segAvatar = segChar?.avatarUrl ?? null;
           const segAvatarCropStyle = getAvatarCropStyle(segChar?.avatarCrop);

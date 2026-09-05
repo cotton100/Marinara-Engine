@@ -5,7 +5,11 @@ import {
   CLOCK_TOKEN_SOURCE,
   DATE_TIME_TOKEN_SOURCE,
   FULL_DATE_TOKEN_SOURCE,
+  decodeEncodedSpeakerTags,
+  normalizeSpeakerName,
   normalizeTextForMatch,
+  parseNamePrefixFormat,
+  parseSpeakerTags,
 } from "@marinara-engine/shared";
 
 const DATE_TAG_RE = /<\/?date(?:="[^"]*")?>/gi;
@@ -99,4 +103,54 @@ export function stripConversationResponseEnvelope(
     .replace(new RegExp(`^\\s*${escapedName}\\s*\\n+`, "i"), "")
     .trim();
   return cleaned;
+}
+
+/** Keep only the selected CMB speaker's response, before extracting commands or history. */
+export function retainConversationSpeaker(
+  content: string,
+  characterId: string | null,
+  characters: readonly { id: string; name: string; convoDisplayName?: string }[],
+): string {
+  const character = characters.find((candidate) => candidate.id === characterId);
+  if (!character?.name.trim()) return "";
+  const aliases = (candidate: { name: string; convoDisplayName?: string }) =>
+    [candidate.name, candidate.convoDisplayName].filter((name): name is string => !!name?.trim());
+  const targetAliases = aliases(character);
+  const targetNames = new Set(targetAliases.map(normalizeSpeakerName));
+  const speakerNames = characters.flatMap(aliases);
+  const knownNames = new Set(speakerNames.map(normalizeSpeakerName));
+  let cleaned = decodeEncodedSpeakerTags(stripConversationPromptTimestamps(content));
+  // Explicit unknown tags must not become unlabelled narration owned by the target.
+  for (const match of cleaned.matchAll(/<speaker="([^"]*)">/g)) {
+    knownNames.add(normalizeSpeakerName(match[1]));
+  }
+  // ponytail: cap nested/mixed envelopes at eight passes; reject deeper output.
+  // Reuse the display parsers so retained text cannot reveal another speaker on reparse.
+  for (let pass = 0; pass < 8; pass++) {
+    const segments =
+      parseSpeakerTags(cleaned, knownNames) ?? parseNamePrefixFormat(cleaned, knownNames, character.name);
+    const retained = segments
+      ? segments
+          .filter((segment) => segment.speaker === null || targetNames.has(normalizeSpeakerName(segment.speaker)))
+          .map((segment) => segment.text)
+          .join("\n")
+      : cleaned;
+    const next = targetAliases.reduce(
+      (text, speakerName) => stripConversationResponseEnvelope(text, { speakerName, speakerNames }),
+      retained,
+    );
+    if (next === cleaned) {
+      // Display and future prompts expand macros before parsing speakers. Keep
+      // generated macros literal in CMB-scoped replies so a later context/seed
+      // cannot reveal another speaker or execute variable writes. Literalize
+      // only after envelope removal, including overlapping `{{{` and internal
+      // macro sentinels; authored cards and ordinary replies are unchanged.
+      return next
+        .replace(/\{(?=\{)/g, "{ ")
+        .replace(/\x00/g, "\u2400")
+        .replace(/\x1e/g, "\u241e");
+    }
+    cleaned = next;
+  }
+  return "";
 }

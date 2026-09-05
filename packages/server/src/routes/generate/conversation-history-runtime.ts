@@ -1,7 +1,7 @@
 import type { DaySummaryEntry, WeekSummaryEntry, WrapFormat } from "@marinara-engine/shared";
 import {
   normalizeSummaryTailMessages,
-  normalizeTextForMatch,
+  normalizeSpeakerName,
   stripLeadingMessageTimestamps,
 } from "@marinara-engine/shared";
 
@@ -408,7 +408,7 @@ async function annotateConversationPromptReactions(args: {
   const reactionSpeakersByNorm = new Map<string, string>();
   const addReactionSpeaker = (name: unknown) => {
     if (typeof name !== "string") return;
-    const norm = normalizeTextForMatch(name);
+    const norm = normalizeSpeakerName(name);
     const canonical = name.replace(/\s+/g, " ").trim();
     if (norm && canonical && !reactionSpeakersByNorm.has(norm)) reactionSpeakersByNorm.set(norm, canonical);
   };

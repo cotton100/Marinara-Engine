@@ -3151,7 +3151,7 @@
   "ui.chat.chatsettingsdrawer.recentMessageTail": "Recent Message Tail",
   "ui.chat.chatsettingsdrawer.recommendedUseAStrongStateOfTheArtImage": "Recommended: use a strong state-of-the-art image model for storyboard images, or something equivalent to Google Nano Banana 2 Lite.",
   "ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessages": "Use Latest CMB Context Before Check-ins",
-  "ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessagesDescription": "Before an autonomous message, include up to five of the newest messages from shared Roleplay or group chats linked through CMB. If CMB context is unavailable, continue with the existing context.",
+  "ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessagesDescription": "Before an autonomous message, include up to five of the newest messages from other shared Roleplay or group chats linked through CMB. The current chat and private DMs stay excluded. If CMB context is unavailable, continue with the existing context.",
   "ui.chat.chatsettingsdrawer.regenerating": "Regenerating…",
   "ui.chat.chatsettingsdrawer.regeneratingSchedules": "Regenerating schedules…",
   "ui.chat.chatsettingsdrawer.removeAgent": "Remove Agent",

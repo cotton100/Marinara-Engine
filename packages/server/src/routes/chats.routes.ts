@@ -1715,6 +1715,34 @@ export async function chatsRoutes(app: FastifyInstance) {
 
   // ── Messages ──
 
+  app.get<{ Querystring: { baseline?: string; after?: string; limit?: string } }>(
+    "/autonomous-notifications",
+    async (req, reply) => {
+      const { baseline, after, limit: rawLimit } = req.query;
+      const limit = rawLimit === undefined ? 100 : Number(rawLimit);
+      if (
+        (baseline !== undefined && baseline !== "true") ||
+        (baseline === "true" && after !== undefined) ||
+        (rawLimit !== undefined && (typeof rawLimit !== "string" || !/^[1-9]\d*$/u.test(rawLimit))) ||
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 250
+      ) {
+        return reply.status(400).send({ error: "Invalid autonomous notification query" });
+      }
+      if (
+        after !== undefined &&
+        (typeof after !== "string" ||
+          !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(after) ||
+          !Number.isFinite(Date.parse(after)) ||
+          new Date(after).toISOString() !== after)
+      ) {
+        return reply.status(400).send({ error: "Invalid autonomous notification cursor" });
+      }
+      return storage.listAutonomousNotifications({ after, limit, baseline: baseline === "true" });
+    },
+  );
+
   // List messages for a chat (supports pagination via ?limit=N&before=CURSOR)
   app.get<{ Params: { id: string }; Querystring: { limit?: string; before?: string } }>(
     "/:id/messages",

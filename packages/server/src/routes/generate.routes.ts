@@ -1042,7 +1042,7 @@ export async function generateRoutes(app: FastifyInstance) {
             gameStateSnapshotId: spatialGameStateSnapshotId,
             attachments: input.attachments,
           });
-          userMsg = committed.message;
+          userMsg = { ...committed.message, autonomousNotificationAt: null };
           committedSpatialTransition = {
             commandId: input.pendingSpatialTransition.commandId,
             currentLocationId: committed.snapshot.currentLocationId,
@@ -7493,12 +7493,16 @@ export async function generateRoutes(app: FastifyInstance) {
               }
             }
           } else {
-            savedMsg = await chats.createMessage({
-              chatId: input.chatId,
-              role: input.impersonate ? "user" : "assistant",
-              characterId: input.impersonate ? null : targetCharId,
-              content: fullResponse,
-            });
+            savedMsg = await chats.createMessage(
+              {
+                chatId: input.chatId,
+                role: input.impersonate ? "user" : "assistant",
+                characterId: input.impersonate ? null : targetCharId,
+                content: fullResponse,
+              },
+              undefined,
+              { autonomousNotification: shouldAccountAutonomousGeneration && !input.continueMessageId },
+            );
             savedSwipeIndex = 0;
           }
           if (

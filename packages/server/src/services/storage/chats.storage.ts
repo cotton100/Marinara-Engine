@@ -67,6 +67,25 @@ export type ChatDeleteGuardResult = { allowed: true } | { allowed: false; reason
 const metadataPatchQueues = new Map<string, Promise<void>>();
 const messageExtraPatchQueues = new Map<string, Promise<void>>();
 const swipeExtraPatchQueues = new Map<string, Promise<void>>();
+const autonomousNotificationQueues = new WeakMap<DB, Promise<void>>();
+const autonomousNotificationFloors = new WeakMap<DB, number>();
+
+async function withAutonomousNotificationQueue<T>(db: DB, operation: () => Promise<T>): Promise<T> {
+  // Marked createMessage callers must stay outside an existing db.transaction:
+  // this queue is acquired before the storage transaction, not the reverse.
+  const previous = autonomousNotificationQueues.get(db) ?? Promise.resolve();
+  const queued = previous.catch(() => undefined).then(operation);
+  const settled = queued.then(
+    () => undefined,
+    () => undefined,
+  );
+  autonomousNotificationQueues.set(db, settled);
+  try {
+    return await queued;
+  } finally {
+    if (autonomousNotificationQueues.get(db) === settled) autonomousNotificationQueues.delete(db);
+  }
+}
 
 async function withPatchQueue<T>(
   queues: Map<string, Promise<void>>,
@@ -1613,45 +1632,149 @@ export function createChatsStorage(db: DB) {
       return rows[0] ?? null;
     },
 
-    async createMessage(input: CreateMessageInput, timestampOverrides?: TimestampOverrides | null) {
-      const id = newId();
-      const resolvedTimestamp = resolveTimestamps(timestampOverrides).createdAt;
-      const explicitTimestamp = normalizeTimestampOverrides(timestampOverrides)?.createdAt;
-      const chatRows = await db
-        .select({ lastMessageAt: chats.lastMessageAt })
-        .from(chats)
-        .where(eq(chats.id, input.chatId))
-        .limit(1);
-      const timestamp = explicitTimestamp
-        ? resolvedTimestamp
-        : ensureTimestampAfter(resolvedTimestamp, chatRows[0]?.lastMessageAt);
-      await db.insert(messages).values({
-        id,
-        chatId: input.chatId,
-        role: input.role,
-        characterId: input.characterId,
-        content: input.content,
-        activeSwipeIndex: 0,
-        extra: JSON.stringify({
-          ...parseExtraRecord(input.extra),
-          displayText: null,
-          isGenerated: input.role !== "user",
-          tokenCount: null,
-          generationInfo: null,
-        }),
-        createdAt: timestamp,
+    /** A metadata-only feed independent of the UI's disposable unread badge. */
+    async listAutonomousNotifications(options: { after?: string; limit: number; baseline?: boolean }) {
+      return db.transaction(async () => {
+        if (options.baseline) {
+          const latest = await db
+            .select({ createdAt: messages.autonomousNotificationAt })
+            .from(messages)
+            .where(isNotNull(messages.autonomousNotificationAt))
+            .orderBy(desc(messages.autonomousNotificationAt))
+            .limit(1);
+          return { version: 1, events: [], nextCursor: latest[0]?.createdAt ?? null, hasMore: false };
+        }
+        const rows = await db
+          .select({
+            id: messages.id,
+            chatId: messages.chatId,
+            characterId: messages.characterId,
+            createdAt: messages.autonomousNotificationAt,
+            role: messages.role,
+            content: messages.content,
+            extra: messages.extra,
+          })
+          .from(messages)
+          .where(
+            options.after
+              ? gt(messages.autonomousNotificationAt, options.after)
+              : isNotNull(messages.autonomousNotificationAt),
+          )
+          .orderBy(messages.autonomousNotificationAt, messages.id)
+          .limit(options.limit + 1);
+        const page = rows.slice(0, options.limit);
+        const conversationChats = new Set(
+          (
+            await db
+              .select({ id: chats.id, metadata: chats.metadata })
+              .from(chats)
+              .where(eq(chats.mode, "conversation"))
+          )
+            .filter((chat) => parseMetadata(chat.metadata).internalAssistant !== "professor-mari")
+            .map((chat) => chat.id),
+        );
+        const events = page
+          .filter((message) => {
+            const extra = parseExtraRecord(message.extra);
+            return (
+              conversationChats.has(message.chatId) &&
+              message.role === "assistant" &&
+              message.content.trim().length > 0 &&
+              extra.hiddenFromUser !== true &&
+              extra.commandOnly !== true
+            );
+          })
+          .map(({ id, chatId, characterId, createdAt }) => ({ id, chatId, characterId, createdAt }));
+        return {
+          version: 1,
+          events,
+          // Advance over excluded rows too, so deletion/hiding/mode changes cannot stall a page.
+          nextCursor: page.at(-1)?.createdAt ?? options.after ?? null,
+          hasMore: rows.length > options.limit,
+        };
       });
-      // Create the initial swipe (index 0)
-      await db.insert(messageSwipes).values({
-        id: newId(),
-        messageId: id,
-        index: 0,
-        content: input.content,
-        extra: JSON.stringify(parseExtraRecord(input.extra)),
-        createdAt: timestamp,
+    },
+
+    async createMessage(
+      input: CreateMessageInput,
+      timestampOverrides?: TimestampOverrides | null,
+      options: { autonomousNotification?: boolean } = {},
+    ) {
+      const save = async (notificationAt: string | null = null) => {
+        const id = newId();
+        const resolvedTimestamp = resolveTimestamps(timestampOverrides).createdAt;
+        const explicitTimestamp = normalizeTimestampOverrides(timestampOverrides)?.createdAt;
+        const chatRows = await db
+          .select({ lastMessageAt: chats.lastMessageAt })
+          .from(chats)
+          .where(eq(chats.id, input.chatId))
+          .limit(1);
+        const timestamp = explicitTimestamp
+          ? resolvedTimestamp
+          : ensureTimestampAfter(resolvedTimestamp, chatRows[0]?.lastMessageAt);
+        await db.insert(messages).values({
+          id,
+          chatId: input.chatId,
+          role: input.role,
+          characterId: input.characterId,
+          content: input.content,
+          activeSwipeIndex: 0,
+          extra: JSON.stringify({
+            ...parseExtraRecord(input.extra),
+            displayText: null,
+            isGenerated: input.role !== "user",
+            tokenCount: null,
+            generationInfo: null,
+          }),
+          autonomousNotificationAt: notificationAt,
+          createdAt: timestamp,
+        });
+        // Create the initial swipe (index 0)
+        await db.insert(messageSwipes).values({
+          id: newId(),
+          messageId: id,
+          index: 0,
+          content: input.content,
+          extra: JSON.stringify(parseExtraRecord(input.extra)),
+          createdAt: timestamp,
+        });
+        await db
+          .update(chats)
+          .set({ lastMessageAt: timestamp, updatedAt: timestamp })
+          .where(eq(chats.id, input.chatId));
+        return this.getMessage(id);
+      };
+
+      if (!options.autonomousNotification) return save();
+      return withAutonomousNotificationQueue(db, async () => {
+        const chat = await this.getById(input.chatId);
+        const extra = parseExtraRecord(input.extra);
+        if (
+          chat?.mode !== "conversation" ||
+          parseMetadata(chat.metadata).internalAssistant === "professor-mari" ||
+          input.role !== "assistant" ||
+          !input.content.trim() ||
+          extra.hiddenFromUser === true ||
+          extra.commandOnly === true
+        ) {
+          return save();
+        }
+        const latest = await db
+          .select({ timestamp: messages.autonomousNotificationAt })
+          .from(messages)
+          .where(isNotNull(messages.autonomousNotificationAt))
+          .orderBy(desc(messages.autonomousNotificationAt))
+          .limit(1);
+        const persistedFloor = latest[0]?.timestamp ? Date.parse(latest[0].timestamp) : 0;
+        const timestamp = Math.max(Date.now(), persistedFloor + 1, (autonomousNotificationFloors.get(db) ?? 0) + 1);
+        const notificationAt = new Date(timestamp).toISOString();
+        // Retain the clock across deletion during this process. After restart only retained
+        // rows provide the floor: deleting the newest row before wall time catches up can
+        // lower it, including after same-ms bursts without any wall-clock rollback.
+        autonomousNotificationFloors.set(db, timestamp);
+        // The marker and content are one row. A failed swipe/chat write rolls the insertion back.
+        return db.transaction(() => save(notificationAt));
       });
-      await db.update(chats).set({ lastMessageAt: timestamp, updatedAt: timestamp }).where(eq(chats.id, input.chatId));
-      return this.getMessage(id);
     },
 
     /**

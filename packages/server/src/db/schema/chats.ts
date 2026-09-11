@@ -65,6 +65,8 @@ export const messages = fileTable("messages", {
   activeSwipeIndex: integer("active_swipe_index").notNull().default(0),
   /** JSON object for extra data */
   extra: text("extra").notNull().default("{}"),
+  /** Engine-owned event clock, stored with a newly saved visible autonomous reply. */
+  autonomousNotificationAt: text("autonomous_notification_at"),
   createdAt: text("created_at").notNull(),
 });
 

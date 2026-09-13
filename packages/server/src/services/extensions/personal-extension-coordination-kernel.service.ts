@@ -304,6 +304,12 @@ export type PersonalExtensionAdminValidationResult = Pick<
   "contentHash" | "configRevision" | "rawStorageValue" | "registry"
 >;
 
+export type PersonalExtensionBlockedRecoveryPreparation = (
+  tx: DB,
+  row: PersonalExtensionCoordinationRow,
+  journals: readonly PersonalExtensionOperationJournalRow[],
+) => Promise<PersonalExtensionAdminValidationResult | null>;
+
 class AsyncMutex {
   private tail: Promise<void> = Promise.resolve();
 
@@ -1098,6 +1104,7 @@ export function createPersonalExtensionCoordinationKernel(
         .delete(personalExtensionOperationJournal)
         .where(eq(personalExtensionOperationJournal.operationDigest, journal.operationDigest));
     }
+    return unresolved;
   };
 
   const runStrictMutation = async <T>(
@@ -1869,12 +1876,14 @@ export function createPersonalExtensionCoordinationKernel(
     extensionId: string,
     validate: (tx: DB, row: PersonalExtensionCoordinationRow) => Promise<PersonalExtensionAdminValidationResult>,
     proveBlockedJournalRecovery?: PersonalExtensionBlockedJournalRecoveryProof,
+    prepareRecovery?: PersonalExtensionBlockedRecoveryPreparation,
   ) => {
     requireIdentifier(extensionId);
     if (typeof validate !== "function") throw kernelError("invalid-request");
     if (proveBlockedJournalRecovery !== undefined && typeof proveBlockedJournalRecovery !== "function") {
       throw kernelError("invalid-request");
     }
+    if (prepareRecovery !== undefined && typeof prepareRecovery !== "function") throw kernelError("invalid-request");
     return runStrictMutation(
       extensionId,
       async (tx) => {
@@ -1892,7 +1901,28 @@ export function createPersonalExtensionCoordinationKernel(
         ) {
           throw kernelError("coordination-validation-failed");
         }
-        await clearSafelyClosableBlockedJournals(tx, row, proveBlockedJournalRecovery);
+        const journals = await clearSafelyClosableBlockedJournals(tx, row, proveBlockedJournalRecovery);
+        // Preparation runs only after every journal is proven closable, inside
+        // the same strict transaction. It may queue work, never claim success.
+        const prepared = await prepareRecovery?.(tx, row, journals);
+        const recovered = prepared ?? validated;
+        if (
+          prepared &&
+          (prepared.contentHash !== validated.contentHash ||
+            prepared.configRevision !== nextFence(row.configRevision) ||
+            prepared.registry.extensionStorage.resourceRevision !== prepared.configRevision ||
+            JSON.stringify(prepared.registry.lorebooks) !== JSON.stringify(validated.registry.lorebooks))
+        ) {
+          throw kernelError("coordination-validation-failed");
+        }
+        if (prepared) {
+          // File-native commits are not multi-file atomic. Persist the pending
+          // handoff and journal retirement while coordination is STILL blocked
+          // at its old revision. Every crash prefix can then retry recovery:
+          // the old journal still matches, or it is already gone. Never land
+          // inactive/revision+1 ahead of retiring that old journal.
+          await tx._fileStore.flushStrict();
+        }
         const fence = nextFence(row.fence);
         await tx
           .update(personalExtensionCoordination)
@@ -1907,6 +1937,8 @@ export function createPersonalExtensionCoordinationKernel(
             handoffRequester: null,
             handoffDeadlineAt: null,
             activeOperations: "[]",
+            configRevision: recovered.configRevision,
+            protectedLorebookRegistry: serializePersonalExtensionProtectedResourceRegistry(recovered.registry),
             updatedAt: new Date(checkedWallNow()).toISOString(),
           })
           .where(eq(personalExtensionCoordination.extensionId, extensionId));
@@ -1916,7 +1948,7 @@ export function createPersonalExtensionCoordinationKernel(
           serverBootId,
           contentHash: row.contentHash,
           fence,
-          configRevision: row.configRevision,
+          configRevision: recovered.configRevision,
         };
       },
       () => clearRuntimeAuthority(extensionId),

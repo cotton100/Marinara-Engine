@@ -20,11 +20,13 @@ import {
 import { createPersonalExtensionsStorage } from "./personal-extension-storage.service.js";
 import {
   createPersonalExtensionCoordinationKernel,
+  parsePersonalExtensionJournalResourceRevisions,
   parsePersonalExtensionProtectedResourceRegistry,
   PersonalExtensionCoordinationKernelError,
   PERSONAL_EXTENSION_PROTECTED_RESOURCE_REGISTRY_VERSION,
   type PersonalExtensionActivationSnapshot,
   type PersonalExtensionBlockedJournalRecoveryProof,
+  type PersonalExtensionBlockedRecoveryPreparation,
   type PersonalExtensionCoordinationKernelOptions,
   type PersonalExtensionOperationConclusionEvidence,
   type PersonalExtensionOperationDispatchMarkerProof,
@@ -906,6 +908,75 @@ function provisionalRegistry(
   };
 }
 
+// A vectorize-only operation can be interrupted after its ready-state write
+// but before removing the generic dispatch marker. Do not infer success from
+// that write or existing vectors: preserve ambiguity and queue the existing
+// guarded, only-missing revalidation path. All proofs and writes are inside
+// recover-blocked's strict transaction, after the journals were validated.
+const prepareInterruptedCmbVectorization: PersonalExtensionBlockedRecoveryPreparation = async (tx, row, journals) => {
+  const fresh = await readCmbStorageSnapshot(tx, row.extensionId);
+  const candidates = journals.filter((journal) => {
+    const target = fresh.config.ensembles.find((ensemble) => ensemble.ensembleId === journal.targetEnsembleId);
+    return (
+      journal.operationKind === "vectorize" &&
+      target?.runtime.semanticStatus === "ready" &&
+      target.runtime.manualRecoveryReasons.includes("mutation-ambiguous")
+    );
+  });
+  if (candidates.length === 0) return null;
+  if (journals.length !== 1 || candidates.length !== 1) throw validationError();
+  const journal = candidates[0]!;
+  const ensemble = fresh.config.ensembles.find((candidate) => candidate.ensembleId === journal.targetEnsembleId)!;
+  const registry = parsePersonalExtensionProtectedResourceRegistry(row.protectedLorebookRegistry);
+  const revisions = parsePersonalExtensionJournalResourceRevisions(journal.protectedResourceRevisions);
+  const storage = revisions.filter((resource) => resource.kind === "extension-storage");
+  const books = revisions.filter((resource) => resource.kind === "lorebook");
+  if (
+    journal.phase !== "dispatching" ||
+    journal.fence >= row.fence ||
+    fresh.configRevision !== row.configRevision ||
+    !ensemble.autoSync ||
+    ensemble.lorebookId === "" ||
+    ensemble.runtime.pendingEmbeddingProfile !== null ||
+    !sameEmbeddingProfile(ensemble.runtime.lastSuccessfulEmbeddingProfile, ensemble.embedding) ||
+    !sameUniqueStrings(ensemble.runtime.manualRecoveryReasons, ["mutation-ambiguous"]) ||
+    fresh.config.ensembles.filter((candidate) => candidate.runtime.manualRecoveryReasons.length > 0).length !== 1 ||
+    storage.length !== 1 ||
+    storage[0]?.resourceId !== row.extensionId ||
+    storage[0].presence !== "present" ||
+    storage[0].resourceRevision !== row.configRevision ||
+    books.length !== 1 ||
+    books[0]?.resourceId !== ensemble.lorebookId ||
+    books[0].presence !== "present" ||
+    books[0].resourceRevision !== registry.lorebooks[ensemble.lorebookId]?.resourceRevision
+  )
+    throw validationError();
+  const configRevision = row.configRevision + 1;
+  if (!Number.isSafeInteger(configRevision)) throw validationError();
+  // Preserve unrelated extension keys, options and all historical timestamps.
+  const stored = parseJsonRecord(fresh.rawStorageValue);
+  const rawConfig = stored[STORAGE_KEY] as CmbConfig;
+  const target = rawConfig.ensembles.find((candidate) => candidate.ensembleId === ensemble.ensembleId)!;
+  target.runtime = {
+    ...target.runtime,
+    semanticStatus: "pending",
+    pendingEmbeddingProfile: { ...ensemble.embedding },
+    manualRecoveryReasons: [...PREPARED_AUTO_RECOVERY_REASONS],
+  };
+  if (!activationRecoveryStateIsSafe(parseCmbConfig(rawConfig))) throw validationError();
+  const rawStorageValue = JSON.stringify(stored);
+  await tx
+    .update(appSettings)
+    .set({ value: rawStorageValue, updatedAt: new Date().toISOString() })
+    .where(eq(appSettings.key, `${STORAGE_KEY_PREFIX}${row.extensionId}`));
+  return {
+    contentHash: row.contentHash,
+    configRevision,
+    rawStorageValue,
+    registry: { ...registry, extensionStorage: { resourceRevision: configRevision } },
+  };
+};
+
 export function createPersonalExtensionCoordinationAdminService(
   db: DB,
   options: PersonalExtensionCoordinationKernelOptions = {},
@@ -974,6 +1045,8 @@ export function createPersonalExtensionCoordinationAdminService(
       return kernel.recoverBlockedCoordination(
         extensionId,
         async (tx, row) => {
+          const extension = await requireApprovedFullPageExtension(tx, extensionId);
+          if (extension.contentHash !== row.contentHash) throw validationError();
           const fresh = await readCmbStorageSnapshot(tx, extensionId);
           const registry = parsePersonalExtensionProtectedResourceRegistry(row.protectedLorebookRegistry);
           if (
@@ -991,6 +1064,7 @@ export function createPersonalExtensionCoordinationAdminService(
           };
         },
         proveCmbBlockedJournalRecovery,
+        prepareInterruptedCmbVectorization,
       );
     },
 

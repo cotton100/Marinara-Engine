@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Fastify from "../../packages/server/node_modules/fastify/fastify.js";
 import { eq } from "../../packages/server/src/db/file-query.js";
 import type { DB } from "../../packages/server/src/db/connection.js";
-import { createFileNativeDB } from "../../packages/server/src/db/file-backed-store.js";
+import { createFileNativeDB, encodeShardKey } from "../../packages/server/src/db/file-backed-store.js";
 import {
+  appSettings,
   characters,
   chats,
   personalExtensionCoordination,
   personalExtensionOperationJournal,
+  type PersonalExtensionOperationJournalRow,
 } from "../../packages/server/src/db/schema/index.js";
 import { personalExtensionCoordinationRoutes } from "../../packages/server/src/routes/personal-extension-coordination.routes.js";
 import { personalExtensionsRoutes } from "../../packages/server/src/routes/personal-extensions.routes.js";
@@ -65,7 +67,17 @@ process.env.ADMIN_SECRET = exactSecret;
 process.env.ENABLE_EXTERNAL_EXTENSIONS = "true";
 
 let failStrictWrite = false;
+let beforeInactiveCoordinationWrite: (() => void) | null = null;
 const fileDb = await createFileNativeDB({
+  beforeTableWrite(table, serializedRows) {
+    if (
+      beforeInactiveCoordinationWrite &&
+      table === `personal_extension_coordination/${encodeShardKey(EXTENSION_ID)}` &&
+      JSON.parse(serializedRows)[0]?.mode === "inactive"
+    ) {
+      beforeInactiveCoordinationWrite();
+    }
+  },
   fileOperations: {
     writeFile: async (...args) => {
       if (failStrictWrite) {
@@ -1439,6 +1451,454 @@ try {
     .set({ mode: "inactive", updatedAt: new Date().toISOString() })
     .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
   transitionSubscription.close();
+
+  const interruptedVectorizeDigest = "1".repeat(64);
+  const extraVectorizeDigest = "2".repeat(64);
+  async function interruptedVectorizeFixture() {
+    const row = (await coordinationRow())!;
+    const registry = JSON.parse(row.protectedLorebookRegistry);
+    const value = preparedActivationConfig({
+      semanticStatus: "ready",
+      pendingEmbeddingProfile: null,
+      manualRecoveryReasons: ["mutation-ambiguous"],
+    });
+    const ensemble = value.ensembles[0]!;
+    const stored = {
+      unrelatedExtensionOptions: { enabled: false, labels: ["keep", "exact"] },
+      convoMemoryBridgeV1: {
+        ...value,
+        ensembles: [
+          {
+            ...ensemble,
+            // The parser normalizes local-sidecar aliases, but recovery must not rewrite raw options.
+            embedding: { ...embedding, model: "legacy-local-sidecar-label" },
+            runtime: { ...ensemble.runtime, lastSuccessfulSyncAt: timestamp },
+          },
+        ],
+      },
+    };
+    const revisions = [
+      {
+        kind: "extension-storage",
+        resourceId: EXTENSION_ID,
+        presence: "present",
+        resourceRevision: row.configRevision,
+      },
+      {
+        kind: "lorebook",
+        resourceId: lorebook.id,
+        presence: "present",
+        resourceRevision: registry.lorebooks[lorebook.id].resourceRevision,
+      },
+    ];
+    const journal: PersonalExtensionOperationJournalRow = {
+      operationDigest: interruptedVectorizeDigest,
+      extensionId: EXTENSION_ID,
+      targetEnsembleId: ENSEMBLE_ID,
+      operationKind: "vectorize",
+      fence: row.fence,
+      phase: "dispatching",
+      protectedResourceRevisions: JSON.stringify(revisions),
+      preparedAt: timestamp,
+      dispatchingAt: timestamp,
+      finalAt: null,
+      updatedAt: timestamp,
+    };
+    return { row: { ...row, mode: "blocked" as const, fence: row.fence + 1 }, stored, revisions, journals: [journal] };
+  }
+
+  async function seedInterruptedVectorize(fixture: Awaited<ReturnType<typeof interruptedVectorizeFixture>>) {
+    await settings.set(STORAGE_KEY, JSON.stringify(fixture.stored));
+    await db
+      .update(personalExtensionCoordination)
+      .set(fixture.row)
+      .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+    if (fixture.journals[0]) fixture.journals[0].protectedResourceRevisions = JSON.stringify(fixture.revisions);
+    for (const journal of fixture.journals) await db.insert(personalExtensionOperationJournal).values(journal);
+    await fileDb._fileStore.flushStrict();
+  }
+
+  async function interruptedVectorizeState() {
+    return {
+      row: await coordinationRow(),
+      settings: await db.select().from(appSettings),
+      journals: await db
+        .select()
+        .from(personalExtensionOperationJournal)
+        .where(eq(personalExtensionOperationJournal.extensionId, EXTENSION_ID)),
+      book: await lorebooks.getById(lorebook.id),
+      entries: await lorebooks.listEntries(lorebook.id),
+      otherBook: await lorebooks.getById(secondLorebook.id),
+      otherEntries: await lorebooks.listEntries(secondLorebook.id),
+    };
+  }
+
+  function interruptedVectorizeDiskState() {
+    const readShard = (table: string, key: string) => {
+      const primary = join(storageDir, "tables", table, `${encodeShardKey(key)}.json`);
+      const path = existsSync(primary) ? primary : `${primary}.bak`;
+      return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null;
+    };
+    return {
+      row: readShard("personal_extension_coordination", EXTENSION_ID),
+      storage: readShard("app_settings", STORAGE_KEY),
+      journal: readShard("personal_extension_operation_journal", interruptedVectorizeDigest),
+    };
+  }
+
+  const vectorizeFixture = await interruptedVectorizeFixture();
+  await seedInterruptedVectorize(vectorizeFixture);
+  const vectorizeBefore = await interruptedVectorizeState();
+  const vectorizeDiskBefore = interruptedVectorizeDiskState();
+  const expectedPreparedStorage = structuredClone(vectorizeFixture.stored);
+  expectedPreparedStorage.convoMemoryBridgeV1.ensembles[0]!.runtime = {
+    ...expectedPreparedStorage.convoMemoryBridgeV1.ensembles[0]!.runtime,
+    semanticStatus: "pending",
+    pendingEmbeddingProfile: embedding,
+    manualRecoveryReasons: ["mutation-ambiguous", "vectorization-pending"],
+  };
+  const eventsBeforeVectorizeFailure = publishedAdminDrafts.length;
+  failStrictWrite = true;
+  const failedVectorizeRecovery = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-blocked"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(failedVectorizeRecovery.statusCode, 503, failedVectorizeRecovery.body);
+  assert.equal(failedVectorizeRecovery.json().code, "coordination-unavailable");
+  assert.deepEqual(
+    await interruptedVectorizeState(),
+    vectorizeBefore,
+    "failed strict recovery must restore the original journal, blocked authority, all settings and books",
+  );
+  assert.equal(
+    publishedAdminDrafts.length,
+    eventsBeforeVectorizeFailure,
+    "failed vectorize preparation must publish no success event",
+  );
+  assert.deepEqual(interruptedVectorizeDiskState(), vectorizeDiskBefore);
+
+  const secondBarrierDiskStates: Array<ReturnType<typeof interruptedVectorizeDiskState>> = [];
+  beforeInactiveCoordinationWrite = () => {
+    beforeInactiveCoordinationWrite = null;
+    secondBarrierDiskStates.push(interruptedVectorizeDiskState());
+    throw new Error("simulated recovery authority barrier write failure");
+  };
+  const failedVectorizeAuthorityWrite = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-blocked"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(failedVectorizeAuthorityWrite.statusCode, 503, failedVectorizeAuthorityWrite.body);
+  assert.equal(failedVectorizeAuthorityWrite.json().code, "coordination-unavailable");
+  const secondBarrierDiskState = secondBarrierDiskStates[0];
+  assert.ok(secondBarrierDiskState, "the failure must occur at the later inactive authority write");
+  assert.deepEqual(
+    secondBarrierDiskState.row,
+    vectorizeDiskBefore.row,
+    "the first barrier must keep old blocked authority durably intact",
+  );
+  assert.deepEqual(
+    JSON.parse(secondBarrierDiskState.storage[0].value),
+    expectedPreparedStorage,
+    "the first barrier must durably prepare pending storage before inactive authority can be written",
+  );
+  assert.equal(
+    secondBarrierDiskState.journal,
+    null,
+    "the first barrier must durably retire the old journal before inactive authority can be written",
+  );
+  assert.deepEqual(
+    await interruptedVectorizeState(),
+    vectorizeBefore,
+    "second-barrier failure must restore all original settings, authority, journals and books in memory",
+  );
+  assert.deepEqual(
+    interruptedVectorizeDiskState(),
+    vectorizeDiskBefore,
+    "second-barrier failure must restore the original settings, blocked authority and journal on disk",
+  );
+  assert.equal(publishedAdminDrafts.length, eventsBeforeVectorizeFailure);
+
+  const vectorizeRecovered = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-blocked"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(vectorizeRecovered.statusCode, 200, vectorizeRecovered.body);
+  assert.equal(vectorizeRecovered.json().mode, "inactive");
+  const vectorizeAfter = await interruptedVectorizeState();
+  assert.deepEqual(
+    JSON.parse((await settings.get(STORAGE_KEY))!),
+    expectedPreparedStorage,
+    "recovery must preserve raw options, unrelated keys and historical sync time while retaining ambiguity",
+  );
+  assert.equal(vectorizeAfter.row?.fence, vectorizeBefore.row!.fence + 1);
+  assert.equal(vectorizeAfter.row?.configRevision, vectorizeBefore.row!.configRevision + 1);
+  assert.equal(vectorizeRecovered.json().configRevision, vectorizeBefore.row!.configRevision + 1);
+  const registryBeforeVectorize = JSON.parse(vectorizeBefore.row!.protectedLorebookRegistry);
+  const registryAfterVectorize = JSON.parse(vectorizeAfter.row!.protectedLorebookRegistry);
+  assert.deepEqual(
+    registryAfterVectorize,
+    {
+      ...registryBeforeVectorize,
+      extensionStorage: { resourceRevision: vectorizeBefore.row!.configRevision + 1 },
+    },
+    "only the extension-storage revision may advance during server-owned preparation",
+  );
+  assert.deepEqual(
+    vectorizeAfter.journals,
+    vectorizeBefore.journals.filter((journal) => journal.operationDigest !== interruptedVectorizeDigest),
+    "only the proven journal may be retired",
+  );
+  assert.deepEqual(
+    vectorizeAfter.settings.filter((setting) => setting.key !== STORAGE_KEY),
+    vectorizeBefore.settings.filter((setting) => setting.key !== STORAGE_KEY),
+  );
+  for (const key of ["book", "entries", "otherBook", "otherEntries"] as const) {
+    assert.deepEqual(
+      vectorizeAfter[key],
+      vectorizeBefore[key],
+      `${key} must not be rewritten or vectorized by recovery`,
+    );
+  }
+  assert.equal(publishedAdminDrafts.length, eventsBeforeVectorizeFailure + 1);
+  const repeatedVectorizeRecovery = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-blocked"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(repeatedVectorizeRecovery.statusCode, 409, repeatedVectorizeRecovery.body);
+  assert.deepEqual(
+    await interruptedVectorizeState(),
+    vectorizeAfter,
+    "repeated recover-blocked must not advance revisions, replace markers or change inactive authority",
+  );
+  assert.equal(publishedAdminDrafts.length, eventsBeforeVectorizeFailure + 1);
+
+  const vectorizeActivation = await app.inject({
+    method: "POST",
+    url: adminUrl("activate"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(vectorizeActivation.statusCode, 200, vectorizeActivation.body);
+  assert.equal(vectorizeActivation.json().mode, "active");
+  assert.equal((await coordinationRow())?.configRevision, vectorizeAfter.row?.configRevision);
+  assert.deepEqual(
+    JSON.parse((await settings.get(STORAGE_KEY))!),
+    expectedPreparedStorage,
+    "existing activation must retain pending proof for guarded client revalidation",
+  );
+  const vectorizeLease = await coordination.acquireLease({
+    extensionId: EXTENSION_ID,
+    holderSessionId: "recovered-vectorize-holder",
+    serverBootId: PERSONAL_EXTENSION_COORDINATION_PROCESS_BOOT_ID,
+    contentHash: extension.contentHash,
+  });
+  assert.ok(vectorizeLease.fence > vectorizeAfter.row!.fence);
+  const vectorizeAuthority = {
+    extensionId: EXTENSION_ID,
+    holderSessionId: "recovered-vectorize-holder",
+    serverBootId: vectorizeLease.serverBootId,
+    contentHash: vectorizeLease.contentHash,
+    fence: vectorizeLease.fence,
+    leaseToken: vectorizeLease.leaseToken,
+  };
+  const resumedVectorize = await coordination.beginOperation({
+    ...vectorizeAuthority,
+    kind: "vectorize",
+    targetEnsembleId: ENSEMBLE_ID,
+  });
+  assert.ok(resumedVectorize.operationHandle, "recovered activation must admit a fresh guarded vectorize operation");
+  await coordination.endOperation({
+    ...vectorizeAuthority,
+    operationHandle: resumedVectorize.operationHandle,
+    disposition: "aborted",
+  });
+  await coordination.releaseLease(vectorizeAuthority);
+  const vectorizeDeactivated = await app.inject({
+    method: "POST",
+    url: adminUrl("deactivate"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(vectorizeDeactivated.statusCode, 200, vectorizeDeactivated.body);
+
+  for (const oldJournalPresent of [true, false]) {
+    const fixture = await interruptedVectorizeFixture();
+    fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime = {
+      ...fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime,
+      semanticStatus: "pending",
+      pendingEmbeddingProfile: embedding,
+      manualRecoveryReasons: ["mutation-ambiguous", "vectorization-pending"],
+    };
+    if (!oldJournalPresent) fixture.journals = [];
+    await seedInterruptedVectorize(fixture);
+    const before = await interruptedVectorizeState();
+    const recoveredPrefix = await app.inject({
+      method: "POST",
+      url: adminUrl("recover-blocked"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(recoveredPrefix.statusCode, 200, `journal present=${oldJournalPresent}: ${recoveredPrefix.body}`);
+    assert.equal(recoveredPrefix.json().mode, "inactive");
+    const after = await interruptedVectorizeState();
+    assert.equal(
+      after.row?.configRevision,
+      before.row?.configRevision,
+      "retrying an already-pending crash prefix must not advance the storage revision again",
+    );
+    assert.equal(after.row?.protectedLorebookRegistry, before.row?.protectedLorebookRegistry);
+    assert.deepEqual(after.settings, before.settings, "crash-prefix recovery must preserve exact pending storage");
+    assert.deepEqual(
+      after.journals,
+      before.journals.filter((journal) => journal.operationDigest !== interruptedVectorizeDigest),
+    );
+    for (const key of ["book", "entries", "otherBook", "otherEntries"] as const)
+      assert.deepEqual(after[key], before[key]);
+    const activatePrefix = await app.inject({
+      method: "POST",
+      url: adminUrl("activate"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(activatePrefix.statusCode, 200, activatePrefix.body);
+    assert.equal(activatePrefix.json().mode, "active");
+    assert.equal((await coordinationRow())?.configRevision, before.row?.configRevision);
+    assert.deepEqual((await interruptedVectorizeState()).settings, before.settings);
+    const deactivatePrefix = await app.inject({
+      method: "POST",
+      url: adminUrl("deactivate"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(deactivatePrefix.statusCode, 200, deactivatePrefix.body);
+  }
+
+  const invalidVectorizeFixtures: Array<
+    [string, (fixture: Awaited<ReturnType<typeof interruptedVectorizeFixture>>) => void]
+  > = [
+    [
+      "missing lorebook revision",
+      (fixture) => {
+        fixture.revisions.pop();
+      },
+    ],
+    [
+      "mismatched lorebook revision",
+      (fixture) => {
+        fixture.revisions[1]!.resourceRevision += 1;
+      },
+    ],
+    [
+      "missing storage revision",
+      (fixture) => {
+        fixture.revisions.shift();
+      },
+    ],
+    [
+      "mismatched storage revision",
+      (fixture) => {
+        fixture.revisions[0]!.resourceRevision += 1;
+      },
+    ],
+    [
+      "wrong lorebook",
+      (fixture) => {
+        fixture.revisions[1]!.resourceId = secondLorebook.id;
+      },
+    ],
+    [
+      "wrong target ensemble",
+      (fixture) => {
+        fixture.journals[0]!.targetEnsembleId = SECOND_ENSEMBLE_ID;
+      },
+    ],
+    [
+      "journal fence not older",
+      (fixture) => {
+        fixture.journals[0]!.fence = fixture.row.fence;
+      },
+    ],
+    [
+      "marker-free runtime",
+      (fixture) => {
+        fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.manualRecoveryReasons = [];
+      },
+    ],
+    [
+      "additional recovery reason",
+      (fixture) => {
+        fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.manualRecoveryReasons.push("source-read-incomplete");
+      },
+    ],
+    [
+      "auto sync disabled",
+      (fixture) => {
+        fixture.stored.convoMemoryBridgeV1.ensembles[0]!.autoSync = false;
+      },
+    ],
+    [
+      "different last-success profile",
+      (fixture) => {
+        fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.lastSuccessfulEmbeddingProfile = {
+          connectionId: "different-connection",
+          model: "different-model",
+        };
+      },
+    ],
+    [
+      "already has a pending profile",
+      (fixture) => {
+        fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.pendingEmbeddingProfile = embedding;
+      },
+    ],
+    [
+      "additional safely prepared journal",
+      (fixture) => {
+        fixture.journals.push({
+          ...fixture.journals[0]!,
+          operationDigest: extraVectorizeDigest,
+          phase: "prepared",
+          dispatchingAt: null,
+          protectedResourceRevisions: "[]",
+        });
+      },
+    ],
+  ];
+  for (const [label, mutate] of invalidVectorizeFixtures) {
+    const fixture = await interruptedVectorizeFixture();
+    mutate(fixture);
+    await seedInterruptedVectorize(fixture);
+    const before = await interruptedVectorizeState();
+    const eventCountBefore = publishedAdminDrafts.length;
+    const rejected = await app.inject({
+      method: "POST",
+      url: adminUrl("recover-blocked"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(rejected.statusCode, 409, `${label}: ${rejected.body}`);
+    assert.equal(rejected.json().code, "coordination-validation-failed", label);
+    assert.deepEqual(await interruptedVectorizeState(), before, `${label} must preserve every journal and setting`);
+    assert.equal(publishedAdminDrafts.length, eventCountBefore, `${label} must not publish an admin event`);
+    for (const journal of fixture.journals) {
+      await db
+        .delete(personalExtensionOperationJournal)
+        .where(eq(personalExtensionOperationJournal.operationDigest, journal.operationDigest));
+    }
+  }
+  await setConfig();
+  await db
+    .update(personalExtensionCoordination)
+    .set({ mode: "inactive" })
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
 
   await db.insert(personalExtensionCoordination).values({
     extensionId: STALE_EXTENSION_ID,

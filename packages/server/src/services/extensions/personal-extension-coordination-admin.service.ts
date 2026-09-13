@@ -1,5 +1,5 @@
 import { PERSONAL_EXTENSION_FULL_PAGE_CAPABILITY } from "@marinara-engine/shared";
-import { eq } from "../../db/file-query.js";
+import { eq, like } from "../../db/file-query.js";
 import type { DB } from "../../db/connection.js";
 import {
   apiConnections,
@@ -27,6 +27,7 @@ import {
   type PersonalExtensionActivationSnapshot,
   type PersonalExtensionBlockedJournalRecoveryProof,
   type PersonalExtensionBlockedRecoveryPreparation,
+  type PersonalExtensionDetachedLorebookRetirementInput,
   type PersonalExtensionCoordinationKernelOptions,
   type PersonalExtensionOperationConclusionEvidence,
   type PersonalExtensionOperationDispatchMarkerProof,
@@ -1066,6 +1067,57 @@ export function createPersonalExtensionCoordinationAdminService(
         proveCmbBlockedJournalRecovery,
         prepareInterruptedCmbVectorization,
       );
+    },
+
+    retireDetachedLorebook(extensionId: string, input: PersonalExtensionDetachedLorebookRetirementInput) {
+      return kernel.retireDetachedLorebook(extensionId, input, async (tx, row, nextRegistry) => {
+        const extension = await requireApprovedFullPageExtension(tx, extensionId);
+        if (extension.contentHash !== row.contentHash) throw validationError();
+        const fresh = await readCmbStorageSnapshot(tx, extensionId);
+        if (
+          fresh.configRevision !== row.configRevision ||
+          nextRegistry.extensionStorage.resourceRevision !== row.configRevision ||
+          fresh.config.ensembles.some((ensemble) => ensemble.lorebookId === input.lorebookId)
+        )
+          throw validationError();
+        // Retain the retired ensemble's book and its normal recall scope. Only
+        // an unreferenced CMB registration may leave this extension's registry.
+        const book = await createLorebooksStorage(tx).getById(input.lorebookId);
+        if (!book || !Array.isArray(book.tags) || !book.tags.includes(MANAGED_LOREBOOK_TAG)) throw validationError();
+        const [storageRows, chatRows, characterRows, coordinationRows] = await Promise.all([
+          tx
+            .select({ value: appSettings.value })
+            .from(appSettings)
+            .where(like(appSettings.key, `${STORAGE_KEY_PREFIX}%`)),
+          tx.select({ metadata: chats.metadata }).from(chats),
+          tx.select({ data: characters.data }).from(characters),
+          tx.select().from(personalExtensionCoordination),
+        ]);
+        const referencesBook = (raw: string) => {
+          try {
+            return JSON.stringify(JSON.parse(raw)).includes(input.lorebookId);
+          } catch {
+            return true;
+          } // Unknown reference shape cannot prove safe retirement.
+        };
+        if (
+          storageRows.some((setting) => referencesBook(setting.value)) ||
+          chatRows.some((chat) => referencesBook(chat.metadata)) ||
+          characterRows.some((character) => referencesBook(character.data)) ||
+          coordinationRows.some(
+            (other) =>
+              other.extensionId !== extensionId &&
+              Object.hasOwn(
+                parsePersonalExtensionProtectedResourceRegistry(other.protectedLorebookRegistry).lorebooks,
+                input.lorebookId,
+              ),
+          )
+        )
+          throw validationError();
+        // Keep the full existing resource contract: retirement must make the
+        // registry exactly equal the configured set, not merely a superset.
+        await validateCmbResources(tx, fresh.config, nextRegistry, false);
+      });
     },
 
     recoverStaleTransitions() {

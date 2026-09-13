@@ -1521,6 +1521,8 @@ try {
   async function interruptedVectorizeState() {
     return {
       row: await coordinationRow(),
+      chats: await db.select().from(chats),
+      characters: await db.select().from(characters),
       settings: await db.select().from(appSettings),
       journals: await db
         .select()
@@ -1545,6 +1547,227 @@ try {
       journal: readShard("personal_extension_operation_journal", interruptedVectorizeDigest),
     };
   }
+
+  // Real route proof for explicit retirement: keep a nonempty historical book,
+  // policy, links, current ambiguity and journal, changing only registration.
+  await db
+    .update(characters)
+    .set({ data: JSON.stringify({ name: "Unrelated" }) })
+    .where(eq(characters.id, "unrelated-corrupt-character"));
+  const detachedFixture = await interruptedVectorizeFixture();
+  const detachedRegistry = JSON.parse(detachedFixture.row.protectedLorebookRegistry);
+  detachedRegistry.lorebooks[secondLorebook.id] = { resourceRevision: 0 };
+  detachedFixture.row.protectedLorebookRegistry = JSON.stringify(detachedRegistry);
+  await seedInterruptedVectorize(detachedFixture);
+  const retirementUrl = `/api/personal-extensions/${EXTENSION_ID}/coordination/admin/retire-detached-lorebook`;
+  const retirementInput = {
+    lorebookId: secondLorebook.id,
+    expectedContentHash: extension.contentHash,
+    expectedConfigRevision: detachedFixture.row.configRevision,
+    expectedFence: detachedFixture.row.fence,
+    expectedResourceRevision: 0,
+  };
+  const retire = (payload: unknown = retirementInput, secret: string | undefined = exactSecret) =>
+    app.inject({ method: "POST", url: retirementUrl, headers: adminHeaders(secret), payload });
+  const detachedBefore = await interruptedVectorizeState();
+  const ordinaryRecoveryWithExtra = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-blocked"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(
+    ordinaryRecoveryWithExtra.statusCode,
+    409,
+    "normal recovery must not silently discard a historical registration",
+  );
+  assert.deepEqual(await interruptedVectorizeState(), detachedBefore);
+  for (const [label, payload, secret, expectedStatus] of [
+    ["missing administrator", retirementInput, "", 403],
+    ["wrong administrator", retirementInput, "incorrect", 403],
+    ["unknown input", { ...retirementInput, bypass: true }, exactSecret, 400],
+    ["missing identity", {}, exactSecret, 400],
+    ["stale hash", { ...retirementInput, expectedContentHash: `sha256:${"0".repeat(64)}` }, exactSecret, 412],
+    ["stale fence", { ...retirementInput, expectedFence: retirementInput.expectedFence - 1 }, exactSecret, 409],
+    [
+      "stale configuration",
+      { ...retirementInput, expectedConfigRevision: retirementInput.expectedConfigRevision + 1 },
+      exactSecret,
+      409,
+    ],
+    ["nonzero revision", { ...retirementInput, expectedResourceRevision: 1 }, exactSecret, 400],
+    ["nonexistent registration", { ...retirementInput, lorebookId: "missing-detached-book" }, exactSecret, 409],
+  ] as const) {
+    const eventCount = publishedAdminDrafts.length;
+    const response = await retire(payload, secret);
+    assert.equal(response.statusCode, expectedStatus, `${label}: ${response.body}`);
+    assert.deepEqual(await interruptedVectorizeState(), detachedBefore, `${label} must write nothing`);
+    assert.equal(publishedAdminDrafts.length, eventCount);
+  }
+  const expectRetirementRejected = async (label: string) => {
+    await fileDb._fileStore.flushStrict();
+    const before = await interruptedVectorizeState();
+    const events = publishedAdminDrafts.length;
+    const response = await retire();
+    assert.equal(response.statusCode, 409, `${label}: ${response.body}`);
+    assert.deepEqual(await interruptedVectorizeState(), before, `${label} must preserve all state`);
+    assert.equal(publishedAdminDrafts.length, events);
+  };
+  for (const patch of [
+    { mode: "active" as const },
+    { holderSessionId: "retirement-holder" },
+    { leaseTokenDigest: "a".repeat(64) },
+    { expiresAt: timestamp },
+    { handoffRequestId: "a".repeat(16), handoffRequester: "other", handoffDeadlineAt: timestamp },
+    {
+      activeOperations: JSON.stringify([
+        {
+          digest: "a".repeat(64),
+          kind: "vectorize",
+          targetEnsembleId: ENSEMBLE_ID,
+          holderSessionId: "other",
+          fence: detachedFixture.row.fence,
+          startedAt: timestamp,
+          deadlineAt: timestamp,
+          drainEligible: false,
+        },
+      ]),
+    },
+  ]) {
+    await db
+      .update(personalExtensionCoordination)
+      .set(patch)
+      .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+    await expectRetirementRejected("authority remains present");
+    await db
+      .update(personalExtensionCoordination)
+      .set(detachedFixture.row)
+      .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  }
+  const advancedRegistry = structuredClone(detachedRegistry);
+  advancedRegistry.lorebooks[secondLorebook.id].resourceRevision = 1;
+  await db
+    .update(personalExtensionCoordination)
+    .set({ protectedLorebookRegistry: JSON.stringify(advancedRegistry) })
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  await expectRetirementRejected("retired resource was modified");
+  await db
+    .update(personalExtensionCoordination)
+    .set(detachedFixture.row)
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  await db
+    .update(personalExtensionOperationJournal)
+    .set({
+      protectedResourceRevisions: JSON.stringify([
+        ...detachedFixture.revisions,
+        { kind: "lorebook", resourceId: secondLorebook.id, presence: "present", resourceRevision: 0 },
+      ]),
+    })
+    .where(eq(personalExtensionOperationJournal.operationDigest, interruptedVectorizeDigest));
+  await expectRetirementRejected("unfinished journal references the target");
+  await db
+    .update(personalExtensionOperationJournal)
+    .set({ protectedResourceRevisions: JSON.stringify(detachedFixture.revisions) })
+    .where(eq(personalExtensionOperationJournal.operationDigest, interruptedVectorizeDigest));
+  const currentRequest = { ...retirementInput, lorebookId: lorebook.id };
+  const zeroCurrentRegistry = structuredClone(detachedRegistry);
+  zeroCurrentRegistry.lorebooks[lorebook.id].resourceRevision = 0;
+  await db
+    .update(personalExtensionCoordination)
+    .set({ protectedLorebookRegistry: JSON.stringify(zeroCurrentRegistry) })
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  const beforeCurrentAttempt = await interruptedVectorizeState();
+  const currentAttempt = await retire(currentRequest);
+  assert.equal(currentAttempt.statusCode, 409);
+  assert.deepEqual(await interruptedVectorizeState(), beforeCurrentAttempt, "configured memory book cannot be retired");
+  await db
+    .update(personalExtensionCoordination)
+    .set(detachedFixture.row)
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  for (const value of [JSON.stringify({ other: secondLorebook.id }), "invalid-json"]) {
+    await settings.set("extension-storage:retirement-reference", value);
+    await expectRetirementRejected("another extension has a reference or unreadable storage");
+    await db.delete(appSettings).where(eq(appSettings.key, "extension-storage:retirement-reference"));
+  }
+  const dmBeforeRetirement = (await db.select().from(chats).where(eq(chats.id, DM_CHAT_ID)))[0]!;
+  await db
+    .update(chats)
+    .set({ metadata: JSON.stringify({ ...JSON.parse(dmBeforeRetirement.metadata), lorebookIds: [secondLorebook.id] }) })
+    .where(eq(chats.id, DM_CHAT_ID));
+  await expectRetirementRejected("chat explicitly references old book");
+  await db.update(chats).set({ metadata: dmBeforeRetirement.metadata }).where(eq(chats.id, DM_CHAT_ID));
+  const characterBeforeRetirement = (
+    await db.select().from(characters).where(eq(characters.id, SECOND_CHARACTER_ID))
+  )[0]!;
+  await db
+    .update(characters)
+    .set({
+      data: JSON.stringify({
+        name: "Bob",
+        extensions: { importMetadata: { embeddedLorebook: { lorebookId: secondLorebook.id } } },
+      }),
+    })
+    .where(eq(characters.id, SECOND_CHARACTER_ID));
+  await expectRetirementRejected("character embeds the old book");
+  await db
+    .update(characters)
+    .set({ data: characterBeforeRetirement.data })
+    .where(eq(characters.id, SECOND_CHARACTER_ID));
+  await db
+    .insert(personalExtensionCoordination)
+    .values({ ...detachedFixture.row, extensionId: "other-registry-owner" });
+  await expectRetirementRejected("another coordination owns the book");
+  await db
+    .delete(personalExtensionCoordination)
+    .where(eq(personalExtensionCoordination.extensionId, "other-registry-owner"));
+  await fileDb._fileStore.flushStrict();
+  const retirementDiskBefore = interruptedVectorizeDiskState();
+  const retirementBefore = await interruptedVectorizeState();
+  const retirementEventsBefore = publishedAdminDrafts.length;
+  failStrictWrite = true;
+  const failedDetachedRetirement = await retire();
+  assert.equal(failedDetachedRetirement.statusCode, 503, failedDetachedRetirement.body);
+  assert.deepEqual(await interruptedVectorizeState(), retirementBefore);
+  assert.deepEqual(interruptedVectorizeDiskState(), retirementDiskBefore);
+  assert.equal(publishedAdminDrafts.length, retirementEventsBefore, "failed durability must not publish success");
+  const detachedRetired = await retire();
+  assert.equal(detachedRetired.statusCode, 200, detachedRetired.body);
+  const retiredState = await interruptedVectorizeState();
+  const expectedRegistry = structuredClone(detachedRegistry);
+  delete expectedRegistry.lorebooks[secondLorebook.id];
+  assert.deepEqual(retiredState, {
+    ...retirementBefore,
+    row: {
+      ...retirementBefore.row,
+      protectedLorebookRegistry: JSON.stringify(expectedRegistry),
+      fence: retirementBefore.row!.fence + 1,
+      updatedAt: retiredState.row!.updatedAt,
+    },
+  });
+  assert.equal(retiredState.row?.mode, "blocked", "retirement must never activate or clear uncertainty");
+  assert.ok(retiredState.otherEntries.length > 0, "nonempty historical memories must be preserved");
+  assert.equal(publishedAdminDrafts.length, retirementEventsBefore + 1);
+  const replayRetirement = await retire();
+  assert.equal(replayRetirement.statusCode, 409, "old exact request must not replay after the fence changes");
+  assert.deepEqual(await interruptedVectorizeState(), retiredState);
+  const afterRetirementRecovered = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-blocked"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(afterRetirementRecovered.statusCode, 200, afterRetirementRecovered.body);
+  assert.equal(afterRetirementRecovered.json().mode, "inactive");
+  assert.deepEqual(await lorebooks.listEntries(secondLorebook.id), retirementBefore.otherEntries);
+  const afterRetirementActivated = await app.inject({
+    method: "POST",
+    url: adminUrl("activate"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(afterRetirementActivated.statusCode, 200, afterRetirementActivated.body);
+  await app.inject({ method: "POST", url: adminUrl("deactivate"), headers: adminHeaders(exactSecret), payload: {} });
+  await db.update(characters).set({ data: "not-json" }).where(eq(characters.id, "unrelated-corrupt-character"));
 
   const vectorizeFixture = await interruptedVectorizeFixture();
   await seedInterruptedVectorize(vectorizeFixture);

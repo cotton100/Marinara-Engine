@@ -2,7 +2,7 @@
 // Personal Extension Coordination Routes
 // ──────────────────────────────────────────────
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { ZodError } from "zod";
+import { z, ZodError } from "zod";
 import {
   PERSONAL_EXTENSION_COORDINATION_HOLDER_HEADER,
   PERSONAL_EXTENSION_COORDINATION_HTTP_STATUS,
@@ -156,6 +156,29 @@ export async function personalExtensionCoordinationRoutes(
   adminTransition("activate", (id) => service.activateCoordination(id));
   adminTransition("deactivate", (id) => service.deactivateCoordination(id));
   adminTransition("recover-blocked", (id) => service.recoverBlockedCoordination(id));
+
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    "/:id/coordination/admin/retire-detached-lorebook",
+    async (request, reply) => {
+      if (!requireCoordinationAdminAccess(request, reply, { feature: "Personal extension coordination" })) return;
+      try {
+        const id = extensionId(request);
+        const input = z
+          .object({
+            lorebookId: z.string().min(1).max(128),
+            expectedContentHash: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+            expectedConfigRevision: z.number().int().nonnegative().safe(),
+            expectedFence: z.number().int().nonnegative().safe(),
+            expectedResourceRevision: z.literal(0),
+          })
+          .strict()
+          .parse(request.body);
+        return await service.retireDetachedLorebook(id, input);
+      } catch (error) {
+        return sendCoordinationError(error, request, reply);
+      }
+    },
+  );
 
   app.get<{ Params: { id: string } }>("/:id/coordination", async (request, reply) => {
     try {

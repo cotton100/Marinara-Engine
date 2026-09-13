@@ -293,6 +293,14 @@ export type PersonalExtensionActivationSnapshot = {
   registry: PersonalExtensionProtectedResourceRegistry;
 };
 
+export type PersonalExtensionDetachedLorebookRetirementInput = {
+  lorebookId: string;
+  expectedContentHash: string;
+  expectedConfigRevision: number;
+  expectedFence: number;
+  expectedResourceRevision: 0;
+};
+
 export type PersonalExtensionActivationBarrier = {
   extensionId: string;
   snapshot: PersonalExtensionActivationSnapshot;
@@ -1872,6 +1880,68 @@ export function createPersonalExtensionCoordinationKernel(
     );
   };
 
+  // Explicit administrator repair, not normal recovery: remove one obsolete
+  // registration only. The book, links, settings and journals are never written.
+  const retireDetachedLorebook = async (
+    extensionId: string,
+    input: PersonalExtensionDetachedLorebookRetirementInput,
+    validate: (
+      tx: DB,
+      row: PersonalExtensionCoordinationRow,
+      nextRegistry: PersonalExtensionProtectedResourceRegistry,
+    ) => Promise<void>,
+  ) => {
+    requireIdentifier(extensionId);
+    requireIdentifier(input.lorebookId);
+    requireIdentifier(input.expectedContentHash);
+    requireResourceRevision(input.expectedConfigRevision);
+    requireResourceRevision(input.expectedFence);
+    if (input.expectedResourceRevision !== 0 || typeof validate !== "function") throw kernelError("invalid-request");
+    return runStrictMutation(extensionId, async (tx) => {
+      const [row] = await tx
+        .select()
+        .from(personalExtensionCoordination)
+        .where(eq(personalExtensionCoordination.extensionId, extensionId));
+      if (!row || row.mode !== "blocked") throw kernelError("coordination-transition-blocked");
+      requireAuthorityClear(row);
+      if (row.contentHash !== input.expectedContentHash) throw kernelError("extension-runtime-changed");
+      if (row.configRevision !== input.expectedConfigRevision || row.fence !== input.expectedFence)
+        throw kernelError("resource-revision-conflict");
+      const registry = parsePersonalExtensionProtectedResourceRegistry(row.protectedLorebookRegistry);
+      if (registry.lorebooks[input.lorebookId]?.resourceRevision !== 0) throw kernelError("resource-revision-conflict");
+      const journals = await tx.select().from(personalExtensionOperationJournal);
+      if (
+        journals.some(
+          (journal) =>
+            journal.phase !== "final" &&
+            parsePersonalExtensionJournalResourceRevisions(journal.protectedResourceRevisions).some(
+              (resource) => resource.kind === "lorebook" && resource.resourceId === input.lorebookId,
+            ),
+        )
+      )
+        throw kernelError("coordination-validation-failed");
+      const nextRegistry = { ...registry, lorebooks: { ...registry.lorebooks } };
+      delete nextRegistry.lorebooks[input.lorebookId];
+      await validate(tx, row, nextRegistry);
+      const fence = nextFence(row.fence);
+      await tx
+        .update(personalExtensionCoordination)
+        .set({
+          protectedLorebookRegistry: serializePersonalExtensionProtectedResourceRegistry(nextRegistry),
+          fence,
+          updatedAt: new Date(checkedWallNow()).toISOString(),
+        })
+        .where(eq(personalExtensionCoordination.extensionId, extensionId));
+      return {
+        mode: "blocked" as const,
+        fence,
+        configRevision: row.configRevision,
+        retiredLorebookId: input.lorebookId,
+        memoriesPreserved: true as const,
+      };
+    });
+  };
+
   const recoverBlockedCoordination = async (
     extensionId: string,
     validate: (tx: DB, row: PersonalExtensionCoordinationRow) => Promise<PersonalExtensionAdminValidationResult>,
@@ -2887,6 +2957,7 @@ export function createPersonalExtensionCoordinationKernel(
     blockActivation,
     deactivateCoordination,
     recoverBlockedCoordination,
+    retireDetachedLorebook,
     recoverStaleTransitions,
     runExtensionLifecycleMutation,
     runExtensionLifecycleMutations,

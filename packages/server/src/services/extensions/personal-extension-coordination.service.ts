@@ -31,6 +31,7 @@ import {
   type PersonalExtensionOperationTransitionToVectorizeInput,
   type PersonalExtensionProtectedResourceRegistry,
   type PersonalExtensionProtectedResource,
+  type PersonalExtensionDetachedLorebookRetirementInput,
 } from "./personal-extension-coordination-kernel.service.js";
 import {
   createPersonalExtensionCoordinationAdminService,
@@ -249,6 +250,11 @@ export function createPersonalExtensionCoordinationService(
     },
     async recoverBlockedCoordination(extensionId: string) {
       const committed = await admin.recoverBlockedCoordination(extensionId);
+      publishAfterCommit(extensionId, { type: "lease-changed" });
+      return committed;
+    },
+    async retireDetachedLorebook(extensionId: string, input: PersonalExtensionDetachedLorebookRetirementInput) {
+      const committed = await admin.retireDetachedLorebook(extensionId, input);
       publishAfterCommit(extensionId, { type: "lease-changed" });
       return committed;
     },

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
@@ -191,5 +192,21 @@ try {
 } finally {
   await app.close();
   await closeDB();
-  rmSync(fixtureDir, { recursive: true, force: true });
+  try {
+    rmSync(fixtureDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch (error) {
+    if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+    // Some Windows native media handles are released only as this process exits.
+    // A detached, argument-only helper removes the fixture immediately afterwards.
+    const cleanup = spawn(
+      process.execPath,
+      [
+        "-e",
+        'const fs=require("node:fs");setTimeout(()=>fs.rmSync(process.argv[1],{recursive:true,force:true,maxRetries:20,retryDelay:100}),250)',
+        fixtureDir,
+      ],
+      { detached: true, stdio: "ignore", windowsHide: true },
+    );
+    cleanup.unref();
+  }
 }

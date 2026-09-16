@@ -19,12 +19,19 @@ assert.doesNotMatch(adminRoutes, /\bspawn\(/u, "The server must never fork its o
 assert.match(appFactory, /forceCloseConnections: false/u);
 assert.match(settingsPanel, /api\.post<\{ status: "restarting" \}>\("\/admin\/restart", \{ confirm: true \}\)/u);
 assert.match(settingsPanel, /controlId="restart-server"/u);
+assert.match(
+  settingsPanel,
+  /api\.get<\{ authorized: true \}>\("\/admin\/verify-secret", \{\s*headers: \{ "X-Admin-Secret": trimmed \},?\s*\}\)/u,
+  "the browser must verify a candidate key against an endpoint that never grants loopback exemption",
+);
 
 const dataDir = mkdtempSync(join(tmpdir(), "marinara-admin-restart-"));
 process.env.DATA_DIR = dataDir;
 process.env.FILE_STORAGE_DIR = join(dataDir, "storage");
 process.env.NODE_ENV = "test";
 process.env.MARINARA_LITE = "true";
+process.env.ADMIN_SECRET = "admin-verification-regression-secret";
+process.env.MARINARA_REQUIRE_ADMIN_SECRET_ON_LOOPBACK = "false";
 
 try {
   const { buildApp } = await import("../../packages/server/src/app.js");
@@ -46,6 +53,24 @@ try {
       return { status: "complete" };
     });
     await app.listen({ host: "127.0.0.1", port: 0 });
+
+    const wrongSecret = await app.inject({
+      method: "GET",
+      url: "/api/admin/verify-secret",
+      headers: { "x-admin-secret": "wrong-replacement-secret" },
+    });
+    assert.equal(
+      wrongSecret.statusCode,
+      403,
+      "candidate-key verification must reject a wrong key even when ordinary privileged routes exempt loopback",
+    );
+    const exactSecret = await app.inject({
+      method: "GET",
+      url: "/api/admin/verify-secret",
+      headers: { "x-admin-secret": "admin-verification-regression-secret" },
+    });
+    assert.equal(exactSecret.statusCode, 200);
+    assert.deepEqual(exactSecret.json(), { authorized: true });
 
     const unsupported = await app.inject({ method: "POST", url: "/api/admin/restart", payload: { confirm: true } });
     assert.equal(unsupported.statusCode, 409, "Unsupervised starts must not fork an orphan replacement");

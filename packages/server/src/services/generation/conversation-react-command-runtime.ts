@@ -1,5 +1,5 @@
 import {
-  normalizeTextForMatch,
+  normalizeSpeakerName,
   parseGroupedSpeakerSegments,
   stripLeadingMessageTimestamps,
   type ChatMode,
@@ -127,10 +127,10 @@ async function resolveReactionTarget(
 
   if (command.targetCharacter) {
     const chatMembers = await args.getReactChatMembers();
-    const wanted = normalizeTextForMatch(command.targetCharacter);
-    const targetChar = chatMembers.find((m) => normalizeTextForMatch(m.name) === wanted);
+    const wanted = normalizeSpeakerName(command.targetCharacter);
+    const targetChar = chatMembers.find((m) => normalizeSpeakerName(m.name) === wanted);
     if (!targetChar) {
-      const targetsPersona = wanted === normalizeTextForMatch(args.personaName) || wanted === "user";
+      const targetsPersona = wanted === normalizeSpeakerName(args.personaName) || wanted === "user";
       if (!targetsPersona) {
         logger.debug(
           '[react/conversation] Unknown react target "%s" - falling back to the user message',
@@ -155,7 +155,7 @@ async function resolveTargetedCharacterReaction(
   targetChar: ChatMember,
   wanted: string,
 ): Promise<{ id: string; target: SegmentTarget | null; prefetchedMessage: MessageRow | null } | null> {
-  const baseNames = new Set(chatMembers.map((m) => normalizeTextForMatch(m.name)));
+  const baseNames = new Set(chatMembers.map((m) => normalizeSpeakerName(m.name)));
   const authorNameCache = new Map<string, string | null>();
   const authorNameOf = async (cid: unknown): Promise<string | null> => {
     if (typeof cid !== "string" || !cid) return null;
@@ -188,13 +188,13 @@ async function resolveTargetedCharacterReaction(
     if (!text) return null;
     const names = new Set(baseNames);
     const author = await authorNameOf(authorId);
-    if (author) names.add(normalizeTextForMatch(author));
+    if (author) names.add(normalizeSpeakerName(author));
     const groups = parseGroupedSpeakerSegments(text, names, author);
     if (!groups) return null;
     let cutoff = groups.length;
     if (beforePartByNorm) {
       const reactorFirst = groups.findIndex(
-        (group) => group.speaker != null && normalizeTextForMatch(group.speaker) === beforePartByNorm,
+        (group) => group.speaker != null && normalizeSpeakerName(group.speaker) === beforePartByNorm,
       );
       if (reactorFirst >= 0) cutoff = reactorFirst;
     }
@@ -202,7 +202,7 @@ async function resolveTargetedCharacterReaction(
       const group = groups[gi]!;
       if (
         group.speaker != null &&
-        normalizeTextForMatch(group.speaker) === wanted &&
+        normalizeSpeakerName(group.speaker) === wanted &&
         group.lines.some((line) => line.trim().length > 0)
       ) {
         return { segment: gi, speaker: group.speaker };
@@ -218,7 +218,7 @@ async function resolveTargetedCharacterReaction(
       const part = await lastPartBy(
         ownMsg.content,
         ownMsg.characterId,
-        reactorName ? normalizeTextForMatch(reactorName) : null,
+        reactorName ? normalizeSpeakerName(reactorName) : null,
       );
       if (part) {
         return { id: args.sourceMessageId, target: part, prefetchedMessage: ownMsg };

@@ -97,6 +97,10 @@ import { rebuildMemoryChunks } from "../services/memory-recall.js";
 import { createAdvancedMemoryService } from "../services/advanced-memory.js";
 import { copyAdvancedMemoryRecords, remapAdvancedMemoryMetadata } from "../services/advanced-memory-transfer.js";
 import { forwardPromptPreview } from "./generate/prompt-preview.js";
+import {
+  getMemoryRecallSourceDirtyPublisher,
+  runMemoryRecallMutationWithDirtyHint,
+} from "../services/memory-recall-source-dirty.js";
 import { wrapContent } from "../services/prompt/format-engine.js";
 import { chatSummaryFingerprintMatches, fingerprintChatSummary } from "../services/prompt/chat-summary-fingerprint.js";
 import { newId } from "../utils/id-generator.js";
@@ -663,6 +667,7 @@ function resolveEntryStateOverrides(value: unknown): EntryStateOverrides | undef
 export async function chatsRoutes(app: FastifyInstance) {
   const storage = createChatsStorage(app.db);
   const appSettings = createAppSettingsStorage(app.db);
+  const memoryRecallSourceDirty = getMemoryRecallSourceDirtyPublisher(app.db);
 
   const cleanupEmptyRoleplayDmChats = async () => {
     const allChats = await storage.list();
@@ -1909,6 +1914,34 @@ export async function chatsRoutes(app: FastifyInstance) {
 
   // ── Messages ──
 
+  app.get<{ Querystring: { baseline?: string; after?: string; limit?: string } }>(
+    "/autonomous-notifications",
+    async (req, reply) => {
+      const { baseline, after, limit: rawLimit } = req.query;
+      const limit = rawLimit === undefined ? 100 : Number(rawLimit);
+      if (
+        (baseline !== undefined && baseline !== "true") ||
+        (baseline === "true" && after !== undefined) ||
+        (rawLimit !== undefined && (typeof rawLimit !== "string" || !/^[1-9]\d*$/u.test(rawLimit))) ||
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 250
+      ) {
+        return reply.status(400).send({ error: "Invalid autonomous notification query" });
+      }
+      if (
+        after !== undefined &&
+        (typeof after !== "string" ||
+          !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(after) ||
+          !Number.isFinite(Date.parse(after)) ||
+          new Date(after).toISOString() !== after)
+      ) {
+        return reply.status(400).send({ error: "Invalid autonomous notification cursor" });
+      }
+      return storage.listAutonomousNotifications({ after, limit, baseline: baseline === "true" });
+    },
+  );
+
   // List messages for a chat (supports pagination via ?limit=N&before=CURSOR)
   app.get<{ Params: { id: string }; Querystring: { limit?: string; before?: string } }>(
     "/:id/messages",
@@ -1930,6 +1963,21 @@ export async function chatsRoutes(app: FastifyInstance) {
       return storage.listMessages(req.params.id);
     },
   );
+
+  // Compact exact tail for consumers that do not need message metadata or swipe counts.
+  app.get<{ Params: { id: string }; Querystring: { limit?: string } }>("/:id/message-tail", async (req, reply) => {
+    const rawLimit = req.query.limit;
+    const limit = rawLimit === undefined || typeof rawLimit !== "string" ? 250 : Number(rawLimit);
+    if (
+      (rawLimit !== undefined && (typeof rawLimit !== "string" || !/^[1-9]\d*$/u.test(rawLimit))) ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 250
+    ) {
+      return reply.status(400).send({ error: "limit must be an integer between 1 and 250" });
+    }
+    return storage.listMessageTail(req.params.id, limit);
+  });
 
   // Total message count for a chat (lightweight, for absolute numbering)
   app.get<{ Params: { id: string } }>("/:id/message-count", async (req) => {
@@ -2085,18 +2133,20 @@ export async function chatsRoutes(app: FastifyInstance) {
         existingKeys.add(key);
       }
 
-      for (let i = 0; i < rowsToInsert.length; i += MEMORY_RECALL_IMPORT_BATCH_SIZE) {
-        await app.db.insert(memoryChunks).values(rowsToInsert.slice(i, i + MEMORY_RECALL_IMPORT_BATCH_SIZE));
-      }
-
-      if (replace && existingChunkIds.length > 0) {
-        for (let i = 0; i < existingChunkIds.length; i += MEMORY_RECALL_IMPORT_BATCH_SIZE) {
-          const ids = existingChunkIds.slice(i, i + MEMORY_RECALL_IMPORT_BATCH_SIZE).map((chunk) => chunk.id);
-          await app.db
-            .delete(memoryChunks)
-            .where(and(eq(memoryChunks.chatId, req.params.id), inArray(memoryChunks.id, ids)));
+      await runMemoryRecallMutationWithDirtyHint(memoryRecallSourceDirty, req.params.id, async () => {
+        for (let i = 0; i < rowsToInsert.length; i += MEMORY_RECALL_IMPORT_BATCH_SIZE) {
+          await app.db.insert(memoryChunks).values(rowsToInsert.slice(i, i + MEMORY_RECALL_IMPORT_BATCH_SIZE));
         }
-      }
+
+        if (replace && existingChunkIds.length > 0) {
+          for (let i = 0; i < existingChunkIds.length; i += MEMORY_RECALL_IMPORT_BATCH_SIZE) {
+            const ids = existingChunkIds.slice(i, i + MEMORY_RECALL_IMPORT_BATCH_SIZE).map((chunk) => chunk.id);
+            await app.db
+              .delete(memoryChunks)
+              .where(and(eq(memoryChunks.chatId, req.params.id), inArray(memoryChunks.id, ids)));
+          }
+        }
+      });
 
       const imported = rowsToInsert.length;
       logger.info(
@@ -2148,15 +2198,17 @@ export async function chatsRoutes(app: FastifyInstance) {
     });
     const chatMeta = parseExtra(chat.metadata) as Record<string, unknown>;
     const contextMessageLimit = chatMeta.contextMessageLimit;
-    const rebuilt = await rebuildMemoryChunks(
-      app.db,
-      req.params.id,
-      { userName, characterNames },
-      {
-        embeddingSource,
-        readBehindMessageCount:
-          typeof contextMessageLimit === "number" && contextMessageLimit > 0 ? contextMessageLimit : undefined,
-      },
+    const rebuilt = await runMemoryRecallMutationWithDirtyHint(memoryRecallSourceDirty, req.params.id, () =>
+      rebuildMemoryChunks(
+        app.db,
+        req.params.id,
+        { userName, characterNames },
+        {
+          embeddingSource,
+          readBehindMessageCount:
+            typeof contextMessageLimit === "number" && contextMessageLimit > 0 ? contextMessageLimit : undefined,
+        },
+      ),
     );
     return { rebuilt };
   });
@@ -2165,7 +2217,9 @@ export async function chatsRoutes(app: FastifyInstance) {
   app.delete<{ Params: { id: string } }>("/:id/memories", async (req, reply) => {
     const chat = await storage.getById(req.params.id);
     if (!chat) return reply.status(404).send({ error: "Chat not found" });
-    await app.db.delete(memoryChunks).where(eq(memoryChunks.chatId, req.params.id));
+    await runMemoryRecallMutationWithDirtyHint(memoryRecallSourceDirty, req.params.id, () =>
+      app.db.delete(memoryChunks).where(eq(memoryChunks.chatId, req.params.id)),
+    );
     return reply.status(204).send();
   });
 
@@ -2173,9 +2227,11 @@ export async function chatsRoutes(app: FastifyInstance) {
   app.delete<{ Params: { id: string; memoryId: string } }>("/:id/memories/:memoryId", async (req, reply) => {
     const chat = await storage.getById(req.params.id);
     if (!chat) return reply.status(404).send({ error: "Chat not found" });
-    await app.db
-      .delete(memoryChunks)
-      .where(and(eq(memoryChunks.chatId, req.params.id), eq(memoryChunks.id, req.params.memoryId)));
+    await runMemoryRecallMutationWithDirtyHint(memoryRecallSourceDirty, req.params.id, () =>
+      app.db
+        .delete(memoryChunks)
+        .where(and(eq(memoryChunks.chatId, req.params.id), eq(memoryChunks.id, req.params.memoryId))),
+    );
     return reply.status(204).send();
   });
 

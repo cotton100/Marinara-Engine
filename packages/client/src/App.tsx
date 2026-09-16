@@ -36,7 +36,9 @@ import {
 } from "./stores/ui.store";
 import { useSidecarStore } from "./stores/sidecar.store";
 import { useDialogStore } from "./stores/dialog.store";
+import { useChatStore } from "./stores/chat.store";
 import { api, requestTimeoutSignal } from "./lib/api-client";
+import { getHashlessAppUrl, parseAppDeepLinkHash } from "./lib/app-deep-link";
 import { forceRefreshSpa, reloadBrowser } from "./lib/browser-runtime";
 import { recordClientError } from "./lib/client-runtime-diagnostics";
 import { showAppUpdatePrompt } from "./lib/app-update-prompt";
@@ -525,6 +527,27 @@ export function App() {
   // closes the race where the prompter fires in the window before the notice
   // fetch resolves.
   const { data: migrationNotice, isPending: migrationNoticePending } = useStorageMigrationNotice();
+
+  useEffect(() => {
+    const openDeepLink = () => {
+      const deepLink = parseAppDeepLinkHash(window.location.hash);
+      if (!deepLink) return;
+
+      if (deepLink.type === "chat") {
+        useUIStore.getState().closeAllDetails();
+        useChatStore.getState().setActiveChatId(deepLink.chatId);
+      } else {
+        useChatStore.getState().setActiveChatId(null);
+        useUIStore.getState().openNoodle();
+      }
+
+      window.history.replaceState(window.history.state, "", getHashlessAppUrl(window.location));
+    };
+
+    openDeepLink();
+    window.addEventListener("hashchange", openDeepLink);
+    return () => window.removeEventListener("hashchange", openDeepLink);
+  }, []);
 
   useEffect(() => {
     setCustomNotificationSoundUrl(customNotificationSound?.url ?? null);

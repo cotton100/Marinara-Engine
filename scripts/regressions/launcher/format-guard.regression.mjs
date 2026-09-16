@@ -94,6 +94,12 @@ const heapSetupStart = termuxLauncherSource.indexOf("has_explicit_node_heap_limi
 const heapSetupEnd = termuxLauncherSource.indexOf("\nload_launcher_setting()", heapSetupStart);
 assert.ok(heapSetupStart >= 0 && heapSetupEnd >= 0, "the Termux heap helpers must be present");
 const heapHelpersSource = termuxLauncherSource.slice(heapSetupStart, heapSetupEnd);
+const bashAvailability = spawnSync("bash", ["-c", "exit 0"], {
+  cwd: repositoryRoot,
+  encoding: "utf8",
+});
+const bashUnavailableOnWindows = process.platform === "win32" && bashAvailability.error?.code === "ENOENT";
+if (bashAvailability.error && !bashUnavailableOnWindows) throw bashAvailability.error;
 const probeHeapHelpers = (script, nodeOptions = "") => {
   const probe = spawnSync("bash", ["-c", `${heapHelpersSource}\n${script}`], {
     cwd: repositoryRoot,
@@ -103,14 +109,18 @@ const probeHeapHelpers = (script, nodeOptions = "") => {
   assert.equal(probe.status, 0, probe.stderr);
   return probe.stdout;
 };
-probeHeapHelpers("has_explicit_node_heap_limit", "--max-old-space-size=512");
-probeHeapHelpers("! has_explicit_node_heap_limit", "--trace-warnings");
-assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 0 8388608"), "1024");
-assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 524288 8388608"), "1536");
-assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 1153434 8388608"), "2048");
-assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 1153434 4194304"), "1024");
-assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 1153434 3145728"), "1024");
-assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 1153434 0"), "1536");
+if (!bashUnavailableOnWindows) {
+  probeHeapHelpers("has_explicit_node_heap_limit", "--max-old-space-size=512");
+  probeHeapHelpers("! has_explicit_node_heap_limit", "--trace-warnings");
+  assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 0 8388608"), "1024");
+  assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 524288 8388608"), "1536");
+  assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 1153434 8388608"), "2048");
+  assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 1153434 4194304"), "1024");
+  assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 1153434 3145728"), "1024");
+  assert.equal(probeHeapHelpers("resolve_default_node_heap_mb 1153434 0"), "1536");
+} else {
+  console.info("Skipping Termux heap-helper execution proof because bash is unavailable on Windows.");
+}
 const wakeLockTrapIndex = termuxLauncherSource.search(/^[ \t]*trap release_termux_wake_lock EXIT[ \t]*$/mu);
 const wakeLockAcquireIndex = termuxLauncherSource.search(/^[ \t]*if[ \t]+termux-wake-lock\b[^\n]*;[ \t]*then[ \t]*$/mu);
 const serverStartIndex = termuxLauncherSource.lastIndexOf("node ../../scripts/run-server.mjs dist/index.js");
@@ -506,6 +516,57 @@ function shardedStorageFixture() {
     assert.ok(
       readdirSync(join(dir, "tables")).some((name) => name.startsWith("memory_chunks.post-unshard-")),
       "the chunk shard files are kept as .post-unshard-<timestamp>",
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Custom coordination tables use non-`id` primary keys. Prove the launcher
+// rollback path preserves them instead of deduplicating every row as keyless.
+{
+  const dir = shardedStorageFixture();
+  const tablesDir = join(dir, "tables");
+  const coordinationDir = join(tablesDir, "personal_extension_coordination");
+  const journalDir = join(tablesDir, "personal_extension_operation_journal");
+  mkdirSync(coordinationDir, { recursive: true });
+  mkdirSync(journalDir, { recursive: true });
+  writeFileSync(
+    join(coordinationDir, "coordination-a.json"),
+    JSON.stringify([
+      { extensionId: "extension-a", mode: "inactive", createdAt: "2026-08-26T00:00:00.000Z" },
+      { extensionId: "extension-b", mode: "inactive", createdAt: "2026-08-26T00:00:01.000Z" },
+    ]),
+  );
+  writeFileSync(
+    join(journalDir, "journal-a.json"),
+    JSON.stringify([
+      { operationDigest: "digest-a", extensionId: "extension-a", createdAt: "2026-08-26T00:00:02.000Z" },
+      { operationDigest: "digest-b", extensionId: "extension-b", createdAt: "2026-08-26T00:00:03.000Z" },
+    ]),
+  );
+  try {
+    await unshardLauncherStorage({ env: { FILE_STORAGE_DIR: dir }, probeServer: false });
+    const coordination = JSON.parse(readFileSync(join(tablesDir, "personal_extension_coordination.json"), "utf8"));
+    const journal = JSON.parse(readFileSync(join(tablesDir, "personal_extension_operation_journal.json"), "utf8"));
+    assert.deepEqual(
+      coordination.map((entry) => entry.extensionId),
+      ["extension-a", "extension-b"],
+      "coordination rows survive unshard using extensionId as their primary key",
+    );
+    assert.deepEqual(
+      journal.map((entry) => entry.operationDigest),
+      ["digest-a", "digest-b"],
+      "operation journals survive unshard using operationDigest as their primary key",
+    );
+    const tableEntries = readdirSync(tablesDir);
+    assert.ok(
+      tableEntries.some((name) => name.startsWith("personal_extension_coordination.post-unshard-")),
+      "coordination shards are retained as post-unshard rollback evidence",
+    );
+    assert.ok(
+      tableEntries.some((name) => name.startsWith("personal_extension_operation_journal.post-unshard-")),
+      "journal shards are retained as post-unshard rollback evidence",
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

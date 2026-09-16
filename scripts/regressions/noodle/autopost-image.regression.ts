@@ -34,7 +34,10 @@ assert.equal(noodleGeneratedNoodlerPostSchema.parse({ title: "x", content: "y" }
 
 // NoodleR media is only reachable through the access-checked endpoint namespace.
 assert.equal(noodlerPostMediaUrl("post123"), "/api/noodle/noodler/posts/post123/media");
-assert.equal(readNoodlerMediaPath({ metadata: { noodlerMediaPath: "noodler-media/acc/img.png" } }), "noodler-media/acc/img.png");
+assert.equal(
+  readNoodlerMediaPath({ metadata: { noodlerMediaPath: "noodler-media/acc/img.png" } }),
+  "noodler-media/acc/img.png",
+);
 assert.equal(readNoodlerMediaPath({ metadata: { noodlerMediaPath: "some/other/img.png" } }), null);
 assert.equal(readNoodlerMediaPath({ metadata: {} }), null);
 // Traversal and non-namespaced paths never resolve to an on-disk file.

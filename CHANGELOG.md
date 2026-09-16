@@ -514,6 +514,24 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 - Avatar generation now preserves the complete user Avatar Prompt, and OpenRouter caching remains enabled for eligible unknown models (#5552, #5574).
 - Permanent Delete now preserves Marinara's stock Universal Preset and its prompt structure while removing editable presets (#5568).
 
+### Custom build additions
+
+- One-to-one and group Conversation chats can opt autonomous messages into a bounded, read-only CMB shared-tail context without running a full sync or vectorization; group prompts exclude the current room and every private DM, and merged-group check-ins stay pinned to the selected speaker whenever a CMB block is actually injected (otherwise existing merged-group behavior is unchanged).
+
+### Custom build fixes
+
+- CMB administrators can explicitly retire one verified, unreferenced legacy lorebook registration while coordination is blocked, preserving the old book, memories and chat links. Exact state checks and normal recovery validation still apply; ordinary recovery never silently drops registrations.
+- CMB administrator recovery can now requeue a precisely verified interrupted vectorization for guarded revalidation instead of becoming stuck inactive with a ready-state ambiguity marker. Recovery preserves memories, the ambiguity marker and historical sync times; normal synchronization must verify completion before clearing the marker.
+- External notification companions can now consume a paged, metadata-only feed of saved autonomous Conversation replies even while the chat is selected or its unread badge has been cleared. Moving an autonomous reply with a cross-post command retains notification eligibility in the target chat. Only new visible autonomous messages are marked; old history, manual replies, imports, regenerations and command-only anchors do not produce new events.
+- CMB-scoped group check-ins now discard other speakers' output before commands and history are saved, validate text rewrites, and show the reply only after speaker validation. All doubled opening braces (including code/templates) and internal macro markers are made literal in these replies to prevent direct macro expansion; ordinary replies and authored card macros are unchanged. Later prompt regex transformations can still reconstruct macro syntax.
+- Encoded Conversation speaker tags now normalize typographic quotes consistently before server and display parsing, preventing a discarded speaker from reappearing after display quote formatting.
+- Conversation speaker names and display aliases now share quote-insensitive comparison across filtering, grouped/bubble card lookup, command ownership and reactions. Names and body text are not rewritten; encoded speaker tags also accept apostrophes inside double-quoted names.
+- CMB regression checks now cover the final single-speaker call and roster-check ordering, including Windows line endings.
+- Privileged local companions can now poll an active Noodle timeline without triggering profile reconciliation or schedule writes; the read-only projection returns only a bounded reply set and fails closed instead of truncating an oversized timeline.
+- Personal Extension sync checks can now use compact chat-tail and lorebook-entry projection reads, avoiding unused message metadata and raw embedding vectors in read-only payloads.
+- Personal Extension coordination can now request a strict lorebook-entry projection that replaces raw embedding arrays with `missing`, `ready`, or `invalid`, reducing sync payloads while leaving the existing entry contract unchanged.
+- Mobile Admin Access now verifies a replacement key before saving it, preserves the last working key when verification fails, and restores Personal Extension access without allowing delayed requests to overwrite the recovered state.
+
 ## [2.4.4]
 
 ### Added

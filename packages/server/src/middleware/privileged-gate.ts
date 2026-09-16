@@ -74,3 +74,24 @@ export function requirePrivilegedAccess(
 
   return true;
 }
+
+/**
+ * Coordination activation and recovery are never exempt from the exact admin
+ * secret, even when the surrounding host, Basic Auth, or network policy has
+ * already accepted a request. Keep the normal privileged gate first so this
+ * helper adds to, rather than replaces, the existing request protections.
+ */
+export function requireCoordinationAdminAccess(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  options: { loopbackOnly?: boolean; trustedNetwork?: boolean; feature?: string } = {},
+): boolean {
+  if (!requirePrivilegedAccess(request, reply, options)) return false;
+
+  if (!isAdminAuthorized(request)) {
+    reply.status(403).send({ error: "Coordination admin authorization required" });
+    return false;
+  }
+
+  return true;
+}

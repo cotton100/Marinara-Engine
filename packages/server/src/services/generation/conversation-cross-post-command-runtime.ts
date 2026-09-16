@@ -11,8 +11,12 @@ type ChatRow = {
 
 type ChatsStore = {
   list(): Promise<ChatRow[]>;
-  getMessage(id: string): Promise<{ content?: unknown } | null>;
-  createMessage(input: { chatId: string; role: string; characterId: string | null; content: string }): Promise<unknown>;
+  getMessage(id: string): Promise<{ content?: unknown; autonomousNotificationAt?: string | null } | null>;
+  createMessage(
+    input: { chatId: string; role: string; characterId: string | null; content: string },
+    timestampOverrides?: undefined,
+    options?: { autonomousNotification?: boolean },
+  ): Promise<unknown>;
   removeMessage(id: string): Promise<unknown>;
 };
 
@@ -44,12 +48,16 @@ export async function handleConversationCrossPostCommand(args: {
 
   const msgRow = args.messageId ? await args.chats.getMessage(args.messageId) : null;
   const msgContent = typeof msgRow?.content === "string" ? msgRow.content : args.fullResponse;
-  await args.chats.createMessage({
-    chatId: targetChat.id,
-    role: "assistant",
-    characterId: args.characterId,
-    content: msgContent,
-  });
+  await args.chats.createMessage(
+    {
+      chatId: targetChat.id,
+      role: "assistant",
+      characterId: args.characterId,
+      content: msgContent,
+    },
+    undefined,
+    { autonomousNotification: msgRow?.autonomousNotificationAt != null },
+  );
 
   if (args.messageId) {
     await args.chats.removeMessage(args.messageId);

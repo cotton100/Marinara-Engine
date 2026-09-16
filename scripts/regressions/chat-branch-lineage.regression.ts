@@ -6,10 +6,12 @@ import { join } from "node:path";
 
 const dataDir = mkdtempSync(join(tmpdir(), "marinara-chat-branch-lineage-"));
 const fileStorageDir = join(dataDir, "storage");
+const ADMIN_SECRET = "chat-branch-lineage-regression-secret";
 process.env.DATA_DIR = dataDir;
 process.env.FILE_STORAGE_DIR = fileStorageDir;
 process.env.NODE_ENV = "test";
 process.env.MARINARA_LITE = "true";
+process.env.ADMIN_SECRET = ADMIN_SECRET;
 
 let app: { close(): Promise<void>; inject(options: Record<string, unknown>): Promise<any> } | null = null;
 
@@ -838,7 +840,12 @@ try {
   const backedUpCorrection = backedUpRecords.find((record: { id: string }) => record.id === retainedCorrection!.id);
   assert.ok(backedUpCorrection);
   await db.delete(advancedMemoryRecords).where(eq(advancedMemoryRecords.id, retainedCorrection!.id));
-  const profileImport = await app.inject({ method: "POST", url: "/api/backup/import-profile", payload: profile });
+  const profileImport = await app.inject({
+    method: "POST",
+    url: "/api/backup/import-profile",
+    headers: { "x-admin-secret": ADMIN_SECRET },
+    payload: profile,
+  });
   assert.equal(profileImport.statusCode, 200, profileImport.body);
   const restoredCorrection = (
     await db.select().from(advancedMemoryRecords).where(eq(advancedMemoryRecords.id, retainedCorrection!.id))

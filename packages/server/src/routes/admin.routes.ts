@@ -8,7 +8,7 @@ import { join } from "path";
 import { MARINARA_UNIVERSAL_PRESET_SYSTEM_KEY, PROFESSOR_MARI_ID, TTS_SETTINGS_KEY } from "@marinara-engine/shared";
 import { DATA_DIR } from "../utils/data-dir.js";
 import * as schema from "../db/schema/index.js";
-import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
+import { isAdminAuthorized, requirePrivilegedAccess } from "../middleware/privileged-gate.js";
 import { ADMIN_RESTART_RATE_LIMIT, AVATAR_STORAGE_RATE_LIMIT } from "../middleware/rate-limit.js";
 import { logger } from "../lib/logger.js";
 import { isDockerRuntime } from "../config/runtime-config.js";
@@ -66,6 +66,17 @@ function isValidScope(scope: unknown): scope is ExpungeScope {
 
 export async function adminRoutes(app: FastifyInstance) {
   let restartScheduled = false;
+
+  // Candidate-key verification must never inherit the ordinary loopback
+  // exemption: Settings uses this result to replace the browser's last known
+  // key, and coordination/import routes always require the exact secret.
+  app.get("/verify-secret", async (req, reply) => {
+    if (!requirePrivilegedAccess(req, reply, { feature: "Admin secret verification" })) return;
+    if (!isAdminAuthorized(req)) {
+      return reply.status(403).send({ error: "Invalid or missing X-Admin-Secret header" });
+    }
+    return { authorized: true as const };
+  });
 
   app.post<{ Body: { confirm?: boolean } }>(
     "/restart",

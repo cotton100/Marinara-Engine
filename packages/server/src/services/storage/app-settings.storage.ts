@@ -14,13 +14,18 @@ export function createAppSettingsStorage(db: DB) {
     },
 
     async set(key: string, value: string): Promise<void> {
-      const timestamp = now();
-      const existing = await db.select().from(appSettings).where(eq(appSettings.key, key));
-      if (existing.length > 0) {
-        await db.update(appSettings).set({ value, updatedAt: timestamp }).where(eq(appSettings.key, key));
-      } else {
-        await db.insert(appSettings).values({ key, value, updatedAt: timestamp });
-      }
+      // The existence check and mutation are one logical write. Reserving the
+      // transaction lane here prevents an exclusive profile restore from
+      // deleting the row between SELECT and UPDATE.
+      await db.transaction(async (tx) => {
+        const timestamp = now();
+        const existing = await tx.select().from(appSettings).where(eq(appSettings.key, key));
+        if (existing.length > 0) {
+          await tx.update(appSettings).set({ value, updatedAt: timestamp }).where(eq(appSettings.key, key));
+        } else {
+          await tx.insert(appSettings).values({ key, value, updatedAt: timestamp });
+        }
+      });
     },
 
     async remove(key: string): Promise<void> {

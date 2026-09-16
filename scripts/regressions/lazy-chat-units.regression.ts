@@ -784,6 +784,56 @@ const loadedUnitsOf = (db: Awaited<ReturnType<typeof createFileNativeDB>>) => db
   }
 }
 
+// ── A shard awaiting a strict durability barrier is never evicted ──
+// A successful best-effort flush consumes dirtyShards but intentionally keeps
+// the shard key in strictPendingShards until flushStrict() rewrites and fsyncs
+// it. Ordinary autosave must still be free to evict the unit; the later strict
+// barrier therefore has to reload pending units before it captures its batch.
+
+{
+  const dir = tempStorageDir();
+  process.env.MARINARA_MAX_RESIDENT_CHATS = "2";
+  for (const chat of ["chat-a", "chat-b", "chat-c"]) {
+    writeShard(dir, "chats", chat, [chatRow(chat)]);
+    writeShard(dir, "messages", chat, [messageRow(`m-${chat}`, chat, chat)]);
+  }
+  const chatAShardWrite = `messages/${encodeShardKey("chat-a")}`;
+  let chatAWrites = 0;
+  let rejectChatAStrictWrite = false;
+  const expectedStrictFailure = new Error("simulated strict write failure after pending-unit reload");
+  const db = await createFileNativeDB({
+    beforeTableWrite: (name) => {
+      if (name !== chatAShardWrite) return;
+      chatAWrites++;
+      if (rejectChatAStrictWrite) throw expectedStrictFailure;
+    },
+    fileOperations: { flushDirectory: async () => {} },
+  });
+  try {
+    await db.update(messages).set({ content: "edited before strict barrier" }).where(eq(messages.chatId, "chat-a"));
+    await db.select().from(messages).where(eq(messages.chatId, "chat-b"));
+    await db.select().from(messages).where(eq(messages.chatId, "chat-c"));
+    await db._fileStore.flush();
+    assert.equal(chatAWrites, 1, "the best-effort flush writes the edited shard once");
+    assert.equal(
+      loadedUnitsOf(db).has("chat-a"),
+      false,
+      "ordinary best-effort autosave may still evict a shard that has not needed a strict barrier yet",
+    );
+
+    rejectChatAStrictWrite = true;
+    await assert.rejects(db._fileStore.flushStrict(), (error) => error === expectedStrictFailure);
+    rejectChatAStrictWrite = false;
+    await db._fileStore.flushStrict();
+    assert.equal(chatAWrites, 3, "a failed strict rewrite keeps the reloaded shard pending for a successful retry");
+  } finally {
+    rejectChatAStrictWrite = false;
+    delete process.env.MARINARA_MAX_RESIDENT_CHATS;
+    await db._fileStore.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ── In-session edits survive the evict/reload round trip ──
 
 {

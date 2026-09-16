@@ -7,7 +7,7 @@
 // emoji + segment); entries without a segment target the whole message.
 // Conversation mode only.
 // ──────────────────────────────────────────────
-import { normalizeTextForMatch, type MessageReaction } from "@marinara-engine/shared";
+import { normalizeSpeakerName, type MessageReaction } from "@marinara-engine/shared";
 
 /** Reactor id for the human (characters react with their character id instead). */
 export const USER_REACTOR = "user";
@@ -35,7 +35,7 @@ export function reactionTargetOf(reaction: MessageReaction): ReactionSegmentTarg
 /** Case/format-insensitive speaker comparison (both null = match, e.g. narration). */
 function sameSpeaker(a: string | null | undefined, b: string | null | undefined): boolean {
   if (a == null || b == null) return a == null && b == null;
-  return normalizeTextForMatch(a) === normalizeTextForMatch(b);
+  return normalizeSpeakerName(a) === normalizeSpeakerName(b);
 }
 
 /** Whether a reaction entry is the one identified by (emoji, segment target). */

@@ -6,7 +6,7 @@ import type {
   PersonalExtensionPolicy,
   UpdatePersonalExtensionInput,
 } from "@marinara-engine/shared";
-import { api } from "../lib/api-client";
+import { ApiError, api } from "../lib/api-client";
 
 export const personalExtensionKeys = {
   all: ["personal-extensions"] as const,
@@ -18,7 +18,7 @@ export const personalExtensionKeys = {
 export function usePersonalExtensions() {
   return useQuery({
     queryKey: personalExtensionKeys.list(),
-    queryFn: () => api.get<PersonalExtension[]>("/personal-extensions"),
+    queryFn: ({ signal }) => api.get<PersonalExtension[]>("/personal-extensions", { signal }),
     staleTime: 30_000,
   });
 }
@@ -26,15 +26,25 @@ export function usePersonalExtensions() {
 export function usePersonalExtensionRuntime() {
   return useQuery({
     queryKey: personalExtensionKeys.runtime(),
-    queryFn: () => api.get<PersonalClientExtensionRuntime[]>("/personal-extensions/runtime/client"),
+    queryFn: ({ signal }) =>
+      api.get<PersonalClientExtensionRuntime[]>("/personal-extensions/runtime/client", { signal }),
     staleTime: 30_000,
+    // Mobile can foreground before its VPN route is ready. Retry transient
+    // startup failures for a bounded window, but never turn a bad key or
+    // another client error into permanent background traffic.
+    retry: (failureCount, error) =>
+      !(error instanceof ApiError && error.status >= 400 && error.status < 500) && failureCount < 4,
+    retryDelay: (attempt) => Math.min(1_000 * 2 ** attempt, 5_000),
+    refetchOnMount: "always",
+    refetchOnReconnect: "always",
+    refetchOnWindowFocus: "always",
   });
 }
 
 export function usePersonalExtensionPolicy() {
   return useQuery({
     queryKey: personalExtensionKeys.policy(),
-    queryFn: () => api.get<PersonalExtensionPolicy>("/personal-extensions/policy"),
+    queryFn: ({ signal }) => api.get<PersonalExtensionPolicy>("/personal-extensions/policy", { signal }),
     staleTime: 30_000,
   });
 }

@@ -258,6 +258,7 @@ import { buildIntentCooldownPatch, isMessageIntent } from "../services/conversat
 import { buildImpersonateInstruction } from "../services/conversation/impersonate-prompt.js";
 import {
   isRepeatedConversationResponse,
+  retainConversationSpeaker,
   stripConversationPromptTimestamps,
   stripConversationResponseEnvelope,
 } from "../services/conversation/transcript-sanitize.js";
@@ -271,6 +272,11 @@ import { gameStateSnapshots as gameStateSnapshotsTable } from "../db/schema/inde
 import { and, eq } from "../db/file-query.js";
 import { PROFESSOR_MARI_ID, type GenerationParameterSendMap } from "@marinara-engine/shared";
 import { chunkAndEmbedMessages } from "../services/memory-recall.js";
+import {
+  getMemoryRecallSourceDirtyPublisher,
+  runMemoryRecallMutationWithDirtyHint,
+} from "../services/memory-recall-source-dirty.js";
+import { runWithDetachedProfileAssetMutation } from "../services/import/profile-asset-mutation-gate.js";
 import {
   isMemoryRecallVectorizerAvailable,
   resolveMemoryRecallEmbeddingSource,
@@ -646,6 +652,7 @@ import { injectCommittedTrackerContext } from "../services/generation/committed-
 import { loadPriorBeholderState } from "../services/agents/beholder-state.js";
 import { injectGameGmPromptRuntime } from "../services/generation/game-gm-prompt-runtime.js";
 import { mergeConversationCharacterMemories } from "../services/generation/conversation-memory-context.js";
+import { buildAutonomousCmbPendingContext } from "../services/conversation/autonomous-cmb-context.service.js";
 import { injectMemoryRecallContext } from "../services/generation/memory-recall-context.js";
 import { shouldSkipAgentByMessageInterval } from "../services/generation/agent-cadence.js";
 import {
@@ -874,6 +881,7 @@ function replaceConversationContextMacro(
 export async function generateRoutes(app: FastifyInstance) {
   registerSequentialGameTasks(app, ["/", "/retry-agents"]);
   const isDebug = logger.isLevelEnabled("debug");
+  const memoryRecallSourceDirty = getMemoryRecallSourceDirtyPublisher(app.db);
 
   const chats = createChatsStorage(app.db);
   const advancedMemory = createAdvancedMemoryService(app.db);
@@ -1140,7 +1148,7 @@ export async function generateRoutes(app: FastifyInstance) {
             gameStateSnapshotId: spatialGameStateSnapshotId,
             attachments: input.attachments,
           });
-          userMsg = committed.message;
+          userMsg = { ...committed.message, autonomousNotificationAt: null };
           committedSpatialTransition = {
             commandId: input.pendingSpatialTransition.commandId,
             currentLocationId: committed.snapshot.currentLocationId,
@@ -1876,6 +1884,10 @@ export async function generateRoutes(app: FastifyInstance) {
         mode: chatMode,
         allowEmpty: true,
       });
+      const autonomousCmbTargetCharacterId =
+        typeof input.forCharacterId === "string" && characterIds.includes(input.forCharacterId)
+          ? input.forCharacterId
+          : null;
       const isHomeProfessorMariAssistantChat =
         chatMeta.internalAssistant === PROFESSOR_MARI_INTERNAL_CHAT_MARKER && characterIds.includes(PROFESSOR_MARI_ID);
 
@@ -1982,6 +1994,33 @@ export async function generateRoutes(app: FastifyInstance) {
         presetDefaultChoices: resolvedPresetDefaultChoices,
         chatPresetChoices: (chatMeta.presetChoices ?? {}) as Record<string, string | string[]>,
       });
+      const autonomousCmbRequestTargetCharacterId =
+        chatMode === "conversation" &&
+        input.autonomous === true &&
+        input.impersonate !== true &&
+        !input.regenerateMessageId &&
+        !input.continueMessageId &&
+        input.turnGameBots !== true &&
+        chatMeta.autonomousCmbContextRefreshEnabled === true &&
+        autonomousCmbTargetCharacterId
+          ? autonomousCmbTargetCharacterId
+          : null;
+      const autonomousCmbPendingContextPromise = autonomousCmbRequestTargetCharacterId
+        ? buildAutonomousCmbPendingContext({
+            db: app.db,
+            targetChatId: input.chatId,
+            targetCharacterId: autonomousCmbRequestTargetCharacterId,
+            timeZone: promptTimeZone,
+            wrapFormat: resolvedPreset ? normalizePromptWrapFormat(resolvedPreset.wrapFormat) : "xml",
+          }).catch((error) => {
+            logger.warn(
+              error,
+              "[autonomous-cmb] Could not prepare pending shared context for chat %s; continuing without it",
+              input.chatId,
+            );
+            return null;
+          })
+        : Promise.resolve(null);
 
       const eligibleCharacterActivityConfigs: typeof characterActivityAgentConfigs = [];
       if (
@@ -4166,21 +4205,52 @@ export async function generateRoutes(app: FastifyInstance) {
           });
         }
 
+        // A pre-generation activity agent may have removed the scheduled
+        // speaker after the read began. Discard that speaker-scoped block
+        // rather than exposing it to whichever character remains active.
+        const autonomousCmbPendingContextBlock =
+          autonomousCmbRequestTargetCharacterId !== null && characterIds.includes(autonomousCmbRequestTargetCharacterId)
+            ? await autonomousCmbPendingContextPromise
+            : null;
+        const autonomousCmbSingleSpeaker =
+          autonomousCmbRequestTargetCharacterId !== null && autonomousCmbPendingContextBlock !== null;
+        const holdForCmbSpeakerValidation = autonomousCmbSingleSpeaker && allCharacterIds.length > 1;
+        const cmbResponseSpeakers = holdForCmbSpeakerValidation
+          ? [
+              ...charInfo,
+              ...(await loadCharacterPromptInfo({
+                chars,
+                characterIds: allCharacterIds.filter((id) => !characterIds.includes(id)),
+                chatMode,
+              })),
+            ]
+          : [];
+
         if (chatMode === "conversation" && !conversationScopesAwarenessToResponder) {
           convoAwarenessBlock = await mergeConversationCharacterMemories({
             chars,
-            characterIds,
+            characterIds:
+              autonomousCmbSingleSpeaker && autonomousCmbRequestTargetCharacterId
+                ? [autonomousCmbRequestTargetCharacterId]
+                : characterIds,
             awarenessBlock: convoAwarenessBlock,
             timeZone: promptTimeZone,
             wrapFormat,
           });
         }
 
-        // ── Inject cross-chat awareness (after persona info so it appears right before chat history) ──
-        if (convoAwarenessBlock) {
+        // ── Inject cross-chat awareness and opt-in CMB pending context after persona info. ──
+        const conversationAwarenessBlocks = [convoAwarenessBlock, autonomousCmbPendingContextBlock].filter(
+          (block): block is string => typeof block === "string" && block.length > 0,
+        );
+        if (conversationAwarenessBlocks.length > 0) {
           const firstUserIdx = finalMessages.findIndex((m) => m.role === "user" || m.role === "assistant");
           const insertAt = firstUserIdx >= 0 ? firstUserIdx : finalMessages.length;
-          finalMessages.splice(insertAt, 0, { role: "system", content: convoAwarenessBlock });
+          finalMessages.splice(
+            insertAt,
+            0,
+            ...conversationAwarenessBlocks.map((content) => ({ role: "system" as const, content })),
+          );
         }
 
         // ── Memory recall: semantic retrieval of relevant past conversation fragments ──
@@ -6104,6 +6174,10 @@ export async function generateRoutes(app: FastifyInstance) {
           }
         };
         const sendTokenTextChunked = async (text: string) => {
+          if (holdForCmbSpeakerValidation) {
+            recordReasoningDuration(text);
+            return;
+          }
           const commandFiltered = roleplayCommandStreamFilter?.push(text) ?? text;
           const chanceFiltered = gameChanceStreamFilter?.push(commandFiltered) ?? commandFiltered;
           const visibleText = spatialDirectiveStreamFilter?.push(chanceFiltered) ?? chanceFiltered;
@@ -6366,7 +6440,9 @@ export async function generateRoutes(app: FastifyInstance) {
           isGroupChat && usesIndividualGroupGeneration && !input.regenerateMessageId && !input.impersonate;
         const regenGroupChatIndividual = isGroupChat && usesIndividualGroupGeneration && input.regenerateMessageId;
         const explicitlyMentionedConversationCharacterIds =
-          chatMode === "conversation" && isGroupChat && !input.impersonate ? getExplicitlyMentionedCharacterIds() : [];
+          chatMode === "conversation" && isGroupChat && !input.impersonate && !autonomousCmbSingleSpeaker
+            ? getExplicitlyMentionedCharacterIds()
+            : [];
         const mentionedConversationCharacters = charInfo.filter((character) =>
           explicitlyMentionedConversationCharacterIds.includes(character.id),
         );
@@ -6721,7 +6797,9 @@ export async function generateRoutes(app: FastifyInstance) {
           );
           if (chatMode === "conversation" && conversationIsGroup && !input.impersonate) {
             const turnCharacterName =
-              usesIndividualGroupGeneration && groupTurnPromptEnabled && speaksOnlyTargetCharacter && targetCharId
+              speaksOnlyTargetCharacter &&
+              targetCharId &&
+              (usesIndividualGroupGeneration ? groupTurnPromptEnabled : autonomousCmbSingleSpeaker)
                 ? (charInfo.find((character) => character.id === targetCharId)?.name ?? null)
                 : null;
             if (!usesIndividualGroupGeneration || turnCharacterName) {
@@ -7786,6 +7864,16 @@ export async function generateRoutes(app: FastifyInstance) {
               contentReplaced = true;
             }
           }
+          // Validate before commands: persistence and command history must share
+          // the same accepted speaker, including members deactivated by an agent.
+          if (holdForCmbSpeakerValidation) {
+            fullResponse = retainConversationSpeaker(fullResponse, targetCharId, cmbResponseSpeakers);
+            contentReplaced = true;
+            if (!fullResponse.trim()) {
+              sendSseEvent(reply, { type: "content_replace", data: "" });
+              return null;
+            }
+          }
           if (conversationCommandsEnabled && !input.impersonate) {
             const responseBeforeCommandParsing = fullResponse;
             // Merged group conversations carry multiple characters' turns in one
@@ -8004,6 +8092,10 @@ export async function generateRoutes(app: FastifyInstance) {
               speakerNames: charInfo.map((character) => character.name),
               preserveSpeakerPrefix: isGroupChat && !usesIndividualGroupGeneration,
             });
+            if (holdForCmbSpeakerValidation) {
+              // Command removal can expose a new line-leading speaker label.
+              fullResponse = retainConversationSpeaker(fullResponse, targetCharId, cmbResponseSpeakers);
+            }
             if (fullResponse !== beforeStrip) {
               contentReplaced = true;
             }
@@ -8552,12 +8644,16 @@ export async function generateRoutes(app: FastifyInstance) {
               }
             }
           } else {
-            savedMsg = await chats.createMessage({
-              chatId: input.chatId,
-              role: input.impersonate ? "user" : "assistant",
-              characterId: input.impersonate ? null : targetCharId,
-              content: fullResponse,
-            });
+            savedMsg = await chats.createMessage(
+              {
+                chatId: input.chatId,
+                role: input.impersonate ? "user" : "assistant",
+                characterId: input.impersonate ? null : targetCharId,
+                content: fullResponse,
+              },
+              undefined,
+              { autonomousNotification: shouldAccountAutonomousGeneration && !input.continueMessageId },
+            );
             savedSwipeIndex = 0;
           }
           // Empty messageId on the paths that save no message; that costs the claim, never the effect.
@@ -9160,9 +9256,14 @@ export async function generateRoutes(app: FastifyInstance) {
           }
 
           // A merged group generation may voice several characters unless a regen
-          // target or a single explicit @mention pins it to exactly one speaker.
+          // target, a single explicit @mention, or an autonomous CMB request pins
+          // it to exactly one speaker. The latter is a privacy boundary: CMB
+          // visibility is evaluated for that selected character only.
           const mergedSpeaksOnlyTarget =
-            !isGroupChat || Boolean(regenGroupChatIndividual) || mentionedConversationCharacters.length === 1;
+            !isGroupChat ||
+            Boolean(regenGroupChatIndividual) ||
+            mentionedConversationCharacters.length === 1 ||
+            autonomousCmbSingleSpeaker;
           const genResult = await generateForCharacter(targetCharId, sentMessages, true, mergedSpeaksOnlyTarget);
           if (genResult) {
             firstSavedMsg ??= genResult.savedMsg;
@@ -9173,9 +9274,12 @@ export async function generateRoutes(app: FastifyInstance) {
             for (let cmdIndex = 0; cmdIndex < genResult.commands.length; cmdIndex++) {
               collectedCommands.push({
                 command: genResult.commands[cmdIndex]!,
-                // Merged group responses attribute each command to its speaker; fall
-                // back to the generation's character when no attribution is available.
-                characterId: genResult.commandCharacterIds?.[cmdIndex] ?? genResult.characterId,
+                // A single-speaker generation owns every command even if the model
+                // emits a conflicting speaker prefix. Multi-speaker merged output
+                // keeps its per-command attribution.
+                characterId: mergedSpeaksOnlyTarget
+                  ? genResult.characterId
+                  : (genResult.commandCharacterIds?.[cmdIndex] ?? genResult.characterId),
                 messageId: genResult.savedMsg?.id ?? "",
                 swipeIndex: genResult.savedSwipeIndex ?? genResult.savedMsg?.activeSwipeIndex ?? 0,
               });
@@ -11712,6 +11816,17 @@ export async function generateRoutes(app: FastifyInstance) {
                   const edData = editorResult.data as Record<string, unknown>;
                   const editedText = typeof edData.editedText === "string" ? edData.editedText : "";
                   let sanitizedEditedText = editedText;
+                  const rewriteCharacterId =
+                    typeof (lastSavedMsg as { characterId?: unknown } | null)?.characterId === "string"
+                      ? (lastSavedMsg as { characterId: string }).characterId
+                      : null;
+                  if (holdForCmbSpeakerValidation) {
+                    sanitizedEditedText = retainConversationSpeaker(
+                      sanitizedEditedText,
+                      rewriteCharacterId,
+                      cmbResponseSpeakers,
+                    );
+                  }
                   if (
                     hierarchicalMapsEnabledForChat &&
                     (requestChatMode === "roleplay" || requestChatMode === "game")
@@ -11745,10 +11860,6 @@ export async function generateRoutes(app: FastifyInstance) {
                       messageId,
                     );
                   }
-                  const rewriteCharacterId =
-                    typeof (lastSavedMsg as { characterId?: unknown } | null)?.characterId === "string"
-                      ? (lastSavedMsg as { characterId: string }).characterId
-                      : null;
                   const repeatsPriorConversationResponse =
                     rewriteAllowed &&
                     !strictEditNeeded &&
@@ -12136,7 +12247,7 @@ export async function generateRoutes(app: FastifyInstance) {
             charNameMap[ci.id] = ci.name;
           }
           if (advancedMemoryEnabled) {
-            void (async () => {
+            void runWithDetachedProfileAssetMutation(async () => {
               const options = { debugMode: requestDebug, blocking: false };
               if (sceneCheckRequest && agentContext.sceneCheck?.claimed) {
                 if (agentContext.sceneCheck.result === undefined) {
@@ -12160,17 +12271,23 @@ export async function generateRoutes(app: FastifyInstance) {
                   asOfMessageId: latestAssistantMessageId,
                 });
               }
-            })().catch((error) => logger.error(error, "[advanced-memory] Background maintenance failed"));
+            }).catch((error) => logger.error(error, "[advanced-memory] Background maintenance failed"));
           } else if (memoryRecallVectorizerAvailable) {
-            chunkAndEmbedMessages(
-              app.db,
-              input.chatId,
-              { userName: personaName, characterNames: charNameMap },
-              {
-                embeddingSource: memoryRecallEmbeddingSource,
-                readBehindMessageCount:
-                  typeof contextMessageLimit === "number" && contextMessageLimit > 0 ? contextMessageLimit : undefined,
-              },
+            void runWithDetachedProfileAssetMutation(() =>
+              runMemoryRecallMutationWithDirtyHint(memoryRecallSourceDirty, input.chatId, () =>
+                chunkAndEmbedMessages(
+                  app.db,
+                  input.chatId,
+                  { userName: personaName, characterNames: charNameMap },
+                  {
+                    embeddingSource: memoryRecallEmbeddingSource,
+                    readBehindMessageCount:
+                      typeof contextMessageLimit === "number" && contextMessageLimit > 0
+                        ? contextMessageLimit
+                        : undefined,
+                  },
+                ),
+              ),
             ).catch((err) => logger.error(err, "[memory-recall] Background chunking failed"));
           }
         }

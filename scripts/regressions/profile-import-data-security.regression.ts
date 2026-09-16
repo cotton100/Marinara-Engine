@@ -56,10 +56,16 @@ function multipartUpload(filename: string, bytes: Buffer) {
 const storageRoot = await mkdtemp(join(tmpdir(), "marinara-profile-import-data-security-"));
 const previousDataDir = process.env.DATA_DIR;
 const previousFileStorageDir = process.env.FILE_STORAGE_DIR;
+const previousAdminSecret = process.env.ADMIN_SECRET;
+// owo: the profile import write path is a coordination operator action and
+// requires the admin secret (preview does not). Mirrors profile-asset-mutation-gate.
+const ADMIN_SECRET = "profile-import-data-security-regression-secret";
+const importWriteHeaders = { "x-admin-secret": ADMIN_SECRET };
 
 try {
   process.env.DATA_DIR = storageRoot;
   process.env.FILE_STORAGE_DIR = join(storageRoot, "storage");
+  process.env.ADMIN_SECRET = ADMIN_SECRET;
 
   const [dbModule, schema, backupModule, cryptoModule, themesModule, connectionsModule] = await Promise.all([
     import("../../packages/server/src/db/connection.js"),
@@ -123,7 +129,7 @@ try {
       .inject({
         method: "POST",
         url: "/api/backup/import-profile",
-        headers: { "x-profile-preview-token": zipPreview.previewToken },
+        headers: { ...importWriteHeaders, "x-profile-preview-token": zipPreview.previewToken },
       })
       .finally(() => {
         Date.now = realDateNow;
@@ -137,7 +143,7 @@ try {
     const replayedZipImport = await app.inject({
       method: "POST",
       url: "/api/backup/import-profile",
-      headers: { "x-profile-preview-token": zipPreview.previewToken },
+      headers: { ...importWriteHeaders, "x-profile-preview-token": zipPreview.previewToken },
     });
     assert.equal(replayedZipImport.statusCode, 410, "a staged profile preview token must be single-use");
 
@@ -341,7 +347,7 @@ try {
     const importResponse = await app.inject({
       method: "POST",
       url: "/api/backup/import-profile",
-      headers: { "x-profile-preview-token": preview.previewToken },
+      headers: { ...importWriteHeaders, "x-profile-preview-token": preview.previewToken },
     });
     assert.equal(importResponse.statusCode, 200, importResponse.body);
 
@@ -489,7 +495,7 @@ try {
     const legacyImportResponse = await app.inject({
       method: "POST",
       url: "/api/backup/import-profile",
-      headers: { "x-profile-preview-token": legacyPreview.previewToken },
+      headers: { ...importWriteHeaders, "x-profile-preview-token": legacyPreview.previewToken },
     });
     assert.equal(legacyImportResponse.statusCode, 200, legacyImportResponse.body);
     assert.equal((await themes.getActive())?.id, localTheme!.id, "legacy import must preserve the local active theme");
@@ -504,6 +510,8 @@ try {
   else process.env.DATA_DIR = previousDataDir;
   if (previousFileStorageDir === undefined) delete process.env.FILE_STORAGE_DIR;
   else process.env.FILE_STORAGE_DIR = previousFileStorageDir;
+  if (previousAdminSecret === undefined) delete process.env.ADMIN_SECRET;
+  else process.env.ADMIN_SECRET = previousAdminSecret;
   await rm(storageRoot, { recursive: true, force: true });
 }
 

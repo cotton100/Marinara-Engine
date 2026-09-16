@@ -111,6 +111,8 @@ type StorageWriterLeaseRecord = {
 type WriterLeaseLiveness = { server: Server; sockets: Set<Socket>; scopeId: string };
 type ActiveStorageWriterLease = { path: string; token: string; liveness: WriterLeaseLiveness | null };
 
+type FileDurabilityMode = "best-effort" | "strict";
+
 type FileTransactionContext = {
   snapshots: Map<string, Row[]>;
   dirtyTables: Set<string>;
@@ -130,6 +132,7 @@ type FileTransactionContext = {
   loadHealDirtyShards: Map<string, Set<string>>;
   loadHealDirtyTables: Set<string>;
   flushed: boolean;
+  strictFlushed: boolean;
 };
 
 const PRIVATE_DIRECTORY_MODE = 0o700;
@@ -175,6 +178,15 @@ function hardenPrivateStorageTree(rootDir: string) {
   }
 }
 
+export class FileNativeStrictDurabilityUnsupportedError extends Error {
+  readonly code = "FILE_STORAGE_STRICT_DURABILITY_UNSUPPORTED";
+
+  constructor(message = "Strict file-storage durability is not supported by this runtime") {
+    super(message);
+    this.name = "FileNativeStrictDurabilityUnsupportedError";
+  }
+}
+
 export type QuarantinedStorageTable = {
   table: string;
   files: Array<{
@@ -185,6 +197,10 @@ export type QuarantinedStorageTable = {
 
 export type FileNativeStoreController = {
   flush: () => Promise<void>;
+  flushStrict: () => Promise<void>;
+  flushPathsStrict: (filePaths: readonly string[], directoryPaths: readonly string[]) => Promise<void>;
+  runExclusiveTransactions: <T>(operation: () => Promise<T>) => Promise<T>;
+  isStrictDurabilitySupported: () => boolean;
   close: () => Promise<void>;
   rootDir: string;
   getQuarantinedTables: () => QuarantinedStorageTable[];
@@ -273,6 +289,14 @@ export type FileNativeStoreTestHooks = {
    * deterministic. Never invoked for transaction-context writes.
    */
   afterWritableTurn?: () => Promise<void> | void;
+  afterTableRead?: (table: string) => Promise<void> | void;
+  fileOperations?: {
+    writeFile?: (path: string, content: string) => Promise<void>;
+    copyFile?: (from: string, to: string) => Promise<void>;
+    rename?: (from: string, to: string) => Promise<void>;
+    flushFile?: (path: string) => Promise<void>;
+    flushDirectory?: (path: string) => Promise<void>;
+  };
 };
 
 type SelectFromBuilder<TProjection extends Projection | undefined> = {
@@ -407,6 +431,8 @@ const BUILT_IN_FILE_BACKED_TABLES = [
   "chat_presets",
   "prompt_overrides",
   "installed_extensions",
+  "personal_extension_coordination",
+  "personal_extension_operation_journal",
   "library_folders",
   "mari_instructions",
   "mari_workspace_context",
@@ -970,7 +996,18 @@ function warnFlushFailure(kind: "file" | "directory", path: string, err: unknown
   );
 }
 
-async function flushFile(path: string) {
+async function flushFile(path: string, durability: FileDurabilityMode, testHooks?: FileNativeStoreTestHooks) {
+  const injectedFlush = testHooks?.fileOperations?.flushFile;
+  if (injectedFlush) {
+    try {
+      await injectedFlush(path);
+    } catch (err) {
+      if (durability === "strict") throw err;
+      warnFlushFailure("file", path, err);
+    }
+    return;
+  }
+
   let handle: import("node:fs/promises").FileHandle | null = null;
   try {
     // Windows FlushFileBuffers requires a writable file handle. Opening the
@@ -979,6 +1016,7 @@ async function flushFile(path: string) {
     handle = await open(path, "r+");
     await handle.sync();
   } catch (err) {
+    if (durability === "strict") throw err;
     // Best effort only. Some mobile filesystems reject fsync for app data.
     warnFlushFailure("file", path, err);
   } finally {
@@ -992,18 +1030,44 @@ async function flushFile(path: string) {
   }
 }
 
-async function flushDirectory(path: string) {
+async function flushDirectory(
+  path: string,
+  durability: FileDurabilityMode,
+  testHooks?: FileNativeStoreTestHooks,
+): Promise<boolean> {
+  const injectedFlush = testHooks?.fileOperations?.flushDirectory;
+  if (injectedFlush) {
+    try {
+      await injectedFlush(path);
+      return true;
+    } catch (err) {
+      if (durability === "strict") throw err;
+      warnFlushFailure("directory", path, err);
+      return false;
+    }
+  }
+
   if (isWindows) {
     // Node cannot open/flush directory handles on Windows. File handles are
     // still flushed above; the directory metadata flush remains POSIX-only.
-    return;
+    if (durability === "strict") {
+      throw new FileNativeStrictDurabilityUnsupportedError(
+        "Strict file-storage durability requires directory fsync, which Node does not support on Windows",
+      );
+    }
+    // Preserve the existing Windows best-effort contract. There is no
+    // directory-fsync operation to retry on this platform.
+    return true;
   }
 
   let handle: import("node:fs/promises").FileHandle | null = null;
+  let flushed = false;
   try {
     handle = await open(path, "r");
     await handle.sync();
+    flushed = true;
   } catch (err) {
+    if (durability === "strict") throw err;
     // Directory fsync is best effort across filesystems/platforms.
     warnFlushFailure("directory", path, err);
   } finally {
@@ -1015,6 +1079,7 @@ async function flushDirectory(path: string) {
       }
     }
   }
+  return flushed;
 }
 
 function looksNulFilled(path: string): boolean {
@@ -1042,10 +1107,45 @@ function looksNulFilled(path: string): boolean {
   }
 }
 
-async function atomicWriteFile(path: string, content: string, options: { refreshBackup?: boolean } = {}) {
+/**
+ * Private-mode chmod for a freshly produced file. Skipped on Windows (no POSIX
+ * modes). When the producing operation was injected by test hooks the path
+ * may never have materialized on disk, so ONLY a missing file is tolerated
+ * there; every other failure propagates like the real write path.
+ */
+async function applyPrivateFileMode(path: string, producedByInjectedOperation: boolean) {
+  if (process.platform === "win32") return;
+  try {
+    await chmod(path, PRIVATE_FILE_MODE);
+  } catch (err) {
+    if (producedByInjectedOperation && (err as NodeJS.ErrnoException)?.code === "ENOENT") return;
+    throw err;
+  }
+}
+
+async function atomicWriteFile(
+  path: string,
+  content: string,
+  options: {
+    refreshBackup?: boolean;
+    durability?: FileDurabilityMode;
+    testHooks?: FileNativeStoreTestHooks;
+  } = {},
+) {
   mkdirSync(dirname(path), { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
   const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}`;
   const refreshBackup = options.refreshBackup ?? true;
+  const durability = options.durability ?? "best-effort";
+  const fileOperations = options.testHooks?.fileOperations;
+  const copy = fileOperations?.copyFile ?? copyFile;
+  const move = fileOperations?.rename ?? rename;
+  const injectedWrite = fileOperations?.writeFile;
+  const write = injectedWrite
+    ? async (target: string, data: string) => {
+        await injectedWrite(target, data);
+        await applyPrivateFileMode(target, true);
+      }
+    : (target: string, data: string) => writeFile(target, data, { mode: PRIVATE_FILE_MODE });
   try {
     // Refresh the .bak via tmp + fsync + rename so a hard crash mid-write
     // can't leave both main and backup zero-filled (NTFS allocates blocks
@@ -1061,17 +1161,18 @@ async function atomicWriteFile(path: string, content: string, options: { refresh
       const bakPath = `${path}.bak`;
       const bakTmpPath = `${bakPath}.tmp-${process.pid}-${Date.now()}`;
       try {
-        await copyFile(path, bakTmpPath);
-        if (process.platform !== "win32") await chmod(bakTmpPath, PRIVATE_FILE_MODE);
-        await flushFile(bakTmpPath);
-        await rename(bakTmpPath, bakPath);
-        await flushDirectory(dirname(bakPath));
+        await copy(path, bakTmpPath);
+        await applyPrivateFileMode(bakTmpPath, fileOperations?.copyFile !== undefined);
+        await flushFile(bakTmpPath, durability, options.testHooks);
+        await move(bakTmpPath, bakPath);
+        await flushDirectory(dirname(bakPath), durability, options.testHooks);
       } catch (err) {
         try {
           if (existsSync(bakTmpPath)) await unlink(bakTmpPath);
         } catch {
           /* ignore */
         }
+        if (durability === "strict") throw err;
         logger.error(
           err,
           "[file-storage] Failed to refresh backup durably; backup may be stale and unusable for crash recovery (path=%s)",
@@ -1079,10 +1180,10 @@ async function atomicWriteFile(path: string, content: string, options: { refresh
         );
       }
     }
-    await writeFile(tmpPath, content, { mode: PRIVATE_FILE_MODE });
-    await flushFile(tmpPath);
-    await rename(tmpPath, path);
-    await flushDirectory(dirname(path));
+    await write(tmpPath, content);
+    await flushFile(tmpPath, durability, options.testHooks);
+    await move(tmpPath, path);
+    await flushDirectory(dirname(path), durability, options.testHooks);
   } catch (err) {
     try {
       if (existsSync(tmpPath)) await unlink(tmpPath);
@@ -1159,6 +1260,26 @@ async function quarantineUnrecoverableFiles(paths: string[], context: string): P
 
 function isRowRecord(value: unknown): value is Row {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Unions per-table shard-key sets from `sources` into `target` (raw keys, as
+ * dirtyShards holds them). Always copies keys, never shares Set instances, so
+ * a consumed flush batch can't be mutated through the pending bookkeeping.
+ */
+function mergeShardKeys(
+  target: Map<string, Set<string>>,
+  ...sources: Array<Map<string, Set<string>>>
+): Map<string, Set<string>> {
+  for (const source of sources) {
+    for (const [table, keys] of source) {
+      if (keys.size === 0) continue;
+      const set = target.get(table) ?? new Set<string>();
+      for (const key of keys) set.add(key);
+      target.set(table, set);
+    }
+  }
+  return target;
 }
 
 /** unlink that tolerates ONLY a missing file; every other failure propagates. */
@@ -2303,6 +2424,17 @@ class FileTableStore {
   private shardDirsCreated = new Set<string>();
   /** Monotonic per-table write counters (#4705); bumped in markDirty, never rolled back. */
   private tableWriteGenerations = new Map<string, number>();
+  // A best-effort flush may have written a snapshot without proving fsync.
+  // Keep those tables pending until a strict barrier rewrites and durably
+  // flushes them; ordinary autosave/close semantics remain unchanged.
+  private strictPendingTables = new Set<string>();
+  /**
+   * Shard keys (RAW, per sharded table) consumed by a best-effort flush since
+   * the last strict barrier. strictPendingTables alone cannot re-dirty a
+   * sharded table's files — saveShardedTable writes only the keys it is
+   * handed — so a strict flush merges these back into the dirty shard set.
+   */
+  private strictPendingShards = new Map<string, Set<string>>();
   private backupRecoveredPaths = new Set<string>();
   private dirty = false;
   private activeFlush: Promise<void> | null = null;
@@ -2315,7 +2447,11 @@ class FileTableStore {
   // async call paths wait for the transaction to finish and are therefore never
   // captured by (or reverted with) its rollback snapshots.
   private readonly txContext = new AsyncLocalStorage<FileTransactionContext>();
+  private readonly exclusiveTransactionsContext = new AsyncLocalStorage<boolean>();
   private transactionQueue: Promise<void> = Promise.resolve();
+  private exclusiveTransactionSequenceRequests = 0;
+  private exclusiveTransactionSequenceBarrier: Promise<void> | null = null;
+  private releaseExclusiveTransactionSequenceBarrier: (() => void) | null = null;
   private activeTransactionCount = 0;
   /**
    * The running transaction's context (#5651). The queue admits at most one
@@ -2424,7 +2560,6 @@ class FileTableStore {
         }
         throw err;
       }
-
       let staleReason: "boot" | "liveness" | "pid" | "pid-reused" | null = null;
       // Same-host proof, in order of strength: the recorded machine ID matches
       // ours; the storage is Termux's app-private HOME; or the writer could not
@@ -2869,6 +3004,8 @@ class FileTableStore {
         serializeTableRows(table, shardRows),
         {
           refreshBackup: true,
+          durability: "best-effort",
+          testHooks: this.testHooks,
         },
       );
     }
@@ -2918,57 +3055,53 @@ class FileTableStore {
     }
     this.assertWritable();
 
-    let releaseTransaction!: () => void;
-    const previousTransaction = this.transactionQueue;
-    this.transactionQueue = new Promise<void>((resolve) => {
-      releaseTransaction = resolve;
-    });
-    // Close the plain-write gate atomically with queue admission (#5631):
-    // without the pending count, a write could pass waitForWritableTurn
-    // during the awaits below (activeTransactionCount still 0), apply after
-    // this transaction's first-mutation snapshot, and vanish on rollback.
-    this.pendingTransactionCount++;
-    let ctx!: FileTransactionContext;
-    let dirtySnapshot!: boolean;
-    let dirtyTablesSnapshot!: Set<string>;
-    let dirtyShardsSnapshot!: Map<string, Set<string>>;
-    try {
-      await previousTransaction;
-      // Loop, not check-once (#5652): two flushes can be parked on the same
-      // activeFlush with the second subscribed first. When it resolves, that
-      // flush's recursion re-enters before this continuation resumes, sees no
-      // active transaction, captures the dirty set, and installs a NEW
-      // activeFlush - a single consumed check would sail past it and run the
-      // callback concurrently with its I/O, letting saveFileSnapshots persist
-      // uncommitted rows that a rollback then leaves on disk with no dirty
-      // mark. The recursing flush assigns activeFlush synchronously before
-      // its first await, so a re-check after every wake always observes it.
+    const ownsExclusiveLane = this.exclusiveTransactionsContext.getStore() === true;
+    let releaseTransaction = () => {};
+    let reservationActive = false;
+    if (!ownsExclusiveLane) {
+      const previousTransaction = this.transactionQueue;
+      this.transactionQueue = new Promise<void>((resolve) => {
+        releaseTransaction = resolve;
+      });
+      // Close the plain-write gate atomically with queue admission (#5631).
+      this.pendingTransactionCount++;
+      reservationActive = true;
+      try {
+        await previousTransaction;
+        // A flush can recursively install a successor while this continuation
+        // is waking, so consume the whole chain before admitting the tx (#5652).
+        while (this.activeFlush) await this.activeFlush;
+        this.activeTransactionCount++;
+        this.pendingTransactionCount--;
+        reservationActive = false;
+      } catch (err) {
+        if (reservationActive) this.pendingTransactionCount--;
+        releaseTransaction();
+        throw err;
+      }
+    } else {
       while (this.activeFlush) await this.activeFlush;
-      ctx = {
-        snapshots: new Map<string, Row[]>(),
-        dirtyTables: new Set<string>(),
-        dirtyShards: new Map<string, Set<string>>(),
-        loadHealDirtyShards: new Map<string, Set<string>>(),
-        loadHealDirtyTables: new Set<string>(),
-        flushed: false,
-      };
-      dirtySnapshot = this.dirty;
-      dirtyTablesSnapshot = new Set(this.dirtyTables);
-      // Deep copy — a shallow one would let in-transaction writes mutate the
-      // snapshot's Sets and corrupt the rollback state (#4708).
-      dirtyShardsSnapshot = new Map([...this.dirtyShards].map(([table, keys]) => [table, new Set(keys)]));
-      // Handoff is synchronous, so the combined gate count never dips to zero
-      // between reservation and activation. Nothing after the increment can
-      // throw inside this try, so the reservation can never leak.
-      this.activeTransactionCount++;
-      this.activeTransactionContext = ctx;
-      this.pendingTransactionCount--;
-    } catch (err) {
-      this.pendingTransactionCount--;
-      releaseTransaction();
-      throw err;
     }
 
+    const ctx: FileTransactionContext = {
+      snapshots: new Map<string, Row[]>(),
+      dirtyTables: new Set<string>(),
+      dirtyShards: new Map<string, Set<string>>(),
+      loadHealDirtyShards: new Map<string, Set<string>>(),
+      loadHealDirtyTables: new Set<string>(),
+      flushed: false,
+      strictFlushed: false,
+    };
+    const dirtySnapshot = this.dirty;
+    const dirtyTablesSnapshot = new Set(this.dirtyTables);
+    // Deep copy — a shallow one would let in-transaction writes mutate the
+    // snapshot's Sets and corrupt the rollback state (#4708).
+    const dirtyShardsSnapshot = new Map([...this.dirtyShards].map(([table, keys]) => [table, new Set(keys)]));
+    const strictPendingTablesSnapshot = new Set(this.strictPendingTables);
+    // strictPendingShards is deliberately NOT snapshotted: it only ever grows
+    // until a strict flush succeeds, and a superset merely rewrites an extra
+    // shard under the strict barrier — a subset could skip one.
+    this.activeTransactionContext = ctx;
     try {
       const result = await this.txContext.run(ctx, () => fn(tx));
       // Flush on commit only for tables whose durability the caller reasons about across a
@@ -3008,6 +3141,7 @@ class FileTableStore {
           this.dirtyShards.set(table, set);
         }
       }
+      this.strictPendingTables = strictPendingTablesSnapshot;
       // Rollback restored the full messages array — the shard index must
       // match the restored rows, not the rolled-back ones (#4708).
       if (ctx.dirtyTables.has("messages")) this.rebuildMessageShardIndex();
@@ -3021,7 +3155,10 @@ class FileTableStore {
       }
       if (ctx.flushed) {
         this.dirty = true;
-        for (const tableName of ctx.dirtyTables) this.dirtyTables.add(tableName);
+        for (const tableName of ctx.dirtyTables) {
+          this.dirtyTables.add(tableName);
+          this.strictPendingTables.add(tableName);
+        }
         // Disk was already touched mid-transaction: the affected shards must
         // be rewritten from the restored rows too (#4708).
         for (const [table, keys] of ctx.dirtyShards) {
@@ -3030,15 +3167,60 @@ class FileTableStore {
           this.dirtyShards.set(table, set);
         }
         try {
-          await this.txContext.run(ctx, () => this.flush(true, true));
+          await this.txContext.run(ctx, () =>
+            ctx.strictFlushed ? this.flush(true, true, "strict") : this.flush(true, true),
+          );
         } catch (rollbackError) {
           throw new AggregateError([err, rollbackError], "File-storage transaction and durable rollback both failed");
         }
       }
       throw err;
     } finally {
-      this.activeTransactionCount--;
       if (this.activeTransactionContext === ctx) this.activeTransactionContext = null;
+      if (!ownsExclusiveLane) {
+        this.activeTransactionCount--;
+        if (this.activeTransactionCount === 0) {
+          for (const resolve of this.transactionIdleWaiters) resolve();
+          this.transactionIdleWaiters.clear();
+        }
+        releaseTransaction();
+        if (this.pendingTransactionFlush) {
+          this.pendingTransactionFlush = false;
+          if (!this.writesClosed) void this.flush();
+        }
+      }
+    }
+  }
+
+  async runExclusiveTransactions<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.txContext.getStore()) {
+      throw new Error("An exclusive transaction sequence cannot begin inside a file-storage transaction");
+    }
+    if (this.exclusiveTransactionsContext.getStore()) return operation();
+    // Fail fast once close() has begun rather than queueing behind the lane;
+    // every write inside the sequence re-checks through transaction() and
+    // runWhenWritable, so a close that starts mid-sequence is still refused.
+    this.assertWritable();
+
+    this.exclusiveTransactionSequenceRequests++;
+    if (this.exclusiveTransactionSequenceRequests === 1) {
+      this.exclusiveTransactionSequenceBarrier = new Promise<void>((resolve) => {
+        this.releaseExclusiveTransactionSequenceBarrier = resolve;
+      });
+    }
+
+    let releaseTransaction!: () => void;
+    const previousTransaction = this.transactionQueue;
+    this.transactionQueue = new Promise<void>((resolve) => {
+      releaseTransaction = resolve;
+    });
+    await previousTransaction;
+    if (this.activeFlush) await this.activeFlush;
+    this.activeTransactionCount++;
+    try {
+      return await this.exclusiveTransactionsContext.run(true, operation);
+    } finally {
+      this.activeTransactionCount--;
       if (this.activeTransactionCount === 0) {
         for (const resolve of this.transactionIdleWaiters) resolve();
         this.transactionIdleWaiters.clear();
@@ -3048,6 +3230,13 @@ class FileTableStore {
         this.pendingTransactionFlush = false;
         if (!this.writesClosed) void this.flush();
       }
+      this.exclusiveTransactionSequenceRequests--;
+      if (this.exclusiveTransactionSequenceRequests === 0) {
+        const releaseBarrier = this.releaseExclusiveTransactionSequenceBarrier;
+        this.exclusiveTransactionSequenceBarrier = null;
+        this.releaseExclusiveTransactionSequenceBarrier = null;
+        releaseBarrier?.();
+      }
     }
   }
 
@@ -3056,22 +3245,56 @@ class FileTableStore {
     await new Promise<void>((resolve) => this.transactionIdleWaiters.add(resolve));
   }
 
-  private async waitForWritableTurn(): Promise<void> {
-    this.assertWritable();
-    if (this.txContext.getStore()) return;
-    // Loop: a wake at activeTransactionCount === 0 can still land inside
-    // another transaction's reservation window (#5631), so re-check both
-    // counters after every wait. The idle waiters only fire on active-count
-    // transitions, so the pending-only case waits on the transaction queue
-    // instead (resolved when the queued transaction fully finishes).
-    while (this.activeTransactionCount > 0 || this.pendingTransactionCount > 0) {
+  private currentExclusiveSequenceBarrier(): Promise<void> | null {
+    // A transaction that already owns the lane must be allowed to finish even
+    // if an exclusive sequence was requested behind it. Otherwise the sequence
+    // waits for the transaction while the transaction waits for the sequence.
+    if (this.txContext.getStore() || this.exclusiveTransactionsContext.getStore()) return null;
+    return this.exclusiveTransactionSequenceBarrier;
+  }
+
+  async runWhenReadable<T>(operation: () => T): Promise<T> {
+    for (;;) {
+      const barrier = this.currentExclusiveSequenceBarrier();
+      if (!barrier) return operation();
+      await barrier;
+    }
+  }
+
+  async notifyTableRead(table: string): Promise<void> {
+    await this.testHooks?.afterTableRead?.(table);
+  }
+
+  /**
+   * Runs a write once no exclusive sequence or foreign transaction owns the
+   * lane. Re-checked at the top of EVERY loop turn, so a close() that began
+   * while this writer was parked behind a barrier or transaction is refused
+   * (StorageWriterLeaseError) instead of landing on a closing store — the
+   * same guarantee the pre-exclusive-lane waitForWritableTurn gave.
+   */
+  private async runWhenWritable<T>(operation: () => T | Promise<T>): Promise<T> {
+    for (;;) {
+      this.assertWritable();
+      const exclusiveBarrier = this.currentExclusiveSequenceBarrier();
+      if (exclusiveBarrier) {
+        await exclusiveBarrier;
+        continue;
+      }
+      if (this.txContext.getStore() || this.exclusiveTransactionsContext.getStore()) {
+        return await operation();
+      }
       if (this.activeTransactionCount > 0) {
         await this.waitForTransactions();
-      } else {
-        await this.transactionQueue;
+        continue;
       }
+      if (this.pendingTransactionCount > 0) {
+        await this.transactionQueue;
+        continue;
+      }
+      const result = await operation();
+      await this.testHooks?.afterWritableTurn?.();
+      return result;
     }
-    await this.testHooks?.afterWritableTurn?.();
   }
 
   private assertWritable() {
@@ -3160,102 +3383,102 @@ class FileTableStore {
     return {
       values: (rows) => {
         const runInsert = (onConflict?: { target: unknown; set: Row }) =>
-          executable(async () => {
-            await this.waitForWritableTurn();
-            this.assertWritable();
-            const conflictColumns = normalizeConflictTargets(onConflict?.target);
-            const inputRows = Array.isArray(rows) ? rows : [rows];
-            // Normalize ONCE, before unit selection: raw input may carry
-            // dbName-form keys (chat_id), which shardKeyForRow cannot read —
-            // scoping from raw rows would load the unassigned unit instead of
-            // the destination chat and the duplicate scan below would miss
-            // that chat's on-disk rows. Preparing here also keeps
-            // function-valued column defaults generated exactly once.
-            const preparedRows = inputRows.map((input) => prepareInsertRow(meta, input));
-            // Load the destination units BEFORE the duplicate/uniqueness scan
-            // (#5592 Phase 2): onConflict matching and assertUniqueRow are
-            // only sound against the unit's full row set. A key with no shard
-            // on disk (a brand-new chat) is simply marked loaded.
-            if (LAZY_UNIT_TABLES.has(meta.name) && !this.fullyResidentTables.has(meta.name)) {
-              const destinationKeys = this.shardKeysForRows(meta.name, preparedRows);
-              // Primary-key uniqueness is table-wide, not per-unit. For
-              // messages the complete harvest index can name the unit that
-              // already owns an incoming id — load it too, so the duplicate
-              // scan and conflict matching see the existing row exactly as
-              // the eager store did (id-preserving chat imports are the
-              // realistic cross-unit collision source).
-              if (meta.name === "messages") {
-                for (const row of preparedRows) {
-                  if (typeof row.id !== "string") continue;
-                  const owner = this.messageShardIndex.get(row.id);
-                  if (owner !== undefined) destinationKeys.add(owner);
-                }
-              }
-              this.ensureUnitsLoaded(destinationKeys);
-            }
-            const target = this.rows(meta.name);
-            // Pointer copy, not per-row clones (#5592 Phase 3): row objects
-            // are immutable once installed — every mutation path REPLACES a
-            // row — so sharing them between the old and new arrays is safe,
-            // and the old O(rows) object-clone per insert was the largest
-            // remaining per-write allocation spike on big tables (#4730).
-            const nextRows = target.slice();
-            const affectedRows: Row[] = [];
-            for (const row of preparedRows) {
-              const conflictKeys =
-                conflictColumns.length > 0 ? conflictColumns : meta.primaryKey ? [meta.primaryKey] : [];
-              const duplicateIndex = onConflict ? findMatchingRowIndex(nextRows, row, conflictKeys) : -1;
-              if (onConflict && duplicateIndex !== -1) {
-                const existing = nextRows[duplicateIndex]!;
-                const ctx = this.contextForRow(meta, existing);
-                const candidate = cloneRow(existing);
-                for (const [key, value] of Object.entries(onConflict.set)) {
-                  const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
-                  candidate[column?.key ?? key] = resolveValue(value, ctx);
-                }
-                assertUniqueRow(meta, nextRows, candidate, duplicateIndex);
-                // Conflict updates can move a row's shard key (profile import
-                // rewrites arbitrary columns) — dirty BOTH the old and new
-                // shard or the old file keeps a stale duplicate (#4708).
-                affectedRows.push(existing, candidate);
-                nextRows[duplicateIndex] = candidate;
-              } else {
-                assertUniqueRow(meta, nextRows, row);
-                affectedRows.push(row);
-                if (LAZY_UNIT_TABLES.has(meta.name)) {
-                  // Keep lazy tables in canonical order at insert time — an
-                  // appended row would re-sort on the next unit reload, and
-                  // orderBy-less queries must not change results with
-                  // residency history (#5592 PR-B). Scan from the end: new
-                  // rows are usually newest, making this O(1) in practice.
-                  let position = nextRows.length;
-                  while (position > 0 && compareRowOrder(nextRows[position - 1]!, row) > 0) {
-                    position -= 1;
-                  }
-                  nextRows.splice(position, 0, row);
-                } else {
-                  nextRows.push(row);
-                }
-              }
-            }
-            this.recordTxMutation(meta.name);
-            this.tables.set(meta.name, nextRows);
-            if (SHARDED_TABLE_SET.has(meta.name)) {
-              const shardKeys = this.shardKeysForRows(meta.name, affectedRows);
-              // A conflict update can MOVE a row's shard key (profile import
-              // rewrites arbitrary columns): the destination unit must be
-              // resident before its key is flushed (#5592 Phase 2).
+          executable(() =>
+            this.runWhenWritable(() => {
+              const conflictColumns = normalizeConflictTargets(onConflict?.target);
+              const inputRows = Array.isArray(rows) ? rows : [rows];
+              // Normalize ONCE, before unit selection: raw input may carry
+              // dbName-form keys (chat_id), which shardKeyForRow cannot read —
+              // scoping from raw rows would load the unassigned unit instead of
+              // the destination chat and the duplicate scan below would miss
+              // that chat's on-disk rows. Preparing here also keeps
+              // function-valued column defaults generated exactly once.
+              const preparedRows = inputRows.map((input) => prepareInsertRow(meta, input));
+              // Load the destination units BEFORE the duplicate/uniqueness scan
+              // (#5592 Phase 2): onConflict matching and assertUniqueRow are
+              // only sound against the unit's full row set. A key with no shard
+              // on disk (a brand-new chat) is simply marked loaded.
               if (LAZY_UNIT_TABLES.has(meta.name) && !this.fullyResidentTables.has(meta.name)) {
-                this.ensureUnitsLoaded(shardKeys);
+                const destinationKeys = this.shardKeysForRows(meta.name, preparedRows);
+                // Primary-key uniqueness is table-wide, not per-unit. For
+                // messages the complete harvest index can name the unit that
+                // already owns an incoming id — load it too, so the duplicate
+                // scan and conflict matching see the existing row exactly as
+                // the eager store did (id-preserving chat imports are the
+                // realistic cross-unit collision source).
+                if (meta.name === "messages") {
+                  for (const row of preparedRows) {
+                    if (typeof row.id !== "string") continue;
+                    const owner = this.messageShardIndex.get(row.id);
+                    if (owner !== undefined) destinationKeys.add(owner);
+                  }
+                }
+                this.ensureUnitsLoaded(destinationKeys);
               }
-              if (meta.name === "messages") {
-                this.reindexMovedMessages(affectedRows);
+              const target = this.rows(meta.name);
+              // Pointer copy, not per-row clones (#5592 Phase 3): row objects
+              // are immutable once installed — every mutation path REPLACES a
+              // row — so sharing them between the old and new arrays is safe,
+              // and the old O(rows) object-clone per insert was the largest
+              // remaining per-write allocation spike on big tables (#4730).
+              const nextRows = target.slice();
+              const affectedRows: Row[] = [];
+              for (const row of preparedRows) {
+                const conflictKeys =
+                  conflictColumns.length > 0 ? conflictColumns : meta.primaryKey ? [meta.primaryKey] : [];
+                const duplicateIndex = onConflict ? findMatchingRowIndex(nextRows, row, conflictKeys) : -1;
+                if (onConflict && duplicateIndex !== -1) {
+                  const existing = nextRows[duplicateIndex]!;
+                  const ctx = this.contextForRow(meta, existing);
+                  const candidate = cloneRow(existing);
+                  for (const [key, value] of Object.entries(onConflict.set)) {
+                    const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
+                    candidate[column?.key ?? key] = resolveValue(value, ctx);
+                  }
+                  assertUniqueRow(meta, nextRows, candidate, duplicateIndex);
+                  // Conflict updates can move a row's shard key (profile import
+                  // rewrites arbitrary columns) — dirty BOTH the old and new
+                  // shard or the old file keeps a stale duplicate (#4708).
+                  affectedRows.push(existing, candidate);
+                  nextRows[duplicateIndex] = candidate;
+                } else {
+                  assertUniqueRow(meta, nextRows, row);
+                  affectedRows.push(row);
+                  if (LAZY_UNIT_TABLES.has(meta.name)) {
+                    // Keep lazy tables in canonical order at insert time — an
+                    // appended row would re-sort on the next unit reload, and
+                    // orderBy-less queries must not change results with
+                    // residency history (#5592 PR-B). Scan from the end: new
+                    // rows are usually newest, making this O(1) in practice.
+                    let position = nextRows.length;
+                    while (position > 0 && compareRowOrder(nextRows[position - 1]!, row) > 0) {
+                      position -= 1;
+                    }
+                    nextRows.splice(position, 0, row);
+                  } else {
+                    nextRows.push(row);
+                  }
+                }
               }
-              this.markDirty(meta.name, shardKeys);
-            } else {
-              this.markDirty(meta.name);
-            }
-          });
+              this.recordTxMutation(meta.name);
+              this.tables.set(meta.name, nextRows);
+              if (SHARDED_TABLE_SET.has(meta.name)) {
+                const shardKeys = this.shardKeysForRows(meta.name, affectedRows);
+                // A conflict update can MOVE a row's shard key (profile import
+                // rewrites arbitrary columns): the destination unit must be
+                // resident before its key is flushed (#5592 Phase 2).
+                if (LAZY_UNIT_TABLES.has(meta.name) && !this.fullyResidentTables.has(meta.name)) {
+                  this.ensureUnitsLoaded(shardKeys);
+                }
+                if (meta.name === "messages") {
+                  this.reindexMovedMessages(affectedRows);
+                }
+                this.markDirty(meta.name, shardKeys);
+              } else {
+                this.markDirty(meta.name);
+              }
+            }),
+          );
         const builder = runInsert() as InsertValuesBuilder;
         builder.onConflictDoUpdate = (config) => runInsert(config);
         return builder;
@@ -3268,49 +3491,49 @@ class FileTableStore {
     return {
       set: (patch) => {
         const runUpdate = (condition?: Condition) =>
-          executable(async () => {
-            await this.waitForWritableTurn();
-            this.assertWritable();
-            this.ensureQueryScopeLoaded(meta, condition);
-            const target = this.rows(meta.name);
-            const changedIndexes: number[] = [];
-            const nextRows = target.map((row, index) => {
-              const ctx = this.contextForRow(meta, row);
-              if (!evaluateCondition(condition, ctx)) return row;
-              const candidate = cloneRow(row);
-              for (const [key, value] of Object.entries(patch)) {
-                const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
-                candidate[column?.key ?? key] = resolveValue(value, ctx);
-              }
-              changedIndexes.push(index);
-              return candidate;
-            });
-            if (changedIndexes.length > 0) {
-              for (const index of changedIndexes) {
-                assertUniqueRow(meta, nextRows, nextRows[index]!, index);
-              }
-              this.recordTxMutation(meta.name);
-              this.tables.set(meta.name, nextRows);
-              if (SHARDED_TABLE_SET.has(meta.name)) {
-                const affectedRows: Row[] = [];
+          executable(() =>
+            this.runWhenWritable(() => {
+              this.ensureQueryScopeLoaded(meta, condition);
+              const target = this.rows(meta.name);
+              const changedIndexes: number[] = [];
+              const nextRows = target.map((row, index) => {
+                const ctx = this.contextForRow(meta, row);
+                if (!evaluateCondition(condition, ctx)) return row;
+                const candidate = cloneRow(row);
+                for (const [key, value] of Object.entries(patch)) {
+                  const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
+                  candidate[column?.key ?? key] = resolveValue(value, ctx);
+                }
+                changedIndexes.push(index);
+                return candidate;
+              });
+              if (changedIndexes.length > 0) {
                 for (const index of changedIndexes) {
-                  affectedRows.push(target[index]!, nextRows[index]!);
+                  assertUniqueRow(meta, nextRows, nextRows[index]!, index);
                 }
-                const shardKeys = this.shardKeysForRows(meta.name, affectedRows);
-                // An update that rewrites the shard column moves rows into a
-                // unit that may not be resident yet (#5592 Phase 2).
-                if (LAZY_UNIT_TABLES.has(meta.name) && !this.fullyResidentTables.has(meta.name)) {
-                  this.ensureUnitsLoaded(shardKeys);
+                this.recordTxMutation(meta.name);
+                this.tables.set(meta.name, nextRows);
+                if (SHARDED_TABLE_SET.has(meta.name)) {
+                  const affectedRows: Row[] = [];
+                  for (const index of changedIndexes) {
+                    affectedRows.push(target[index]!, nextRows[index]!);
+                  }
+                  const shardKeys = this.shardKeysForRows(meta.name, affectedRows);
+                  // An update that rewrites the shard column moves rows into a
+                  // unit that may not be resident yet (#5592 Phase 2).
+                  if (LAZY_UNIT_TABLES.has(meta.name) && !this.fullyResidentTables.has(meta.name)) {
+                    this.ensureUnitsLoaded(shardKeys);
+                  }
+                  if (meta.name === "messages") {
+                    this.reindexMovedMessages(affectedRows);
+                  }
+                  this.markDirty(meta.name, shardKeys);
+                } else {
+                  this.markDirty(meta.name);
                 }
-                if (meta.name === "messages") {
-                  this.reindexMovedMessages(affectedRows);
-                }
-                this.markDirty(meta.name, shardKeys);
-              } else {
-                this.markDirty(meta.name);
               }
-            }
-          });
+            }),
+          );
         const builder = runUpdate() as UpdateWhereBuilder;
         builder.where = (condition) => runUpdate(condition);
         return builder;
@@ -3321,17 +3544,50 @@ class FileTableStore {
   delete(table: Table): DeleteBuilder {
     const meta = getMeta(table);
     const runDelete = (condition?: Condition) =>
-      executable(async () => {
-        await this.waitForWritableTurn();
-        this.assertWritable();
-        this.deleteWhere(meta, condition);
-      });
+      executable(() => this.runWhenWritable(() => this.deleteWhere(meta, condition)));
     const builder = runDelete() as DeleteBuilder;
     builder.where = (condition) => runDelete(condition);
     return builder;
   }
 
-  async flush(force = false, throwOnError = false, allowClosed = false) {
+  isStrictDurabilitySupported() {
+    return !isWindows || typeof this.testHooks?.fileOperations?.flushDirectory === "function";
+  }
+
+  async flushStrict() {
+    if (!this.isStrictDurabilitySupported()) {
+      throw new FileNativeStrictDurabilityUnsupportedError(
+        "Strict file-storage durability requires directory fsync, which Node does not support on Windows",
+      );
+    }
+    await this.flush(true, true, "strict");
+  }
+
+  async flushPathsStrict(filePaths: readonly string[], directoryPaths: readonly string[]) {
+    if (!this.isStrictDurabilitySupported()) {
+      throw new FileNativeStrictDurabilityUnsupportedError(
+        "Strict file-storage durability requires directory fsync, which Node does not support on Windows",
+      );
+    }
+    for (const path of new Set(filePaths)) {
+      await flushFile(path, "strict", this.testHooks);
+    }
+    for (const path of new Set(directoryPaths)) {
+      await flushDirectory(path, "strict", this.testHooks);
+    }
+  }
+
+  async flush(
+    force = false,
+    throwOnError = false,
+    durability: FileDurabilityMode = "best-effort",
+    allowClosed = false,
+  ) {
+    if (durability === "strict" && !this.isStrictDurabilitySupported()) {
+      throw new FileNativeStrictDurabilityUnsupportedError(
+        "Strict file-storage durability requires directory fsync, which Node does not support on Windows",
+      );
+    }
     const transactionContext = this.txContext.getStore();
     if (this.writesClosed && !transactionContext && !allowClosed) this.assertWritable();
     // Loop, not check-once — the mirror image of transaction()'s activeFlush
@@ -3350,14 +3606,39 @@ class FileTableStore {
       if (transactionContext) return;
       await this.waitForTransactions();
     }
-    if (transactionContext && force) transactionContext.flushed = true;
+    if (transactionContext && force) {
+      transactionContext.flushed = true;
+      if (durability === "strict") transactionContext.strictFlushed = true;
+    }
     if (this.activeFlush) {
       await this.activeFlush;
-      if (this.dirty || this.dirtyTables.size > 0) await this.flush(force, throwOnError, allowClosed);
-      else if (throwOnError && this.lastFlushError) throw this.lastFlushError;
+      if (this.dirty || this.dirtyTables.size > 0 || (durability === "strict" && this.strictPendingTables.size > 0)) {
+        await this.flush(force, throwOnError, durability, allowClosed);
+      } else if (throwOnError && this.lastFlushError) throw this.lastFlushError;
       return;
     }
-    if (!force && !this.dirty && this.dirtyTables.size === 0) return;
+    if (durability === "strict" && this.strictPendingShards.size > 0) {
+      // Best-effort autosave deliberately leaves shard keys pending until a
+      // strict barrier can rewrite and fsync them. The LRU sweep may evict
+      // those otherwise-clean units in the meantime, so make every pending
+      // lazy unit resident again BEFORE capturing the strict batch. Loading is
+      // synchronous: any recovery/healing marks it creates join the same map
+      // swap below, and a failed strict write requeues the merged batch.
+      const pendingLazyUnits = new Set<string>();
+      for (const [table, keys] of this.strictPendingShards) {
+        if (!LAZY_UNIT_TABLES.has(table) || this.fullyResidentTables.has(table)) continue;
+        for (const key of keys) pendingLazyUnits.add(key);
+      }
+      if (pendingLazyUnits.size > 0) this.ensureUnitsLoaded(pendingLazyUnits);
+    }
+    if (
+      !force &&
+      !this.dirty &&
+      this.dirtyTables.size === 0 &&
+      (durability !== "strict" || this.strictPendingTables.size === 0)
+    ) {
+      return;
+    }
     this.dirty = false;
     // Snapshot the dirty set and reset it BEFORE the async write. saveFileSnapshots
     // now yields the event loop, so a markDirty() that interleaves during the I/O
@@ -3388,20 +3669,33 @@ class FileTableStore {
     // healing write failed. Marks travel with the batch that consumes them.
     const recoveredPaths = this.backupRecoveredPaths;
     this.backupRecoveredPaths = new Set();
+    for (const table of dirtyTables) this.strictPendingTables.add(table);
+    const strictPendingTables = durability === "strict" ? this.strictPendingTables : new Set<string>();
+    if (durability === "strict") this.strictPendingTables = new Set();
+    const tablesToPersist = new Set([...dirtyTables, ...strictPendingTables]);
+    // Shard keys mirror the table bookkeeping above: a best-effort flush
+    // consumes them from dirtyShards without proving fsync, so they stay
+    // pending until a strict barrier rewrites them; a strict flush takes the
+    // pending keys along and clears them only once the write succeeds.
+    let shardsToPersist = dirtyShards;
+    if (durability === "strict") {
+      shardsToPersist = mergeShardKeys(new Map(), dirtyShards, this.strictPendingShards);
+      this.strictPendingShards = new Map();
+    } else {
+      mergeShardKeys(this.strictPendingShards, dirtyShards);
+    }
     const flush = (async () => {
       try {
-        await this.saveFileSnapshots(dirtyTables, dirtyShards, staleShards, recoveredPaths);
+        await this.saveFileSnapshots(tablesToPersist, shardsToPersist, staleShards, recoveredPaths, durability);
         this.lastFlushError = null;
       } catch (err) {
         this.lastFlushError = err;
         this.dirty = true;
         // Re-mark the tables we failed to persist so they retry on the next flush
         // (without clobbering any tables marked dirty during the failed write).
-        for (const table of dirtyTables) this.dirtyTables.add(table);
-        for (const [table, keys] of dirtyShards) {
-          const set = this.dirtyShards.get(table) ?? new Set<string>();
-          for (const key of keys) set.add(key);
-          this.dirtyShards.set(table, set);
+        for (const table of tablesToPersist) {
+          this.dirtyTables.add(table);
+          this.strictPendingTables.add(table);
         }
         for (const [table, encodings] of staleShards) {
           const set = this.staleShardFiles.get(table) ?? new Set<string>();
@@ -3409,6 +3703,8 @@ class FileTableStore {
           this.staleShardFiles.set(table, set);
         }
         for (const path of recoveredPaths) this.backupRecoveredPaths.add(path);
+        mergeShardKeys(this.dirtyShards, shardsToPersist);
+        mergeShardKeys(this.strictPendingShards, shardsToPersist);
         logger.error(err, "[file-storage] Failed to persist file-native storage");
       }
     })();
@@ -3448,7 +3744,7 @@ class FileTableStore {
       await this.transactionQueue;
       if (this.activeFlush) await this.activeFlush;
       while (this.dirty || this.dirtyTables.size > 0) {
-        await this.flush(true, false, true);
+        await this.flush(true, false, "best-effort", true);
         if (this.lastFlushError) throw this.lastFlushError;
       }
     } catch (err) {
@@ -3727,6 +4023,7 @@ class FileTableStore {
     this.tableWriteGenerations.set(table, (this.tableWriteGenerations.get(table) ?? 0) + 1);
     this.dirty = true;
     this.dirtyTables.add(table);
+    this.strictPendingTables.add(table);
     if (shardKeys) {
       const set = this.dirtyShards.get(table) ?? new Set<string>();
       for (const key of shardKeys) set.add(key);
@@ -5033,6 +5330,7 @@ class FileTableStore {
     dirtyKeys: Set<string>,
     stale: Set<string> | undefined,
     recoveredPaths: ReadonlySet<string>,
+    durability: FileDurabilityMode = "best-effort",
   ): Promise<number> {
     const known = this.knownShardFiles.get(table) ?? new Set<string>();
     this.knownShardFiles.set(table, known);
@@ -5050,8 +5348,14 @@ class FileTableStore {
       else rowsByShard.set(key, [row]);
     }
     if (!this.shardDirsCreated.has(table)) {
-      mkdirSync(shardDirPath(this.rootDir, table), { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-      this.shardDirsCreated.add(table);
+      const shardDirectory = shardDirPath(this.rootDir, table);
+      mkdirSync(shardDirectory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+      // A shard file fsync proves the file and its entry inside this directory,
+      // but not the shard directory's own entry inside tables/. Keep the table
+      // unregistered until that parent entry is durable so a strict retry will
+      // try the parent flush again after an injected or real failure.
+      const parentEntryFlushed = await flushDirectory(dirname(shardDirectory), durability, this.testHooks);
+      if (parentEntryFlushed) this.shardDirsCreated.add(table);
     }
     // Stale physical files (foreign-row holders found at load): force a
     // canonical rewrite when an in-memory shard still maps to the name; the
@@ -5076,7 +5380,11 @@ class FileTableStore {
       const serializedRows = serializeTableRows(table, shardRows);
       await this.testHooks?.beforeTableWrite?.(`${table}/${encoded}`, serializedRows);
       const path = shardFilePath(this.rootDir, table, encoded);
-      await atomicWriteFile(path, serializedRows, { refreshBackup: !recoveredPaths.has(path) });
+      await atomicWriteFile(path, serializedRows, {
+        refreshBackup: !recoveredPaths.has(path),
+        durability,
+        testHooks: this.testHooks,
+      });
       known.add(encoded);
       // Register the shard in the lazy discovery index too (#5592 PR-B):
       // discovery was boot-only, which was invisible while units never
@@ -5088,6 +5396,8 @@ class FileTableStore {
         this.lazyDiscoveredShards.set(table, discovered);
       }
     }
+    const removedEncodings = new Set<string>();
+    const removedStaleEncodings = new Set<string>();
     if (stale && stale.size > 0) {
       for (const encoded of stale) {
         if (encodedToKey.has(encoded)) continue; // rewritten canonically above
@@ -5115,8 +5425,8 @@ class FileTableStore {
         // while its rows reload on the next restart.
         await unlinkIgnoringMissing(path);
         await unlinkIgnoringMissing(`${path}.bak`);
-        known.delete(encoded);
-        this.lazyDiscoveredShards.get(table)?.delete(encoded);
+        removedEncodings.add(encoded);
+        removedStaleEncodings.add(encoded);
       }
     }
     for (const key of effectiveDirty) {
@@ -5152,8 +5462,42 @@ class FileTableStore {
       const path = shardFilePath(this.rootDir, table, encoded);
       await unlinkIgnoringMissing(path);
       await unlinkIgnoringMissing(`${path}.bak`);
-      known.delete(encoded);
-      this.lazyDiscoveredShards.get(table)?.delete(encoded);
+      removedEncodings.add(encoded);
+    }
+    if (removedEncodings.size > 0) {
+      // unlink durability belongs to the containing directory. Do not update
+      // the in-memory known-file set until this succeeds: on strict fsync
+      // failure the flush retry must revisit the same logical deletions.
+      const deletionEntriesFlushed = await flushDirectory(
+        shardDirPath(this.rootDir, table),
+        durability,
+        this.testHooks,
+      );
+      if (deletionEntriesFlushed) {
+        for (const encoded of removedEncodings) {
+          known.delete(encoded);
+          this.lazyDiscoveredShards.get(table)?.delete(encoded);
+        }
+      } else {
+        // Keep stale-only deletion evidence too. Some repaired empty shards do
+        // not have a logical dirty key, so clearing this set would let the next
+        // strict flush return without re-proving the directory unlink.
+        const requeued = this.staleShardFiles.get(table) ?? new Set<string>();
+        // Only captured stale-file evidence belongs back in this map. A
+        // logical dirty-key deletion is retried through strictPendingShards;
+        // converting its encoded filename into a stale mark can make a new
+        // lazy shard (never physically loaded) defer forever on the residency
+        // guard above.
+        for (const encoded of removedStaleEncodings) requeued.add(encoded);
+        this.staleShardFiles.set(table, requeued);
+        // Do not make an unsupported best-effort directory fsync self-dirty:
+        // finishClose drains ordinary dirty state and would otherwise loop
+        // forever on filesystems that consistently reject directory handles.
+        // The retained stale evidence joins the next real flush, while the
+        // strict-pending table guarantees an explicit barrier revisits it.
+        this.strictPendingTables.add(table);
+        return known.size;
+      }
     }
     // The processed marks were swapped out of the live map by flush(); marks
     // added DURING this flush (lazy unit loads) sit in the live map and keep
@@ -5167,6 +5511,7 @@ class FileTableStore {
     dirtyShards: Map<string, Set<string>>,
     staleShards: Map<string, Set<string>>,
     recoveredPaths: ReadonlySet<string>,
+    durability: FileDurabilityMode,
   ) {
     mkdirSync(join(this.rootDir, "tables"), { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
     const tables: Record<string, number> = {};
@@ -5193,6 +5538,7 @@ class FileTableStore {
           dirtyShards.get(table) ?? new Set(),
           staleShards.get(table),
           recoveredPaths,
+          durability,
         );
         continue;
       }
@@ -5200,7 +5546,11 @@ class FileTableStore {
       if (dirtyTables.has(table) || !existsSync(path)) {
         const serializedRows = serializeTableRows(table, rows);
         await this.testHooks?.beforeTableWrite?.(table, serializedRows);
-        await atomicWriteFile(path, serializedRows, { refreshBackup: !recoveredPaths.has(path) });
+        await atomicWriteFile(path, serializedRows, {
+          refreshBackup: !recoveredPaths.has(path),
+          durability,
+          testHooks: this.testHooks,
+        });
       }
     }
 
@@ -5215,6 +5565,8 @@ class FileTableStore {
     const serializedManifest = JSON.stringify(manifest, null, 2);
     await atomicWriteFile(path, serializedManifest, {
       refreshBackup: !recoveredPaths.has(path),
+      durability,
+      testHooks: this.testHooks,
     });
     // No whole-set clear: the captured marks die with this batch on success,
     // and marks added DURING this flush (lazy unit loads recovering shards
@@ -5273,53 +5625,52 @@ class SelectQuery implements SelectQueryBuilder<any> {
   }
 
   async run() {
-    // No-join fast path (#5592 Phase 0): filter raw rows through the shared
-    // scan and build contexts only for matches. Joined queries keep the eager
-    // context array below — the join loop needs a context per base row.
-    if (this.joins.length === 0) {
-      const matched: RowContext[] = [];
-      for (const row of this.store.matchingRows(this.fromMeta, this.condition)) {
-        matched.push(this.store.contextForRow(this.fromMeta, row));
+    const result = await this.store.runWhenReadable(() => {
+      // No-join fast path (#5592 Phase 0): filter raw rows through the shared
+      // scan and build contexts only for matches. Joined queries keep the eager
+      // context array below — the join loop needs a context per base row.
+      if (this.joins.length === 0) {
+        const matched: RowContext[] = [];
+        for (const row of this.store.matchingRows(this.fromMeta, this.condition)) {
+          matched.push(this.store.contextForRow(this.fromMeta, row));
+        }
+        return this.finish(matched);
       }
-      return this.finish(matched);
-    }
-    // Joined queries scope each lazy table against the combined WHERE + join
-    // conditions (#5592 Phase 2). The AND extractor ignores conjuncts it
-    // cannot resolve (column-to-column join predicates, other tables'
-    // columns), so each lazy table is bounded by whatever conjuncts name its
-    // OWN shard column or primary key — the shipped joins all carry one, e.g.
-    // eq(agentRuns.chatId, X) — and a table nothing bounds is leased whole.
-    const combined: Condition = {
-      kind: "file-logical",
-      operator: "and",
-      conditions: [this.condition, ...this.joins.map((join) => join.condition)].filter(
-        (entry): entry is FileCondition => entry !== undefined,
-      ),
-    };
-    this.store.ensureQueryScopeLoaded(this.fromMeta, combined);
-    for (const join of this.joins) this.store.ensureQueryScopeLoaded(join.table, combined);
-    let contexts = this.store.rows(this.fromMeta.name).map((row) => this.store.contextForRow(this.fromMeta, row));
+      // Joined queries scope each lazy table against the combined WHERE + join
+      // conditions (#5592 Phase 2).
+      const combined: Condition = {
+        kind: "file-logical",
+        operator: "and",
+        conditions: [this.condition, ...this.joins.map((join) => join.condition)].filter(
+          (entry): entry is FileCondition => entry !== undefined,
+        ),
+      };
+      this.store.ensureQueryScopeLoaded(this.fromMeta, combined);
+      for (const join of this.joins) this.store.ensureQueryScopeLoaded(join.table, combined);
+      let contexts = this.store.rows(this.fromMeta.name).map((row) => this.store.contextForRow(this.fromMeta, row));
 
-    for (const join of this.joins) {
-      const joinedContexts: RowContext[] = [];
-      const joinRows = this.store.rows(join.table.name);
-      for (const ctx of contexts) {
-        joinRows.forEach((row) => {
-          const candidate: RowContext = {
-            rows: { ...ctx.rows, [join.table.name]: row },
-            baseTable: ctx.baseTable,
-            joined: true,
-          };
-          if (evaluateCondition(join.condition, candidate)) {
-            joinedContexts.push(candidate);
-          }
-        });
+      for (const join of this.joins) {
+        const joinedContexts: RowContext[] = [];
+        const joinRows = this.store.rows(join.table.name);
+        for (const ctx of contexts) {
+          joinRows.forEach((row) => {
+            const candidate: RowContext = {
+              rows: { ...ctx.rows, [join.table.name]: row },
+              baseTable: ctx.baseTable,
+              joined: true,
+            };
+            if (evaluateCondition(join.condition, candidate)) {
+              joinedContexts.push(candidate);
+            }
+          });
+        }
+        contexts = joinedContexts;
       }
-      contexts = joinedContexts;
-    }
-
-    contexts = contexts.filter((ctx) => evaluateCondition(this.condition, ctx));
-    return this.finish(contexts);
+      contexts = contexts.filter((ctx) => evaluateCondition(this.condition, ctx));
+      return this.finish(contexts);
+    });
+    await this.store.notifyTableRead(this.fromMeta.name);
+    return result;
   }
 
   /** Ordering, offset/limit, and projection shared by both run() paths. */
@@ -5335,7 +5686,6 @@ class SelectQuery implements SelectQueryBuilder<any> {
         return 0;
       });
     }
-
     if (this.rowOffset > 0) contexts = contexts.slice(this.rowOffset);
     if (this.rowLimit !== null) contexts = contexts.slice(0, this.rowLimit);
     return contexts.map((ctx) => projectRow(ctx, this.projection));
@@ -5357,6 +5707,10 @@ export async function createFileNativeDB(testHooks?: FileNativeStoreTestHooks): 
   const controller: FileNativeStoreController = {
     rootDir,
     flush: () => store.flush(true, true),
+    flushStrict: () => store.flushStrict(),
+    flushPathsStrict: (filePaths, directoryPaths) => store.flushPathsStrict(filePaths, directoryPaths),
+    runExclusiveTransactions: (operation) => store.runExclusiveTransactions(operation),
+    isStrictDurabilitySupported: () => store.isStrictDurabilitySupported(),
     close: () => store.close(),
     getQuarantinedTables: () => store.getQuarantinedTables(),
     getTableWriteGeneration: (table) => store.getTableWriteGeneration(table),

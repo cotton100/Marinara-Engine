@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { BUILT_IN_AGENT_MANIFESTS } from "@marinara-engine/shared";
-import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
+import { isAdminAuthorized, requirePrivilegedAccess } from "../middleware/privileged-gate.js";
 import {
   capabilityPackageManager,
   CapabilityPackageVersionMismatchError,
@@ -10,6 +10,11 @@ import { capabilityModuleRuntime } from "../services/capability-packages/capabil
 import { refreshCapabilityAgentRegistry } from "../services/capability-packages/capability-agent-registry.service.js";
 import { createChatsStorage } from "../services/storage/chats.storage.js";
 import { createAgentsStorage } from "../services/storage/agents.storage.js";
+import {
+  createNoodleStorage,
+  NOODLE_COMPANION_SNAPSHOT_CAPACITY_ERROR,
+  NoodleCompanionSnapshotCapacityError,
+} from "../services/storage/noodle.storage.js";
 
 const packageParams = z.object({
   id: z
@@ -79,6 +84,25 @@ export async function capabilityPackagesRoutes(app: FastifyInstance) {
   app.get<{ Params: { id: string } }>("/:id/release-notes", async (request) => {
     const { id } = packageParams.parse(request.params);
     return capabilityPackageManager.releaseNotes(id);
+  });
+  app.get("/noodle/snapshot", async (request, reply) => {
+    if (!requirePrivilegedAccess(request, reply, { feature: "Noodle companion snapshot" })) return;
+    if (!isAdminAuthorized(request)) {
+      return reply.status(403).send({ error: "Invalid or missing X-Admin-Secret header" });
+    }
+    const installed = (await capabilityPackageManager.installed()).find((item) => item.id === "noodle");
+    if (!installed || installed.status !== "active" || installed.readiness !== "ready") {
+      return reply.status(404).send({ error: "Active Noodle package not found" });
+    }
+    reply.header("Cache-Control", "private, no-store");
+    try {
+      return await createNoodleStorage(app.db).readOnlyCompanionSnapshot();
+    } catch (error) {
+      if (error instanceof NoodleCompanionSnapshotCapacityError) {
+        return reply.status(409).send({ error: NOODLE_COMPANION_SNAPSHOT_CAPACITY_ERROR });
+      }
+      throw error;
+    }
   });
   app.post<{ Params: { id: string; version: string } }>("/:id/updates/:version/decline", async (request, reply) => {
     if (!requirePrivilegedAccess(request, reply, { feature: "Agent update decline" })) return;

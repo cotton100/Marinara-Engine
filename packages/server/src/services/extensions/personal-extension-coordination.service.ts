@@ -253,6 +253,11 @@ export function createPersonalExtensionCoordinationService(
       publishAfterCommit(extensionId, { type: "lease-changed" });
       return committed;
     },
+    async recoverAndResumeCoordination(extensionId: string) {
+      const committed = await admin.recoverBlockedCoordination(extensionId, true);
+      publishAfterCommit(extensionId, { type: "lease-changed" });
+      return committed;
+    },
     async retireDetachedLorebook(extensionId: string, input: PersonalExtensionDetachedLorebookRetirementInput) {
       const committed = await admin.retireDetachedLorebook(extensionId, input);
       publishAfterCommit(extensionId, { type: "lease-changed" });

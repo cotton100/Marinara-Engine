@@ -39,7 +39,7 @@ const routeSource = readFileSync(
   "utf8",
 );
 assert.match(routeSource, /\/:id\/coordination\/admin\/\$\{action\}/u);
-for (const action of ["activate", "deactivate", "recover-blocked"] as const) {
+for (const action of ["activate", "deactivate", "recover-blocked", "recover-and-resume"] as const) {
   assert.match(routeSource, new RegExp(`adminTransition\\("${action}"`, "u"));
 }
 assert.match(routeSource, /requireCoordinationAdminAccess\(request, reply/u);
@@ -68,8 +68,16 @@ process.env.ENABLE_EXTERNAL_EXTENSIONS = "true";
 
 let failStrictWrite = false;
 let beforeInactiveCoordinationWrite: (() => void) | null = null;
+let beforeActiveRecoveryWrite: (() => void) | null = null;
 const fileDb = await createFileNativeDB({
   beforeTableWrite(table, serializedRows) {
+    if (
+      beforeActiveRecoveryWrite &&
+      table === `personal_extension_coordination/${encodeShardKey(EXTENSION_ID)}` &&
+      JSON.parse(serializedRows)[0]?.mode === "active"
+    ) {
+      beforeActiveRecoveryWrite();
+    }
     if (
       beforeInactiveCoordinationWrite &&
       table === `personal_extension_coordination/${encodeShardKey(EXTENSION_ID)}` &&
@@ -428,7 +436,10 @@ function adminHeaders(secret?: string) {
   };
 }
 
-function adminUrl(action: "activate" | "deactivate" | "recover-blocked", extensionId: string = EXTENSION_ID) {
+function adminUrl(
+  action: "activate" | "deactivate" | "recover-blocked" | "recover-and-resume",
+  extensionId: string = EXTENSION_ID,
+) {
   return `/api/personal-extensions/${extensionId}/coordination/admin/${action}`;
 }
 
@@ -1952,6 +1963,177 @@ try {
   });
   assert.equal(vectorizeDeactivated.statusCode, 200, vectorizeDeactivated.body);
 
+  // An open tab must never see an inactive legacy-write window. Exercise the
+  // actual administrator route, storage barriers and queued legacy writer.
+  for (const kind of ["vectorize", "mutation"] as const) {
+    const fixture = await interruptedVectorizeFixture();
+    if (kind === "mutation") {
+      fixture.journals[0]!.operationKind = "mutation";
+      fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime = {
+        ...fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime,
+        semanticStatus: "pending",
+        pendingEmbeddingProfile: embedding,
+        manualRecoveryReasons: ["mutation-ambiguous", "vectorization-pending"],
+      };
+    }
+    await seedInterruptedVectorize(fixture);
+    const before = await interruptedVectorizeState();
+    const diskBefore = interruptedVectorizeDiskState();
+    const eventCount = publishedAdminDrafts.length;
+    for (const headers of [adminHeaders(), adminHeaders("wrong-secret")]) {
+      const denied = await app.inject({ method: "POST", url: adminUrl("recover-and-resume"), headers, payload: {} });
+      assert.equal(denied.statusCode, 403);
+      assert.deepEqual(await interruptedVectorizeState(), before);
+    }
+    const malformed = await app.inject({
+      method: "POST",
+      url: adminUrl("recover-and-resume"),
+      headers: adminHeaders(exactSecret),
+      payload: { force: true },
+    });
+    assert.equal(malformed.statusCode, 400);
+    assert.deepEqual(await interruptedVectorizeState(), before);
+    failStrictWrite = true;
+    const failed = await app.inject({
+      method: "POST",
+      url: adminUrl("recover-and-resume"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(failed.statusCode, 503);
+    assert.deepEqual(await interruptedVectorizeState(), before);
+    assert.deepEqual(interruptedVectorizeDiskState(), diskBefore);
+    assert.equal(publishedAdminDrafts.length, eventCount);
+
+    let observedBlockedBarrier = false;
+    beforeActiveRecoveryWrite = () => {
+      beforeActiveRecoveryWrite = null;
+      const disk = interruptedVectorizeDiskState();
+      assert.equal(disk.row[0].mode, "blocked");
+      assert.equal(disk.journal, null, "retire journal durably before publishing active authority");
+      observedBlockedBarrier = true;
+      throw new Error("simulated active recovery barrier failure");
+    };
+    const failedActive = await app.inject({
+      method: "POST",
+      url: adminUrl("recover-and-resume"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(failedActive.statusCode, 503);
+    assert.ok(observedBlockedBarrier);
+    assert.deepEqual(await interruptedVectorizeState(), before);
+    assert.deepEqual(interruptedVectorizeDiskState(), diskBefore);
+    assert.equal(publishedAdminDrafts.length, eventCount);
+
+    let legacyWrote = false;
+    let queuedLegacy: Promise<void> | undefined;
+    beforeActiveRecoveryWrite = () => {
+      beforeActiveRecoveryWrite = null;
+      queuedLegacy = assert.rejects(
+        coordination.runLegacyInactiveMutation(EXTENSION_ID, async () => {
+          legacyWrote = true;
+        }),
+        (error: unknown) =>
+          error instanceof PersonalExtensionCoordinationKernelError && error.code === "coordination-required",
+      );
+    };
+    const resumed = await app.inject({
+      method: "POST",
+      url: adminUrl("recover-and-resume"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(resumed.statusCode, 200, resumed.body);
+    assert.ok(queuedLegacy, "queued open-tab legacy writer must actually run");
+    await queuedLegacy;
+    assert.equal(legacyWrote, false);
+    const after = await interruptedVectorizeState();
+    assert.equal(after.row?.mode, "active");
+    assert.equal(after.row?.fence, before.row!.fence + 1);
+    assert.equal(after.row?.configRevision, before.row!.configRevision + 1);
+    assert.equal(after.row?.leaseTokenDigest, null);
+    await assert.rejects(
+      coordination.beginOperation({ ...vectorizeAuthority, kind: "mutation", targetEnsembleId: ENSEMBLE_ID }),
+      (error: unknown) => error instanceof PersonalExtensionCoordinationKernelError,
+      "old open-tab authority must remain invalid after recovery",
+    );
+    assert.equal(after.journals.length, 0);
+    assert.equal(publishedAdminDrafts.length, eventCount + 1);
+    for (const key of ["book", "entries", "otherBook", "otherEntries", "chats", "characters"] as const)
+      assert.deepEqual(after[key], before[key]);
+    if (kind === "mutation") assert.deepEqual(after.settings, before.settings);
+    const repeated = await app.inject({
+      method: "POST",
+      url: adminUrl("recover-and-resume"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(repeated.statusCode, 409);
+    assert.deepEqual(await interruptedVectorizeState(), after);
+    // A still-open current client can reacquire normally without a tab reload.
+    const lease = await coordination.acquireLease({
+      extensionId: EXTENSION_ID,
+      holderSessionId: "open-tab",
+      serverBootId: resumed.json().serverBootId,
+      contentHash: extension.contentHash,
+    });
+    const authority = {
+      extensionId: EXTENSION_ID,
+      holderSessionId: "open-tab",
+      serverBootId: lease.serverBootId,
+      contentHash: lease.contentHash,
+      fence: lease.fence,
+      leaseToken: lease.leaseToken,
+    };
+    const operation = await coordination.beginOperation({
+      ...authority,
+      kind: "vectorize",
+      targetEnsembleId: ENSEMBLE_ID,
+    });
+    await coordination.endOperation({
+      ...authority,
+      operationHandle: operation.operationHandle,
+      disposition: "aborted",
+    });
+    await coordination.releaseLease(authority);
+    await coordination.deactivateCoordination(EXTENSION_ID);
+  }
+
+  // A marker-current mutation can pass recovery proof but still fail the
+  // stricter activation contract (autoSync was disabled). Keep it blocked.
+  const unsafeResume = await interruptedVectorizeFixture();
+  unsafeResume.journals[0]!.operationKind = "mutation";
+  unsafeResume.stored.convoMemoryBridgeV1.ensembles[0]!.autoSync = false;
+  unsafeResume.stored.convoMemoryBridgeV1.ensembles[0]!.runtime = {
+    ...unsafeResume.stored.convoMemoryBridgeV1.ensembles[0]!.runtime,
+    semanticStatus: "pending",
+    pendingEmbeddingProfile: embedding,
+    manualRecoveryReasons: ["mutation-ambiguous", "vectorization-pending"],
+  };
+  await seedInterruptedVectorize(unsafeResume);
+  const unsafeBefore = await interruptedVectorizeState();
+  const unsafeEvents = publishedAdminDrafts.length;
+  const unsafeResult = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-and-resume"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(unsafeResult.statusCode, 409, unsafeResult.body);
+  assert.equal(unsafeResult.json().code, "coordination-validation-failed");
+  assert.deepEqual(await interruptedVectorizeState(), unsafeBefore);
+  assert.equal(publishedAdminDrafts.length, unsafeEvents);
+  // The old repair-only API is intentionally still available for diagnosis.
+  const repairOnly = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-blocked"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(repairOnly.statusCode, 200, repairOnly.body);
+  assert.equal(repairOnly.json().mode, "inactive");
+
   for (const oldJournalPresent of [true, false]) {
     const fixture = await interruptedVectorizeFixture();
     fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime = {
@@ -2002,6 +2184,48 @@ try {
       payload: {},
     });
     assert.equal(deactivatePrefix.statusCode, 200, deactivatePrefix.body);
+  }
+
+  // Simulate a process crash, not an exception rollback: pending storage was
+  // persisted, but authority is still blocked at the old storage revision.
+  for (const journalPresent of [true, false]) {
+    const prefix = await interruptedVectorizeFixture();
+    prefix.stored.convoMemoryBridgeV1.ensembles[0]!.runtime = {
+      ...prefix.stored.convoMemoryBridgeV1.ensembles[0]!.runtime,
+      semanticStatus: "pending",
+      pendingEmbeddingProfile: embedding,
+      manualRecoveryReasons: ["mutation-ambiguous", "vectorization-pending"],
+    };
+    if (!journalPresent) prefix.journals = [];
+    await seedInterruptedVectorize(prefix);
+    const before = await interruptedVectorizeState();
+    const resumed = await app.inject({
+      method: "POST",
+      url: adminUrl("recover-and-resume"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(resumed.statusCode, 200, resumed.body);
+    const after = await interruptedVectorizeState();
+    assert.equal(after.row?.mode, "active");
+    assert.equal(
+      after.row?.configRevision,
+      before.row!.configRevision + 1,
+      "crash-prefix retry must invalidate old client storage revisions",
+    );
+    const beforeRegistry = JSON.parse(before.row!.protectedLorebookRegistry);
+    assert.deepEqual(JSON.parse(after.row!.protectedLorebookRegistry), {
+      ...beforeRegistry,
+      extensionStorage: { resourceRevision: before.row!.configRevision + 1 },
+    });
+    assert.equal(after.journals.length, 0);
+    assert.deepEqual(after.settings, before.settings);
+    for (const key of ["book", "entries", "otherBook", "otherEntries"] as const)
+      assert.deepEqual(after[key], before[key]);
+    const disk = interruptedVectorizeDiskState();
+    assert.equal(disk.row[0].mode, "active");
+    assert.equal(disk.row[0].configRevision, after.row?.configRevision);
+    await coordination.deactivateCoordination(EXTENSION_ID);
   }
 
   const invalidVectorizeFixtures: Array<

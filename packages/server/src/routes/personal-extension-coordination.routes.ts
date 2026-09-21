@@ -138,7 +138,7 @@ export async function personalExtensionCoordinationRoutes(
   });
 
   const adminTransition = (
-    action: "activate" | "deactivate" | "recover-blocked",
+    action: "activate" | "deactivate" | "recover-blocked" | "recover-and-resume",
     transition: (extensionId: string) => Promise<unknown>,
   ) => {
     app.post<{ Params: { id: string }; Body: unknown }>(`/:id/coordination/admin/${action}`, async (request, reply) => {
@@ -156,6 +156,7 @@ export async function personalExtensionCoordinationRoutes(
   adminTransition("activate", (id) => service.activateCoordination(id));
   adminTransition("deactivate", (id) => service.deactivateCoordination(id));
   adminTransition("recover-blocked", (id) => service.recoverBlockedCoordination(id));
+  adminTransition("recover-and-resume", (id) => service.recoverAndResumeCoordination(id));
 
   app.post<{ Params: { id: string }; Body: unknown }>(
     "/:id/coordination/admin/retire-detached-lorebook",

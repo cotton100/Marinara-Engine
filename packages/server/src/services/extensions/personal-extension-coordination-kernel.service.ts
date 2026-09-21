@@ -1947,6 +1947,7 @@ export function createPersonalExtensionCoordinationKernel(
     validate: (tx: DB, row: PersonalExtensionCoordinationRow) => Promise<PersonalExtensionAdminValidationResult>,
     proveBlockedJournalRecovery?: PersonalExtensionBlockedJournalRecoveryProof,
     prepareRecovery?: PersonalExtensionBlockedRecoveryPreparation,
+    validateResume?: (tx: DB, recovered: PersonalExtensionAdminValidationResult) => Promise<void>,
   ) => {
     requireIdentifier(extensionId);
     if (typeof validate !== "function") throw kernelError("invalid-request");
@@ -1954,6 +1955,7 @@ export function createPersonalExtensionCoordinationKernel(
       throw kernelError("invalid-request");
     }
     if (prepareRecovery !== undefined && typeof prepareRecovery !== "function") throw kernelError("invalid-request");
+    if (validateResume !== undefined && typeof validateResume !== "function") throw kernelError("invalid-request");
     return runStrictMutation(
       extensionId,
       async (tx) => {
@@ -1975,7 +1977,18 @@ export function createPersonalExtensionCoordinationKernel(
         // Preparation runs only after every journal is proven closable, inside
         // the same strict transaction. It may queue work, never claim success.
         const prepared = await prepareRecovery?.(tx, row, journals);
-        const recovered = prepared ?? validated;
+        // Every resume invalidates open-client storage revisions, including a
+        // crash prefix that already persisted pending storage/journal retirement
+        // but still has the old blocked row. Preparation already advances once.
+        const resumeRevision = validateResume ? nextFence(row.configRevision) : validated.configRevision;
+        const recovered = prepared ?? {
+          ...validated,
+          configRevision: resumeRevision,
+          registry: {
+            ...validated.registry,
+            extensionStorage: { resourceRevision: resumeRevision },
+          },
+        };
         if (
           prepared &&
           (prepared.contentHash !== validated.contentHash ||
@@ -1985,7 +1998,8 @@ export function createPersonalExtensionCoordinationKernel(
         ) {
           throw kernelError("coordination-validation-failed");
         }
-        if (prepared) {
+        if (validateResume) await validateResume(tx, recovered);
+        if (prepared || validateResume) {
           // File-native commits are not multi-file atomic. Persist the pending
           // handoff and journal retirement while coordination is STILL blocked
           // at its old revision. Every crash prefix can then retry recovery:
@@ -1997,7 +2011,7 @@ export function createPersonalExtensionCoordinationKernel(
         await tx
           .update(personalExtensionCoordination)
           .set({
-            mode: "inactive",
+            mode: validateResume ? "active" : "inactive",
             serverBootId,
             fence,
             leaseTokenDigest: null,
@@ -2014,7 +2028,7 @@ export function createPersonalExtensionCoordinationKernel(
           .where(eq(personalExtensionCoordination.extensionId, extensionId));
         return {
           extensionId,
-          mode: "inactive" as const,
+          mode: validateResume ? ("active" as const) : ("inactive" as const),
           serverBootId,
           contentHash: row.contentHash,
           fence,

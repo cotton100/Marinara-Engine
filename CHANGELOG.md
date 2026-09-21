@@ -4,6 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- Administrators can recover and resume a safely recoverable blocked CMB without closing browser tabs; recovery keeps writes fenced until activation validation and durable journal retirement finish.
+
 ## [2.4.6]
 
 - Shutdown regression checks use persisted cleanup results after terminal exit, avoiding false failures when a closed terminal discards its final log output (#6245).

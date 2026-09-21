@@ -1042,7 +1042,7 @@ export function createPersonalExtensionCoordinationAdminService(
       return kernel.deactivateCoordination(extensionId);
     },
 
-    recoverBlockedCoordination(extensionId: string) {
+    recoverBlockedCoordination(extensionId: string, resume = false) {
       return kernel.recoverBlockedCoordination(
         extensionId,
         async (tx, row) => {
@@ -1066,6 +1066,23 @@ export function createPersonalExtensionCoordinationAdminService(
         },
         proveCmbBlockedJournalRecovery,
         prepareInterruptedCmbVectorization,
+        resume
+          ? async (tx, recovered) => {
+              // Stay blocked under the kernel lock through recovery AND the
+              // activation checks. Never expose the legacy-write inactive gap.
+              const extension = await requireApprovedFullPageExtension(tx, extensionId);
+              const fresh = await readCmbStorageSnapshot(tx, extensionId);
+              if (
+                extension.contentHash !== recovered.contentHash ||
+                fresh.rawStorageValue !== recovered.rawStorageValue
+              ) {
+                throw validationError();
+              }
+              // The kernel proves the next revision; the blocked row still
+              // carries the old revision until the final authority barrier.
+              await validateCmbResources(tx, fresh.config, recovered.registry, true);
+            }
+          : undefined,
       );
     },
 

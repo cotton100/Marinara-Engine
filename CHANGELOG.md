@@ -4,6 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- Opt-in CMB autonomous messages retain the newest five visible shared messages even after those messages are saved to memory, so semantic retrieval cannot silently replace recent context with older memories.
+
 - Administrators can recover and resume a safely recoverable blocked CMB without closing browser tabs; recovery keeps writes fenced until activation validation and durable journal retirement finish.
 
 ## [2.4.6]

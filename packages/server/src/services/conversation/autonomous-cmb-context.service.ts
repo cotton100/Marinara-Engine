@@ -13,7 +13,6 @@ import {
   characters,
   chats,
   installedExtensions,
-  lorebookEntries,
   messages,
   personalExtensionCoordination,
   personas,
@@ -37,14 +36,12 @@ const MAX_ENSEMBLES = 32;
 const MAX_MEMBERS_PER_ENSEMBLE = 32;
 const MAX_GROUP_SOURCES_PER_ENSEMBLE = 12;
 const MAX_MAPPED_SOURCES = MAX_GROUP_SOURCES_PER_ENSEMBLE + 1;
-const MAX_MANAGED_CMB_ENTRIES_PER_ENSEMBLE = 2048;
 const MAX_OUTPUT_MESSAGES = 5;
 const MAX_MESSAGE_CHARS = 2_000;
 const MAX_CONTEXT_CHARS = 12_000;
 const MAX_ID_CHARS = 256;
 const MAX_NAME_CHARS = 200;
 const DEFAULT_TIMEOUT_MS = 750;
-const MANAGED_CMB_ENTRY_TAG = "convo-memory-bridge";
 
 const CAST_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu;
@@ -102,16 +99,6 @@ type RecentMessage = {
   content: string;
   extra: string;
   createdAt: string;
-};
-
-type ManagedCmbEntry = {
-  id: string;
-  enabled: string;
-  characterFilterMode: string;
-  characterFilterIds: string;
-  excludeFromVectorization: string;
-  embeddingSpaceId: string | null;
-  dynamicState: string;
 };
 
 type AutonomousCmbPendingContextInput = {
@@ -307,94 +294,6 @@ function sameStringSet(left: string[], right: string[]): boolean {
   );
 }
 
-function parseLiveNativeBoundary(
-  value: unknown,
-  ensembleId: string,
-  chatId: string,
-  chatRole: "rp" | "group",
-): string | null {
-  if (!isRecord(value)) return null;
-  const bridge = isRecord(value.convoMemoryBridge) ? value.convoMemoryBridge : null;
-  if (
-    bridge === null ||
-    bridge.schemaVersion !== CMB_SCHEMA_VERSION ||
-    bridge.ensembleId !== ensembleId ||
-    (Object.hasOwn(bridge, "sourceStatus") && bridge.sourceStatus !== null)
-  ) {
-    return null;
-  }
-  const source = isRecord(bridge.source) ? bridge.source : null;
-  if (
-    source === null ||
-    source.kind !== "native-memory-chunk" ||
-    !canonicalIsoTimestamp(source.firstMessageAt) ||
-    !canonicalIsoTimestamp(source.lastMessageAt) ||
-    source.firstMessageAt > source.lastMessageAt ||
-    !Array.isArray(source.occurrences)
-  ) {
-    return null;
-  }
-  if (source.occurrences.length === 0 || source.occurrences.length > MAX_MAPPED_SOURCES) return null;
-  const occurrenceKeys = new Set<string>();
-  for (const occurrence of source.occurrences) {
-    if (!isRecord(occurrence)) return null;
-    const occurrenceChatId = stableString(occurrence.chatId);
-    const occurrenceChunkId = stableString(occurrence.chunkId);
-    const locatorFingerprint = stableString(occurrence.locatorFingerprint);
-    if (
-      occurrenceChatId === null ||
-      occurrenceChunkId === null ||
-      locatorFingerprint === null ||
-      (occurrence.chatRole !== "rp" && occurrence.chatRole !== "group" && occurrence.chatRole !== "dm")
-    ) {
-      return null;
-    }
-    const occurrenceKey = JSON.stringify([occurrenceChatId, occurrenceChunkId]);
-    if (occurrenceKeys.has(occurrenceKey)) return null;
-    occurrenceKeys.add(occurrenceKey);
-    // The source timestamps belong to the canonical memory, not to each
-    // occurrence. They are a safe per-chat boundary only when every
-    // occurrence came from this exact mapped source. Cross-chat duplicate
-    // memories deliberately fall back to a small duplicate raw tail rather
-    // than risk suppressing newer messages with another chat's timestamp.
-    if (occurrenceChatId !== chatId || occurrence.chatRole !== chatRole) return null;
-  }
-  return source.lastMessageAt;
-}
-
-function latestManagedCmbBoundary(
-  entries: ManagedCmbEntry[],
-  ensembleId: string,
-  chatId: string,
-  chatRole: "rp" | "group",
-  targetCharacterId: string,
-): string | null {
-  let latest: string | null = null;
-  for (const entry of entries) {
-    const characterFilterIds = parseStableStringArray(entry.characterFilterIds, MAX_MEMBERS_PER_ENSEMBLE);
-    if (
-      entry.enabled !== "true" ||
-      entry.characterFilterMode !== "include" ||
-      characterFilterIds === null ||
-      !characterFilterIds.includes(targetCharacterId) ||
-      entry.excludeFromVectorization !== "false" ||
-      stableString(entry.embeddingSpaceId) === null
-    ) {
-      continue;
-    }
-    let dynamicState: unknown;
-    try {
-      dynamicState = JSON.parse(entry.dynamicState) as unknown;
-    } catch {
-      continue;
-    }
-    const boundary = parseLiveNativeBoundary(dynamicState, ensembleId, chatId, chatRole);
-    if (boundary === null) continue;
-    if (latest === null || Date.parse(boundary) > Date.parse(latest)) latest = boundary;
-  }
-  return latest;
-}
-
 function validateRecentMessages(rows: RecentMessage[], chatId: string): boolean {
   const ids = new Set<string>();
   let previousCreatedAt: string | null = null;
@@ -414,26 +313,6 @@ function validateRecentMessages(rows: RecentMessage[], chatId: string): boolean 
     }
     ids.add(row.id);
     previousCreatedAt = row.createdAt;
-  }
-  return true;
-}
-
-function validateManagedCmbEntries(rows: ManagedCmbEntry[]): boolean {
-  const ids = new Set<string>();
-  for (const row of rows) {
-    if (
-      stableString(row.id) === null ||
-      ids.has(row.id) ||
-      typeof row.enabled !== "string" ||
-      typeof row.characterFilterMode !== "string" ||
-      typeof row.characterFilterIds !== "string" ||
-      typeof row.excludeFromVectorization !== "string" ||
-      (row.embeddingSpaceId !== null && typeof row.embeddingSpaceId !== "string") ||
-      typeof row.dynamicState !== "string"
-    ) {
-      return false;
-    }
-    ids.add(row.id);
   }
   return true;
 }
@@ -468,7 +347,7 @@ function renderPendingContext(
   wrapFormat: WrapFormat,
 ): string {
   const introduction =
-    "These are the newest shared messages from linked Convo Memory Bridge chats that are not yet confirmed in saved CMB memory. Treat them as recent shared context for this autonomous message, not as messages from the current conversation.";
+    "These are the newest shared messages from linked Convo Memory Bridge chats, including messages already saved in CMB memory. Respect their timestamps; they are shared context for this autonomous message, not new messages in the current conversation.";
   const sourceOrder = [...new Set(messagesToRender.map((message) => message.sourceIndex))];
   const blocks: string[] = [];
 
@@ -498,9 +377,6 @@ function renderPendingContext(
 async function readPendingSourceMessages(
   db: DB,
   descriptor: SourceDescriptor,
-  managedEntries: ManagedCmbEntry[],
-  ensembleId: string,
-  chatRole: "rp" | "group",
   targetCharacterId: string,
   allowedCharacterIds: ReadonlySet<string>,
   userName: string,
@@ -522,19 +398,10 @@ async function readPendingSourceMessages(
   recentRows.reverse();
   if (!validateRecentMessages(recentRows, descriptor.chat.id)) return null;
 
-  // The managed CMB lorebook metadata is the bridge's durable reflection ledger:
-  // source-chat memory chunks are merely native candidates, while these entries
-  // prove CMB has already materialized the chunk into the shared book.
-  const boundary = latestManagedCmbBoundary(
-    managedEntries,
-    ensembleId,
-    descriptor.chat.id,
-    chatRole,
-    targetCharacterId,
-  );
-  const unmaterialized = boundary === null ? recentRows : recentRows.filter((message) => message.createdAt > boundary);
   const pending: PendingMessage[] = [];
-  for (const message of unmaterialized.slice().reverse()) {
+  // Saved memory is not necessarily selected by semantic retrieval. Always
+  // include a bounded recent visible tail, independent of CMB sync progress.
+  for (const message of recentRows.slice().reverse()) {
     const hidden = isHiddenFromTarget(message.extra, targetCharacterId);
     if (hidden === null) return null;
     if (
@@ -699,23 +566,6 @@ async function buildAutonomousCmbPendingContextInner({
   }
   if (sourceDescriptors.length === 0) return null;
 
-  const managedEntries = (await db
-    .select({
-      id: lorebookEntries.id,
-      enabled: lorebookEntries.enabled,
-      characterFilterMode: lorebookEntries.characterFilterMode,
-      characterFilterIds: lorebookEntries.characterFilterIds,
-      excludeFromVectorization: lorebookEntries.excludeFromVectorization,
-      embeddingSpaceId: lorebookEntries.embeddingSpaceId,
-      dynamicState: lorebookEntries.dynamicState,
-    })
-    .from(lorebookEntries)
-    .where(and(eq(lorebookEntries.lorebookId, ensemble.lorebookId), eq(lorebookEntries.tag, MANAGED_CMB_ENTRY_TAG)))
-    .limit(MAX_MANAGED_CMB_ENTRIES_PER_ENSEMBLE + 1)) as ManagedCmbEntry[];
-  if (managedEntries.length > MAX_MANAGED_CMB_ENTRIES_PER_ENSEMBLE || !validateManagedCmbEntries(managedEntries)) {
-    return null;
-  }
-
   const characterRows = await db
     .select({ id: characters.id, data: characters.data })
     .from(characters)
@@ -773,9 +623,6 @@ async function buildAutonomousCmbPendingContextInner({
     const sourceMessages = await readPendingSourceMessages(
       db,
       descriptor,
-      managedEntries,
-      ensemble.ensembleId,
-      descriptor.chatRole,
       targetCharacterId,
       allowedCharacterIds,
       userName,
@@ -798,7 +645,7 @@ async function buildAutonomousCmbPendingContextInner({
 }
 
 /**
- * Read-only, best-effort bridge for autonomous Conversation generation. Any missing,
+ * Read-only, best-effort recent-context bridge for autonomous Conversation generation. Any missing,
  * ambiguous, oversized, or malformed CMB state deliberately degrades to the
  * existing prompt by returning null.
  */

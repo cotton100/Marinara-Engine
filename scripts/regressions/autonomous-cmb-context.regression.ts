@@ -622,9 +622,9 @@ try {
     },
   ]);
 
-  // Exactly five messages must not disappear merely because Marinara native
-  // memory may later form one logical chunk: until CMB writes a managed
-  // lorebook entry, there is no durable bridge reflection to dedupe against.
+  // Recent context must survive the transition from unsaved messages to a
+  // managed CMB memory. Materialization does not prove semantic retrieval
+  // will select that memory for the next autonomous prompt.
   await clearManagedEntries();
   await setMessages(
     RP_CHAT_ID,
@@ -645,12 +645,16 @@ try {
   );
   const exactFive = await build();
   assert.ok(exactFive, "an exact five-message writerless tail must be available to autonomous generation");
+  assert.match(exactFive, /including messages already saved in CMB memory/u);
   for (let index = 1; index <= 5; index += 1) assert.match(exactFive, new RegExp(`exact-five-${index}\\b`, "u"));
   assert.deepEqual(
     Object.fromEntries(tableNames.map((tableName) => [tableName, db._fileStore.getTableWriteGeneration(tableName)])),
     generationsBefore,
     "the high-level service must not mutate any table it reads",
   );
+  await addManagedNativeEntry(RP_CHAT_ID, "rp", 1, 5);
+  assert.equal(await build(), exactFive, "saving all five messages must not remove the recent shared context");
+  await clearManagedEntries();
 
   // More than five pending rows are bounded to the newest five overall.
   await setMessages(
@@ -662,8 +666,7 @@ try {
   assert.doesNotMatch(overFive, /over-five-[123]\b/u);
   for (let index = 4; index <= 8; index += 1) assert.match(overFive, new RegExp(`over-five-${index}\\b`, "u"));
 
-  // A verified, vectorized CMB managed-entry boundary excludes only the rows
-  // that are already available to this target through the shared lorebook.
+  // A partly materialized source keeps the same newest-five window too.
   await clearManagedEntries();
   await setMessages(
     RP_CHAT_ID,
@@ -672,9 +675,8 @@ try {
   await addManagedNativeEntry(RP_CHAT_ID, "rp", 1, 5);
   const anchored = await build();
   assert.ok(anchored);
-  assert.doesNotMatch(anchored, /anchored-[1-5]\b/u);
-  assert.match(anchored, /anchored-6\b/u);
-  assert.match(anchored, /anchored-7\b/u);
+  assert.doesNotMatch(anchored, /anchored-[12]\b/u);
+  for (let index = 3; index <= 7; index += 1) assert.match(anchored, new RegExp(`anchored-${index}\\b`, "u"));
 
   // A row that is not currently usable by this target must not suppress raw
   // tail context merely because it carries CMB-shaped metadata.
@@ -759,6 +761,9 @@ try {
     visible,
     /globally-hidden|target-hidden|command-hidden|must-not-cross-visibility|must-not-read-current-dm/u,
   );
+  await addManagedNativeEntry(RP_CHAT_ID, "rp", 1, 1);
+  await addManagedNativeEntry(GROUP_CHAT_ID, "group", 2, 6);
+  assert.equal(await build(), visible, "saved group/RP context must retain the same per-message visibility");
 
   // A mapped group Conversation may opt in too. Its current room is already in
   // normal history and must not be duplicated. Pending private DM text has not
@@ -796,6 +801,10 @@ try {
     groupForFriend,
     /current-group-history-must-not-repeat|target-private-dm-must-not-enter-group|friend-private-dm-must-not-enter-group/u,
   );
+  await addManagedNativeEntry(RP_CHAT_ID, "rp", 32, 32);
+  await addManagedNativeEntry(OTHER_GROUP_CHAT_ID, "group", 34, 35);
+  assert.equal(await buildForTarget(GROUP_CHAT_ID, TARGET_CHARACTER_ID), groupForTarget);
+  assert.equal(await buildForTarget(GROUP_CHAT_ID, FRIEND_CHARACTER_ID), groupForFriend);
   assert.equal(
     await buildForTarget(GROUP_CHAT_ID, "unmapped-character"),
     null,

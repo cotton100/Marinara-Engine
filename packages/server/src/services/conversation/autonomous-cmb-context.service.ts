@@ -42,6 +42,9 @@ const MAX_CONTEXT_CHARS = 12_000;
 const MAX_ID_CHARS = 256;
 const MAX_NAME_CHARS = 200;
 const DEFAULT_TIMEOUT_MS = 750;
+// Optional recent-context reads must not pile up behind a slow storage read.
+// Keep the slot until the underlying work settles, not just until its caller times out.
+const activeReads = new WeakSet<DB>();
 
 const CAST_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu;
@@ -427,13 +430,10 @@ async function readPendingSourceMessages(
   return pending.reverse();
 }
 
-async function buildAutonomousCmbPendingContextInner({
-  db,
-  targetChatId,
-  targetCharacterId,
-  timeZone,
-  wrapFormat = "xml",
-}: AutonomousCmbPendingContextInput): Promise<string | null> {
+async function buildAutonomousCmbPendingContextInner(
+  { db, targetChatId, targetCharacterId, timeZone, wrapFormat = "xml" }: AutonomousCmbPendingContextInput,
+  expired: () => boolean,
+): Promise<string | null> {
   if (
     stableString(targetChatId) === null ||
     stableString(targetCharacterId) === null ||
@@ -453,7 +453,7 @@ async function buildAutonomousCmbPendingContextInner({
       ),
     )
     .limit(MAX_MATCHING_EXTENSION_ROWS + 1);
-  if (extensionRows.length > MAX_MATCHING_EXTENSION_ROWS) return null;
+  if (expired() || extensionRows.length > MAX_MATCHING_EXTENSION_ROWS) return null;
   const extensions = extensionRows.filter(isApprovedClientCmb);
   const extension = extensions[0];
   if (extensions.length !== 1 || !extension) return null;
@@ -467,6 +467,7 @@ async function buildAutonomousCmbPendingContextInner({
     .where(eq(personalExtensionCoordination.extensionId, extension.id))
     .limit(2);
   if (
+    expired() ||
     coordinationRows.length !== 1 ||
     coordinationRows[0]!.mode !== "active" ||
     coordinationRows[0]!.contentHash !== extension.contentHash
@@ -479,7 +480,8 @@ async function buildAutonomousCmbPendingContextInner({
     .from(appSettings)
     .where(eq(appSettings.key, `${EXTENSION_STORAGE_PREFIX}${extension.id}`))
     .limit(2);
-  if (storageRows.length !== 1 || Buffer.byteLength(storageRows[0]!.value, "utf8") > MAX_CONFIG_BYTES) return null;
+  if (expired() || storageRows.length !== 1 || Buffer.byteLength(storageRows[0]!.value, "utf8") > MAX_CONFIG_BYTES)
+    return null;
   let storageValue: unknown;
   try {
     storageValue = JSON.parse(storageRows[0]!.value) as unknown;
@@ -528,6 +530,7 @@ async function buildAutonomousCmbPendingContextInner({
     })
     .from(chats)
     .where(inArray(chats.id, requestedChatIds))) as ChatRow[];
+  if (expired()) return null;
   const chatById = new Map(chatRows.map((chat) => [chat.id, chat]));
   if (chatById.size !== requestedChatIds.length) return null;
 
@@ -570,7 +573,7 @@ async function buildAutonomousCmbPendingContextInner({
     .select({ id: characters.id, data: characters.data })
     .from(characters)
     .where(inArray(characters.id, memberCharacterIds));
-  if (characterRows.length !== memberCharacterIds.length) return null;
+  if (expired() || characterRows.length !== memberCharacterIds.length) return null;
   const characterNames = new Map<string, string>();
   for (const row of characterRows) {
     const name = parseCharacterName(row.data);
@@ -592,6 +595,7 @@ async function buildAutonomousCmbPendingContextInner({
           .select({ id: personas.id, name: personas.name })
           .from(personas)
           .where(inArray(personas.id, explicitPersonaIds));
+  if (expired()) return null;
   const personaNames = new Map<string, string>();
   for (const row of explicitPersonaRows) {
     const name = stableString(row.name, MAX_NAME_CHARS);
@@ -609,13 +613,14 @@ async function buildAutonomousCmbPendingContextInner({
         .where(eq(personas.isActive, "true"))
         .limit(2)
     : [];
-  if (activePersonaRows.length > 1) return null;
+  if (expired() || activePersonaRows.length > 1) return null;
   const activePersonaName = activePersonaRows[0] ? stableString(activePersonaRows[0].name, MAX_NAME_CHARS) : null;
   if (activePersonaRows.length === 1 && activePersonaName === null) return null;
 
   const allowedCharacterIds = new Set(memberCharacterIds);
   const pendingMessages: PendingMessage[] = [];
   for (const descriptor of sourceDescriptors) {
+    if (expired()) return null;
     const userName =
       (descriptor.chat.personaId ? personaNames.get(descriptor.chat.personaId) : undefined) ??
       (descriptor.chat.mode === "conversation" ? activePersonaName : null) ??
@@ -627,7 +632,7 @@ async function buildAutonomousCmbPendingContextInner({
       allowedCharacterIds,
       userName,
     );
-    if (sourceMessages === null) return null;
+    if (expired() || sourceMessages === null) return null;
     pendingMessages.push(...sourceMessages);
   }
   if (pendingMessages.length === 0) return null;
@@ -652,12 +657,19 @@ async function buildAutonomousCmbPendingContextInner({
 export async function buildAutonomousCmbPendingContext(
   input: AutonomousCmbPendingContextInput,
 ): Promise<string | null> {
+  // No queue or cached prompt body: a concurrent caller uses the ordinary
+  // memory path instead of retaining another task and its message arrays.
+  if (activeReads.has(input.db)) return null;
   const requestedTimeout = input.timeoutMs;
   const timeoutMs =
     typeof requestedTimeout === "number" && Number.isFinite(requestedTimeout) && requestedTimeout > 0
       ? Math.min(DEFAULT_TIMEOUT_MS, Math.max(1, Math.floor(requestedTimeout)))
       : DEFAULT_TIMEOUT_MS;
-  const work = buildAutonomousCmbPendingContextInner(input).catch(() => null);
+  const deadline = performance.now() + timeoutMs;
+  activeReads.add(input.db);
+  const work = buildAutonomousCmbPendingContextInner(input, () => performance.now() >= deadline)
+    .catch(() => null)
+    .finally(() => activeReads.delete(input.db));
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([

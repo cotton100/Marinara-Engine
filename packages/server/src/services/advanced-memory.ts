@@ -563,7 +563,10 @@ export function createAdvancedMemoryService(db: DB) {
       ...(record.content ? { summaryWork: null } : {}),
     };
     const existingRow = (
-      await db.select().from(advancedMemoryRecords).where(eq(advancedMemoryRecords.id, record.id))
+      await db
+        .select()
+        .from(advancedMemoryRecords)
+        .where(and(eq(advancedMemoryRecords.chatId, ctx.chatId), eq(advancedMemoryRecords.id, record.id)))
     )[0];
     const existing = existingRow ? readStored(existingRow) : null;
     if (existing?.manualOverride && !record.manualOverride)
@@ -624,7 +627,10 @@ export function createAdvancedMemoryService(db: DB) {
     cacheOwner: StoredRecord,
   ): Promise<string> {
     const cachedRow = (
-      await db.select().from(advancedMemoryRecords).where(eq(advancedMemoryRecords.id, cacheOwner.id))
+      await db
+        .select()
+        .from(advancedMemoryRecords)
+        .where(and(eq(advancedMemoryRecords.chatId, ctx.chatId), eq(advancedMemoryRecords.id, cacheOwner.id)))
     )[0];
     const cacheRecord = cachedRow ? readStored(cachedRow) : null;
     const savedWork =

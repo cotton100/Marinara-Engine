@@ -16,6 +16,7 @@
 //   - the manifest reports the harvested messages total, not the resident
 //     fraction, and omits the other lazy tables' counts.
 import assert from "node:assert/strict";
+import { mock } from "node:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -656,6 +657,49 @@ const shardExists = (dir: string, table: string, key: string) =>
 
 const loadedUnitsOf = (db: Awaited<ReturnType<typeof createFileNativeDB>>) => db._fileStore.getResidentChatUnits();
 
+// Read-only browsing also reaches the normal safety timer, without a forced save.
+{
+  const dir = tempStorageDir();
+  const savedCap = process.env.MARINARA_MAX_RESIDENT_CHATS;
+  process.env.MARINARA_MAX_RESIDENT_CHATS = "2";
+  for (const chat of ["idle-a", "idle-b", "idle-c"]) {
+    writeShard(dir, "chats", chat, [chatRow(chat)]);
+    writeShard(dir, "messages", chat, [messageRow(`m-${chat}`, chat, chat)]);
+  }
+  mock.timers.enable({ apis: ["setInterval"] });
+  const db = await createFileNativeDB();
+  try {
+    await db._fileStore.flush();
+    for (const chat of ["idle-a", "idle-b", "idle-c"]) {
+      await db.select().from(messages).where(eq(messages.chatId, chat));
+    }
+    const idleUnits = () => [...loadedUnitsOf(db)].filter((id) => id.startsWith("idle-"));
+    assert.equal(idleUnits().length, 3);
+    const diskBefore = readFileSync(join(dir, "tables", "messages", `${encodeShardKey("idle-a")}.json`), "utf8");
+    mock.timers.tick(10_000);
+    assert.equal(idleUnits().length, 2, "idle safety flush must evict clean read-only units");
+    assert.equal(loadedUnitsOf(db).has("idle-a"), false);
+    assert.equal(readFileSync(join(dir, "tables", "messages", `${encodeShardKey("idle-a")}.json`), "utf8"), diskBefore);
+    assert.equal((await db.select().from(messages).where(eq(messages.chatId, "idle-a")))[0]?.content, "idle-a");
+    process.env.MARINARA_MAX_RESIDENT_CHATS = "0";
+    mock.timers.tick(10_000);
+    assert.equal(idleUnits().length, 3, "explicit zero keeps eviction disabled on idle ticks");
+    process.env.MARINARA_MAX_RESIDENT_CHATS = "2";
+    await db.transaction(async () => {
+      mock.timers.tick(10_000);
+      assert.equal(idleUnits().length, 3, "an active transaction prevents the idle sweep");
+    });
+    mock.timers.tick(10_000);
+    assert.equal(idleUnits().length, 2, "idle sweep resumes outside the transaction");
+  } finally {
+    await db._fileStore.close();
+    mock.timers.reset();
+    if (savedCap === undefined) delete process.env.MARINARA_MAX_RESIDENT_CHATS;
+    else process.env.MARINARA_MAX_RESIDENT_CHATS = savedCap;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ── Cap enforcement, LRU order, and reload correctness ──
 
 {
@@ -1091,26 +1135,30 @@ const loadedUnitsOf = (db: Awaited<ReturnType<typeof createFileNativeDB>>) => db
 
   // The wiring that turns detection into the 8 is observed functionally
   // through the exported test seam - not just source-pinned.
-  assert.equal(platformDefaultMaxResidentChatUnits(true), 8);
-  assert.equal(platformDefaultMaxResidentChatUnits(false), 0);
+  assert.equal(platformDefaultMaxResidentChatUnits(true, 0), 8);
+  assert.equal(platformDefaultMaxResidentChatUnits(false, 0), 0);
+  for (const bytes of [1, 2.5 * 1024 ** 3, 4 * 1024 ** 3]) {
+    assert.equal(platformDefaultMaxResidentChatUnits(false, bytes), 8);
+  }
+  for (const bytes of [-1, Number.NaN, Number.POSITIVE_INFINITY, 4 * 1024 ** 3 + 1]) {
+    assert.equal(platformDefaultMaxResidentChatUnits(false, bytes), 0);
+  }
 
-  // getMaxResidentChatUnits, platform-aware so this block is honest wherever
-  // it runs: on an ordinary dev box or CI the platform default is 0; on a
-  // real Steam Deck (or Termux) it is 8, and the assertions then observe the
-  // constrained default through the full production path. The floor of 2 and
-  // the explicit-0 opt-out are platform-independent.
-  const platformDefault = platformDefaultMaxResidentChatUnits();
+  // Exercise detected limits through the production getter as well as the
+  // pure seam. Explicit settings, including zero, still win on constrained hosts.
   const savedCap = process.env.MARINARA_MAX_RESIDENT_CHATS;
+  const limitMock = mock.method(process, "constrainedMemory", () => 2.5 * 1024 ** 3);
   try {
     delete process.env.MARINARA_MAX_RESIDENT_CHATS;
-    assert.equal(getMaxResidentChatUnits(), platformDefault, "unset means the platform default");
+    assert.equal(getMaxResidentChatUnits(), 8, "OS memory limit enables the small-container default");
     process.env.MARINARA_MAX_RESIDENT_CHATS = "banana";
-    assert.equal(getMaxResidentChatUnits(), platformDefault, "an invalid value falls back to the platform default");
+    assert.equal(getMaxResidentChatUnits(), 8, "an invalid value falls back to the constrained default");
     process.env.MARINARA_MAX_RESIDENT_CHATS = "1";
     assert.equal(getMaxResidentChatUnits(), 2);
     process.env.MARINARA_MAX_RESIDENT_CHATS = "0";
     assert.equal(getMaxResidentChatUnits(), 0, "an explicit 0 disables eviction on every platform");
   } finally {
+    limitMock.mock.restore();
     if (savedCap === undefined) delete process.env.MARINARA_MAX_RESIDENT_CHATS;
     else process.env.MARINARA_MAX_RESIDENT_CHATS = savedCap;
   }

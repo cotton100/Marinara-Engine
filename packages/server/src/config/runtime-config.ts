@@ -557,15 +557,22 @@ function constrainedPlatformDetected(): boolean {
   return cachedSteamOsDetection;
 }
 
-/** The parameter is a test seam; production callers use the detected value. */
-export function platformDefaultMaxResidentChatUnits(constrained = constrainedPlatformDetected()): number {
-  return constrained ? CONSTRAINED_PLATFORM_DEFAULT_MAX_RESIDENT_CHATS : 0;
+/** Parameters are test seams; production callers use platform and OS memory limits. */
+export function platformDefaultMaxResidentChatUnits(
+  constrained = constrainedPlatformDetected(),
+  constrainedBytes = process.constrainedMemory(),
+): number {
+  // Match the existing low-memory platform policy for small memory-limited
+  // containers too. This caps resident units, not bytes or peak process RAM.
+  const smallMemoryLimit =
+    Number.isFinite(constrainedBytes) && constrainedBytes > 0 && constrainedBytes <= 4 * 1024 ** 3;
+  return constrained || smallMemoryLimit ? CONSTRAINED_PLATFORM_DEFAULT_MAX_RESIDENT_CHATS : 0;
 }
 
 /**
  * Resident chat-unit cap for the lazy file store (#5592 Phase 2 PR-B).
- * When unset or invalid, the platform default applies: 8 on SteamOS (#5838),
- * otherwise 0, which disables eviction entirely and preserves load-and-keep
+ * When unset or invalid, the platform default applies: 8 on SteamOS/Termux
+ * and OS memory limits up to 4 GiB, otherwise 0, which disables eviction and preserves load-and-keep
  * behavior. Read per sweep so .env hot reloads apply without a restart. The
  * floor of 2 keeps multi-chat operations (branching, cross-chat notes) from
  * thrashing their own working set.

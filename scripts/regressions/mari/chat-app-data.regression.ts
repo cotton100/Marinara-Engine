@@ -12,9 +12,9 @@ const dir = mkdtempSync(join(tmpdir(), "marinara-mari-chat-app-data-"));
 process.env.FILE_STORAGE_DIR = dir;
 
 try {
-  const db = await createFileNativeDB();
+  let db = await createFileNativeDB();
   try {
-    const chats = createChatsStorage(db);
+    let chats = createChatsStorage(db);
     const chat = await chats.create({
       name: "App data chat regression",
       mode: "roleplay",
@@ -25,14 +25,77 @@ try {
     await chats.createMessage({ chatId: chat.id, role: "assistant", content: "Second" });
     await chats.createMessage({ chatId: chat.id, role: "user", content: "Third" });
 
+    const sibling = await chats.create({ name: "Unrelated cold chat", mode: "roleplay", characterIds: [] });
+    await chats.createMessage({ chatId: sibling.id, role: "user", content: "Do not load this other room" });
+    await db._fileStore.close();
+    let afterChatRead: (() => Promise<void>) | undefined;
+    db = await createFileNativeDB({
+      afterTableRead: async (table) => {
+        if (table !== "chats" || !afterChatRead) return;
+        const callback = afterChatRead;
+        afterChatRead = undefined;
+        await callback();
+      },
+    });
+    chats = createChatsStorage(db);
+    const assertScopedRead = () => {
+      assert.equal(
+        db._fileStore.getFullyResidentLazyTables().has("messages"),
+        false,
+        "one chat must not lease all messages",
+      );
+      assert.equal(db._fileStore.getResidentChatUnits().has(sibling.id), false, "unrelated room must remain cold");
+      assert.equal(
+        db._fileStore.getResidentLazyRows("messages").some((row) => row.chatId === sibling.id),
+        false,
+      );
+    };
+
     const mari = new MariDbService(db);
     assert.ok(PROFESSOR_MARI_APP_DATA_ACTIONS.includes("chat.messages"));
 
     const fetched = await mari.executeAction({ action: "chat.get", chatId: chat.id });
     assert.equal(fetched.ok, true);
     assert.equal((fetched.output as { messageCount?: number }).messageCount, 3);
+    assertScopedRead();
+
+    // A restore may acquire its exclusive barrier after chat lookup but before
+    // counting messages. The second read must wait just like ordinary select.
+    let releaseRestore!: () => void;
+    let enteredRestore!: () => void;
+    const restoreGate = new Promise<void>((resolve) => {
+      releaseRestore = resolve;
+    });
+    const restoreEntered = new Promise<void>((resolve) => {
+      enteredRestore = resolve;
+    });
+    let restoring: Promise<void> | undefined;
+    afterChatRead = async () => {
+      restoring = db._fileStore.runExclusiveTransactions(async () => {
+        enteredRestore();
+        await restoreGate;
+      });
+      await restoreEntered;
+    };
+    let finished = false;
+    const duringRestore = mari.executeAction({ action: "chat.get", chatId: chat.id }).then((result) => {
+      finished = true;
+      return result;
+    });
+    try {
+      await restoreEntered;
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(finished, false, "message count must wait behind an exclusive restore");
+    } finally {
+      releaseRestore();
+      await restoring;
+      await duringRestore;
+    }
+    assert.equal(((await duringRestore).output as { messageCount: number }).messageCount, 3);
+    assertScopedRead();
 
     const messages = await mari.executeAction({ action: "chat.messages", chatId: chat.id, last: 2 });
+    assertScopedRead();
     assert.deepEqual(
       (messages.output as { messages: Array<{ postNumber: number; content: string }> }).messages.map(
         ({ postNumber, content }) => ({ postNumber, content }),

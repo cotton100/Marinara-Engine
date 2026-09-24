@@ -2329,6 +2329,8 @@ class FileTableStore {
   private dirtyShards = new Map<string, Set<string>>();
   /** messageId -> chatId, so swipe writes resolve their shard in O(1) (#4708). */
   private messageShardIndex = new Map<string, string>();
+  /** Conservative, body-free scope for the frequently polled notification feed. */
+  private autonomousNotificationUnits: Set<string> | null = new Set();
   /** ENCODED shard filenames known on disk, so the flush never stats clean shards. */
   private knownShardFiles = new Map<string, Set<string>>();
   /**
@@ -3637,6 +3639,10 @@ class FileTableStore {
       this.dirtyTables.size === 0 &&
       (durability !== "strict" || this.strictPendingTables.size === 0)
     ) {
+      // Read-only browsing can grow residency without dirtying any table.
+      // This idle safety tick has the same no-writer boundary as a completed
+      // flush; keep the existing per-unit pending-state and transaction gates.
+      if (!this.lastFlushError) this.maybeEvictUnits();
       return;
     }
     this.dirty = false;
@@ -3714,8 +3720,7 @@ class FileTableStore {
     } finally {
       if (this.activeFlush === flush) this.activeFlush = null;
     }
-    // Eviction runs only here — the tail of the flush that actually wrote —
-    // see maybeEvictUnits for why this is the one safe trigger point.
+    // A successful write and a clean idle flush are safe sweep boundaries.
     if (!this.lastFlushError) this.maybeEvictUnits();
     if (throwOnError && this.lastFlushError) throw this.lastFlushError;
   }
@@ -4086,6 +4091,7 @@ class FileTableStore {
   private reindexMovedMessages(affectedRows: Row[]) {
     const movedSwipeShards = new Set<string>();
     for (const row of affectedRows) {
+      this.rememberNotificationUnit(row);
       if (typeof row.id !== "string" || typeof row.chatId !== "string") continue;
       const previous = this.messageShardIndex.get(row.id);
       // A first-time index entry is also a "move" when the message ADOPTS
@@ -4150,6 +4156,28 @@ class FileTableStore {
     return typeof value === "string" && value ? value : UNASSIGNED_SHARD_KEY;
   }
 
+  private rememberNotificationUnit(row: Row, sourceEncoded?: string) {
+    if (!this.autonomousNotificationUnits) return;
+    // Match normalizeRow's own-property precedence, including explicit null.
+    const marker = Object.hasOwn(row, "autonomousNotificationAt")
+      ? row.autonomousNotificationAt
+      : row.autonomous_notification_at;
+    if (marker == null) return;
+    const chatId = Object.hasOwn(row, "chatId") ? row.chatId : row.chat_id;
+    const key = this.unitKeyForShardValue(chatId);
+    this.autonomousNotificationUnits.add(key);
+    if (sourceEncoded !== undefined && encodeShardKey(key) !== sourceEncoded) {
+      // Include the physical host too: malformed ids cannot use the message
+      // stray index. An undecodable host must fall back to the complete scan.
+      const host = decodeShardKey(sourceEncoded);
+      if (host !== null && encodeShardKey(host) === sourceEncoded) this.autonomousNotificationUnits.add(host);
+      else this.autonomousNotificationUnits = null;
+    }
+    // ponytail: retain old units across deletion, moves and rollback. This is
+    // only a superset for query scoping, not a cached event/result list. Rebuild
+    // at boot; use a per-message index if historical notification units grow.
+  }
+
   /**
    * Static unit scope of a WHERE condition against one lazy table: the set of
    * unit keys that could possibly hold matching rows, or null when the
@@ -4197,6 +4225,20 @@ class FileTableStore {
         else for (const key of intersection) if (!scope.has(key)) intersection.delete(key);
       }
       return intersection;
+    }
+
+    if (meta.name === "messages" && this.autonomousNotificationUnits) {
+      const marker = meta.byKey.get("autonomousNotificationAt");
+      const markedRows =
+        (condition.kind === "file-null-check" &&
+          condition.operator === "is-not-null" &&
+          getColumnMeta(condition.value) === marker) ||
+        (condition.kind === "file-comparison" &&
+          condition.operator === "gt" &&
+          getColumnMeta(condition.left) === marker &&
+          typeof condition.right === "string" &&
+          compareValues(null, condition.right) <= 0);
+      if (markedRows) return new Set(this.autonomousNotificationUnits);
     }
 
     const strategy = getFileTableShardStrategy(meta.name as FileBackedTable);
@@ -4619,13 +4661,13 @@ class FileTableStore {
   }
 
   /**
-   * LRU sweep over resident chat units, run ONLY from the tail of a
-   * successful flush. That trigger point carries the safety argument:
+   * LRU sweep over resident chat units, run from a successful flush or its
+   * clean idle return. Those trigger points carry the safety argument:
    * (a) no flush is in flight, so no captured mark batch is invisible to the
    * pending-state gate; (b) every synchronous mutate-then-markDirty stretch
    * has completed — a sweep inside ensureUnitsLoaded could run BETWEEN a
    * write installing rows and its markDirty call and evict unflushed data;
-   * (c) the just-flushed state means a clean unit is genuinely durable.
+   * (c) clean units were loaded from disk or already successfully saved.
    * Multi-call storage flows can still lose a unit between their awaited
    * steps — that degrades to a reload (their write conditions carry a
    * scope-resolvable conjunct), never to data loss.
@@ -4635,6 +4677,32 @@ class FileTableStore {
     const cap = getMaxResidentChatUnits();
     if (cap === 0) return;
     if (this.activeFlush || this.activeTransactionCount > 0 || this.txContext.getStore()) return;
+    // A global scan only loads this TABLE, not complete chat units. Release
+    // its clean excess without falsely adding those units to loadedUnits.
+    // Captured query/export arrays stay intact: rows and arrays are replaced,
+    // never mutated by this sweep. The scan's peak allocation is unchanged.
+    const retainedUnits = new Set([...this.loadedUnits, ...this.pinnedUnits]);
+    const retainedEncodings = new Set([...retainedUnits].map(encodeShardKey));
+    for (const table of LAZY_UNIT_LOAD_ORDER) {
+      if (!this.fullyResidentTables.has(table)) continue;
+      if (
+        this.dirtyTables.has(table) ||
+        this.dirtyShards.get(table)?.size ||
+        this.staleShardFiles.get(table)?.size ||
+        this.backupRecoveredPaths.size > 0
+      )
+        continue;
+      const strategy = getFileTableShardStrategy(table as FileBackedTable);
+      const kept = (this.tables.get(table) ?? []).filter((row) =>
+        retainedUnits.has(this.unitKeyOfRowForEviction(strategy, row)),
+      );
+      this.fullyResidentTables.delete(table);
+      this.tables.set(table, kept);
+      const readFiles = this.loadedShardEncodings.get(table);
+      if (readFiles) {
+        for (const encoded of readFiles) if (!retainedEncodings.has(encoded)) readFiles.delete(encoded);
+      }
+    }
     const evictable = [...this.loadedUnits].filter((key) => !this.pinnedUnits.has(key));
     if (evictable.length <= cap) return;
     evictable.sort((a, b) => (this.unitLastTouch.get(a) ?? 0) - (this.unitLastTouch.get(b) ?? 0));
@@ -5089,6 +5157,7 @@ class FileTableStore {
               }
             }
             for (const row of usableRows) {
+              this.rememberNotificationUnit(row, encoded);
               if (typeof row.id !== "string") continue;
               // The eager loader normalized rows before indexing, which also
               // accepted the column's dbName form — a hand-edited or

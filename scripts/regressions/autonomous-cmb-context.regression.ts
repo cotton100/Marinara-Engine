@@ -998,7 +998,13 @@ try {
       return never;
     },
   };
-  const stalledDb = { select: () => stalledQuery } as unknown as typeof db;
+  let stalledReads = 0;
+  const stalledDb = {
+    select: () => {
+      stalledReads += 1;
+      return stalledQuery;
+    },
+  } as unknown as typeof db;
   const timeoutStartedAt = Date.now();
   assert.equal(
     await buildAutonomousCmbPendingContext({
@@ -1010,6 +1016,51 @@ try {
     null,
   );
   assert.ok(Date.now() - timeoutStartedAt < 250, "the shortened regression deadline must fail open promptly");
+
+  await Promise.all(
+    Array.from({ length: 20 }, () =>
+      buildAutonomousCmbPendingContext({
+        db: stalledDb,
+        targetChatId: TARGET_CHAT_ID,
+        targetCharacterId: TARGET_CHARACTER_ID,
+        timeoutMs: 10,
+      }),
+    ),
+  );
+  assert.equal(stalledReads, 1, "timed-out unfinished reads must not accumulate across callers");
+  assert.ok(await build(), "a stalled DB must not block a different DB instance");
+
+  let resumeRead!: (rows: unknown[]) => void;
+  const slowRows = new Promise<unknown[]>((resolve) => {
+    resumeRead = resolve;
+  });
+  let slowReads = 0;
+  const slowQuery = {
+    from() {
+      return slowQuery;
+    },
+    where() {
+      return slowQuery;
+    },
+    limit() {
+      return slowRows;
+    },
+  };
+  const slowDb = {
+    select: () => {
+      slowReads += 1;
+      return slowQuery;
+    },
+  } as unknown as typeof db;
+  const slowInput = { db: slowDb, targetChatId: TARGET_CHAT_ID, targetCharacterId: TARGET_CHARACTER_ID, timeoutMs: 10 };
+  assert.equal(await buildAutonomousCmbPendingContext(slowInput), null);
+  resumeRead(await db.select().from(installedExtensions).where(eq(installedExtensions.id, CMB_ID)));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(slowReads, 1, "expired work must stop before the next storage query");
+  // A fresh read may start once the previous work actually settles. Return no extension now.
+  slowQuery.limit = () => Promise.resolve([]);
+  assert.equal(await buildAutonomousCmbPendingContext(slowInput), null);
+  assert.equal(slowReads, 2, "the slot must be released after the underlying read finishes");
 
   // Static integration pins: the route must gate this service to a valid
   // autonomous Conversation target with an explicit true option, catch failure,
@@ -1073,8 +1124,9 @@ try {
     /url:\s*"\/api\/generate",\s*payload:\s*\{\s*chatId,\s*connectionId:\s*null,\s*forCharacterId:\s*characterId,\s*streaming:\s*false,\s*userStatus:\s*"idle",\s*userActivity:\s*"away or offline",\s*autonomous:\s*true,/u;
 
   assert.match(generateRouteSource, /import \{ buildAutonomousCmbPendingContext \}/u);
+  // Releasing the known in-memory WeakSet slot is not a database deletion.
   assert.doesNotMatch(
-    cmbServiceSource,
+    cmbServiceSource.replaceAll("activeReads.delete(input.db)", ""),
     /\.insert\(|\.update\(|\.delete\(|lorebookEntries\.(?:content|embedding)\b|memoryChunks\.(?:content|embedding)\b/u,
     "the CMB prompt bridge must stay read-only and avoid lorebook content or embedding-vector payload reads",
   );

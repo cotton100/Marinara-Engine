@@ -4,6 +4,11 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- Memory-limited servers now use the existing eight-chat residency default when the OS reports a limit up to 4 GiB; clean read-only chats can also be released on the idle safety tick. With a residency cap enabled, global scans release their extra clean cached rows afterward instead of keeping whole tables resident. Explicit residency settings still take precedence; a large scan or export can still have a high memory peak.
+- Autonomous-notification polling and timestamp allocation scope message reads to units with notification markers instead of loading unrelated chat histories. Existing event filtering and cursors are unchanged; no message bodies are cached in the scope index.
+- Advanced Memory checks for a new scene or summary record stay within the current chat instead of promoting every chat's memory records into RAM.
+- Professor Mari's single-chat detail and message reads no longer load every chat's messages. Optional CMB recent-context reads stop before further queries after their deadline and cannot accumulate behind an unfinished read.
+
 - Opt-in CMB autonomous messages retain the newest five visible shared messages even after those messages are saved to memory, so semantic retrieval cannot silently replace recent context with older memories.
 
 - Administrators can recover and resume a safely recoverable blocked CMB without closing browser tabs; recovery keeps writes fenced until activation validation and durable journal retirement finish.

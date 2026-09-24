@@ -6668,7 +6668,9 @@ export class MariDbService {
         if (!id) throw new Error("Usage: mari chats get <id>");
         const row = await this.getRawById(getMeta("chats"), id);
         if (!row) return { ok: false, mode: "read", command: context.command, output: null };
-        const messageCount = (await this.rawRows("messages")).filter((m) => m.chatId === id).length;
+        const messageCount = (
+          await this.db.select({ id: schema.messages.id }).from(schema.messages).where(eq(schema.messages.chatId, id))
+        ).length;
         return {
           ok: true,
           mode: "read",
@@ -6694,7 +6696,7 @@ export class MariDbService {
         });
         if (last !== null && afterPost !== null) throw new Error("Use either --last or --after-post, not both");
         if (afterPost !== null && tail) throw new Error("--after-post cannot be combined with --tail");
-        let messages = (await this.rawRows("messages")).filter((m) => m.chatId === chatId);
+        const messages = await this.db.select().from(schema.messages).where(eq(schema.messages.chatId, chatId));
         messages.sort((a, b) => String(a.createdAt ?? "").localeCompare(String(b.createdAt ?? "")));
         const numberedMessages = messages.map((message, index) => ({ message, postNumber: index + 1 }));
         let selectedMessages: typeof numberedMessages;

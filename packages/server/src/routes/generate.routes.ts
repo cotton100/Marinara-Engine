@@ -2257,9 +2257,9 @@ export async function generateRoutes(app: FastifyInstance) {
         throw new Error("All characters in this chat are disabled. Enable at least one character before generating.");
       }
 
-      // Ordinary replies use the complete post-activity audience, even when a
-      // caller requests one responder. This does not enable the autonomous
-      // single-speaker/command path and never reads another member's private DM.
+      // Snapshot the post-activity roster. Shared prompts use its full audience;
+      // Individual RP defers context to the actual responder below, including
+      // sequential/smart turns whose speaker is not known at request start.
       const ordinaryCmbAudience =
         (chatMode === "conversation" || chatMode === "roleplay") &&
         input.autonomous !== true &&
@@ -2272,17 +2272,51 @@ export async function generateRoutes(app: FastifyInstance) {
         characterIds.length > 0
           ? [...characterIds]
           : null;
-      const ordinaryCmbRecentContextPromise = ordinaryCmbAudience
-        ? buildCmbRecentContext({
+      const ordinaryCmbIndividualRoleplay =
+        ordinaryCmbAudience !== null && chatMode === "roleplay" && chatMeta.groupChatMode === "individual";
+      const ordinaryCmbRecentContextPromise =
+        ordinaryCmbAudience && !ordinaryCmbIndividualRoleplay
+          ? buildCmbRecentContext({
+              db: app.db,
+              targetChatId: input.chatId,
+              targetCharacterIds: ordinaryCmbAudience,
+              generation: "ordinary",
+              timeZone: promptTimeZone,
+              wrapFormat: resolvedPreset ? normalizePromptWrapFormat(resolvedPreset.wrapFormat) : "xml",
+              signal: abortController.signal,
+            })
+          : Promise.resolve(null);
+
+      // Reuse one bounded read per actual RP speaker across follow-ups. Do not
+      // prefetch the whole cast or put a private audience's block in shared input.
+      const individualRpCmbContexts = new Map<string, ReturnType<typeof buildCmbRecentContext>>();
+      const getIndividualRpCmbContextBlock = async (
+        targetCharId: string | null,
+        speaksOnlyTargetCharacter: boolean,
+      ): Promise<string | null> => {
+        if (!targetCharId || !speaksOnlyTargetCharacter || !ordinaryCmbIndividualRoleplay) return null;
+        const audienceStillMatches = () =>
+          ordinaryCmbAudience !== null &&
+          ordinaryCmbAudience.includes(targetCharId) &&
+          ordinaryCmbAudience.length === characterIds.length &&
+          ordinaryCmbAudience.every((id) => characterIds.includes(id));
+        if (!audienceStillMatches()) return null;
+        let pending = individualRpCmbContexts.get(targetCharId);
+        if (!pending) {
+          pending = buildCmbRecentContext({
             db: app.db,
             targetChatId: input.chatId,
-            targetCharacterIds: ordinaryCmbAudience,
+            targetCharacterIds: [targetCharId],
             generation: "ordinary",
             timeZone: promptTimeZone,
             wrapFormat: resolvedPreset ? normalizePromptWrapFormat(resolvedPreset.wrapFormat) : "xml",
             signal: abortController.signal,
-          })
-        : Promise.resolve(null);
+          });
+          individualRpCmbContexts.set(targetCharId, pending);
+        }
+        const result = await pending;
+        return audienceStillMatches() ? result.block : null;
+      };
 
       let groupHistoryCharacterNamesByIdPromise: Promise<Map<string, string>> | null = null;
       const getGroupHistoryCharacterNamesById = () => {
@@ -4275,6 +4309,7 @@ export async function generateRoutes(app: FastifyInstance) {
 
         // ── Inject cross-chat awareness and opt-in CMB pending context after persona info. ──
         const ordinaryCmbRecentContextBlock =
+          !ordinaryCmbIndividualRoleplay &&
           ordinaryCmbAudience !== null &&
           ordinaryCmbAudience.length === characterIds.length &&
           ordinaryCmbAudience.every((id) => characterIds.includes(id))
@@ -6687,6 +6722,20 @@ export async function generateRoutes(app: FastifyInstance) {
           // and a merged generation that may voice several characters at once
           // stays on the hand-free spectator view.
           let gameAwareMessagesForGen = await prepareConversationLorebookForResponder(targetCharId, messagesForGen);
+          const individualRpCmbContextBlock = await getIndividualRpCmbContextBlock(
+            targetCharId,
+            speaksOnlyTargetCharacter,
+          );
+          if (individualRpCmbContextBlock) {
+            gameAwareMessagesForGen = [...gameAwareMessagesForGen];
+            const firstUserIdx = gameAwareMessagesForGen.findIndex(
+              (message) => message.role === "user" || message.role === "assistant",
+            );
+            gameAwareMessagesForGen.splice(firstUserIdx >= 0 ? firstUserIdx : gameAwareMessagesForGen.length, 0, {
+              role: "system",
+              content: individualRpCmbContextBlock,
+            });
+          }
           if (conversationScopesAwarenessToResponder && targetCharId) {
             let responderAwarenessBlock: string | null = null;
             if (conversationCrossChatAwarenessEnabled && !input.regenerateMessageId) {

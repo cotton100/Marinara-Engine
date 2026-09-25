@@ -38,6 +38,7 @@ function routeSlice(source: string) {
       name,
     );
   const audience = variable("ordinaryCmbAudience");
+  const individual = variable("ordinaryCmbIndividualRoleplay");
   const promise = variable("ordinaryCmbRecentContextPromise");
   const result = variable("cmbRecentContextResult");
   const block = variable("ordinaryCmbRecentContextBlock");
@@ -65,7 +66,11 @@ function routeSlice(source: string) {
     (node): node is ts.CallExpression =>
       ts.isCallExpression(node) && node.expression.getText(file) === "buildCmbRecentContext",
   );
-  assert.equal(allBuilderCalls.length, 2, "only autonomous and ordinary request-level reads may call the builder");
+  assert.equal(
+    allBuilderCalls.length,
+    3,
+    "only autonomous, shared ordinary, and cached RP-speaker reads call the builder",
+  );
   assert.ok(
     allBuilderCalls.every((node) => node.getEnd() < followUp!.getStart(file)),
     "follow-ups must not rescan CMB",
@@ -105,6 +110,7 @@ function routeSlice(source: string) {
     const autonomousCmbRecentContextPromise = Promise.resolve(fixture.autonomousResult ?? null);
     ${roster.getText(file)};
     const ${audience.getText(file)};
+    const ${individual.getText(file)};
     const ${promise.getText(file)};
     const audienceSnapshot = ordinaryCmbAudience ? [...ordinaryCmbAudience] : null;
     if (fixture.lateCharacterIds) characterIds = [...fixture.lateCharacterIds];

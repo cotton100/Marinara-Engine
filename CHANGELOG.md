@@ -4,6 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- CMB supports registered Roleplay rooms in Individual as well as Merged mode without changing the room's speaking mode. Opt-in recent context for Individual replies is filtered for the actual responder, including sequential and smart turns, and reused per speaker across follow-ups; existing roster and memory-visibility checks remain required.
+
 - Memory-limited servers now use the existing eight-chat residency default when the OS reports a limit up to 4 GiB; clean read-only chats can also be released on the idle safety tick. With a residency cap enabled, global scans release their extra clean cached rows afterward instead of keeping whole tables resident. Explicit residency settings still take precedence; a large scan or export can still have a high memory peak.
 - Autonomous-notification polling and timestamp allocation scope message reads to units with notification markers instead of loading unrelated chat histories. Existing event filtering and cursors are unchanged; no message bodies are cached in the scope index.
 - Advanced Memory checks for a new scene or summary record stay within the current chat instead of promoting every chat's memory records into RAM.

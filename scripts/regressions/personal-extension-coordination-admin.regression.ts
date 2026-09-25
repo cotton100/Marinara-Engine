@@ -769,6 +769,132 @@ try {
   }
   await setConfig();
 
+  // RP speaker mode must survive every administrative transition unchanged.
+  for (const groupChatMode of [undefined, "merged", "individual"]) {
+    const metadata = JSON.stringify(groupChatMode === undefined ? {} : { groupChatMode });
+    await db.update(chats).set({ metadata }).where(eq(chats.id, RP_CHAT_ID));
+    const storedConfig = await settings.get(STORAGE_KEY);
+    for (const action of [
+      "activate",
+      "deactivate",
+      "activate",
+      "recover-blocked",
+      "activate",
+      "recover-and-resume",
+      "deactivate",
+    ] as const) {
+      if (action.startsWith("recover-")) {
+        await db
+          .update(personalExtensionCoordination)
+          .set({ mode: "blocked" })
+          .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+      }
+      const response = await app.inject({
+        method: "POST",
+        url: adminUrl(action),
+        headers: adminHeaders(exactSecret),
+        payload: {},
+      });
+      const label = `${groupChatMode ?? "default merged"}: ${action}`;
+      assert.equal(response.statusCode, 200, `${label}: ${response.body}`);
+      assert.equal(
+        response.json().mode,
+        action === "deactivate" || action === "recover-blocked" ? "inactive" : "active",
+        label,
+      );
+      assert.equal((await db.select().from(chats).where(eq(chats.id, RP_CHAT_ID)))[0]!.metadata, metadata, label);
+      assert.equal(await settings.get(STORAGE_KEY), storedConfig, `${label} must preserve CMB storage`);
+    }
+  }
+
+  for (const groupChatMode of [null, "", "Merged", "unknown", false, 0, ["merged"], { mode: "individual" }]) {
+    await db
+      .update(chats)
+      .set({ metadata: JSON.stringify({ groupChatMode }) })
+      .where(eq(chats.id, RP_CHAT_ID));
+    for (const action of ["activate", "recover-blocked", "recover-and-resume"] as const) {
+      await db
+        .update(personalExtensionCoordination)
+        .set({ mode: action === "activate" ? "inactive" : "blocked" })
+        .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+      const before = await coordinationRow();
+      const storedConfig = await settings.get(STORAGE_KEY);
+      const eventsBefore = publishedAdminDrafts.length;
+      const response = await app.inject({
+        method: "POST",
+        url: adminUrl(action),
+        headers: adminHeaders(exactSecret),
+        payload: {},
+      });
+      const label = `malformed RP mode ${JSON.stringify(groupChatMode)}: ${action}`;
+      assert.equal(response.statusCode, 409, `${label}: ${response.body}`);
+      assert.equal(response.json().code, "coordination-validation-failed", label);
+      const after = await coordinationRow();
+      for (const key of ["mode", "fence", "configRevision", "protectedLorebookRegistry"] as const)
+        assert.deepEqual(after?.[key], before?.[key], `${label}: ${key}`);
+      assert.equal(await settings.get(STORAGE_KEY), storedConfig, label);
+      assert.equal(publishedAdminDrafts.length, eventsBefore, label);
+    }
+  }
+  await db
+    .update(personalExtensionCoordination)
+    .set({ mode: "inactive" })
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  await db
+    .update(chats)
+    .set({ metadata: JSON.stringify({ groupChatMode: "individual" }) })
+    .where(eq(chats.id, RP_CHAT_ID));
+  for (const [label, apply, restore] of [
+    [
+      "CWA enabled",
+      () =>
+        db
+          .update(chats)
+          .set({ metadata: JSON.stringify({ crossChatAwareness: true }) })
+          .where(eq(chats.id, DM_CHAT_ID)),
+      () =>
+        db
+          .update(chats)
+          .set({ metadata: JSON.stringify({ crossChatAwareness: false }) })
+          .where(eq(chats.id, DM_CHAT_ID)),
+    ],
+    [
+      "roster mismatch",
+      () => db.update(chats).set({ characterIds: "[]" }).where(eq(chats.id, RP_CHAT_ID)),
+      () =>
+        db
+          .update(chats)
+          .set({ characterIds: JSON.stringify([CHARACTER_ID]) })
+          .where(eq(chats.id, RP_CHAT_ID)),
+    ],
+    [
+      "embedding mismatch",
+      () => db.update(chats).set({ connectionId: "missing-connection" }).where(eq(chats.id, RP_CHAT_ID)),
+      () => db.update(chats).set({ connectionId: "__local_sidecar__" }).where(eq(chats.id, RP_CHAT_ID)),
+    ],
+    [
+      "book scope mismatch",
+      () => lorebooks.update(lorebook.id, { scope: { mode: "specific", chatIds: [DM_CHAT_ID] } }),
+      () => lorebooks.update(lorebook.id, { scope: { mode: "specific", chatIds: [RP_CHAT_ID, DM_CHAT_ID] } }),
+    ],
+  ] as const) {
+    await apply();
+    const response = await app.inject({
+      method: "POST",
+      url: adminUrl("activate"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(response.statusCode, 409, `Individual RP ${label}: ${response.body}`);
+    assert.equal(response.json().code, "coordination-validation-failed", label);
+    assert.equal((await coordinationRow())?.mode, "inactive", label);
+    await restore();
+  }
+  await db
+    .update(chats)
+    .set({ metadata: JSON.stringify({ groupChatMode: "merged" }) })
+    .where(eq(chats.id, RP_CHAT_ID));
+
   const activated = await app.inject({
     method: "POST",
     url: adminUrl("activate"),

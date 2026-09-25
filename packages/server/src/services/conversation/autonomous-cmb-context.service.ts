@@ -133,6 +133,7 @@ type AutonomousCmbPendingContextInput = {
 };
 
 export type CmbRecentContextInput = Omit<AutonomousCmbPendingContextInput, "targetCharacterId"> & {
+  /** Actual prompt audience; ordinary Individual RP must supply exactly its selected speaker. */
   targetCharacterIds: string[];
   generation: "autonomous" | "ordinary";
 };
@@ -639,6 +640,8 @@ async function buildCmbRecentContextInner(
       ? []
       : parseStableStringArray(targetChatState.metadata.excludedLorebookIds, MAX_MANAGED_ENTRIES);
   const expectedTargetCharacterIds = targetRole === "dm" ? targetCharacterIds : memberCharacterIds;
+  const targetGroupChatMode = targetChatState?.metadata.groupChatMode;
+  const individualRpTarget = targetRole === "rp" && targetGroupChatMode === "individual";
   if (
     !targetChat ||
     targetChat.mode !== (targetRole === "rp" ? "roleplay" : "conversation") ||
@@ -646,10 +649,13 @@ async function buildCmbRecentContextInner(
     excludedBooks === null ||
     excludedBooks.includes(ensemble.lorebookId) ||
     !sameStringSet(targetChatState.activeCharacterIds, expectedTargetCharacterIds) ||
-    (generation === "ordinary" && !sameStringSet(targetChatState.activeCharacterIds, targetCharacterIds)) ||
+    (generation === "ordinary" &&
+      (individualRpTarget
+        ? targetCharacterIds.length !== 1
+        : !sameStringSet(targetChatState.activeCharacterIds, targetCharacterIds))) ||
     targetChatState.metadata.sceneStatus != null ||
     (targetRole === "rp"
-      ? (targetChatState.metadata.groupChatMode ?? "merged") !== "merged"
+      ? targetGroupChatMode !== undefined && targetGroupChatMode !== "merged" && targetGroupChatMode !== "individual"
       : targetChatState.metadata.crossChatAwareness !== false)
   ) {
     return null;
@@ -664,6 +670,7 @@ async function buildCmbRecentContextInner(
     const sourceChat = chatById.get(source.chatId);
     const sourceChatState = sourceChat ? parseChatState(sourceChat) : null;
     const expectedMode = source.chatRole === "rp" ? "roleplay" : "conversation";
+    const sourceGroupChatMode = sourceChatState?.metadata.groupChatMode;
     if (
       !sourceChat ||
       stableString(sourceChat.name, MAX_NAME_CHARS) === null ||
@@ -673,7 +680,7 @@ async function buildCmbRecentContextInner(
       sourceChatState.metadata.sceneStatus != null ||
       !sameStringSet(sourceChatState.activeCharacterIds, memberCharacterIds) ||
       (expectedMode === "roleplay"
-        ? (sourceChatState.metadata.groupChatMode ?? "merged") !== "merged"
+        ? sourceGroupChatMode !== undefined && sourceGroupChatMode !== "merged" && sourceGroupChatMode !== "individual"
         : sourceChatState.metadata.crossChatAwareness !== false)
     ) {
       return null;

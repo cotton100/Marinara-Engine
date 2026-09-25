@@ -833,6 +833,22 @@ try {
   await addManagedNativeEntry(OTHER_GROUP_CHAT_ID, "group", 34, 35);
   assert.equal(await buildForTarget(GROUP_CHAT_ID, TARGET_CHARACTER_ID), groupForTarget);
   assert.equal(await buildForTarget(GROUP_CHAT_ID, FRIEND_CHARACTER_ID), groupForFriend);
+  await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, RP_CHAT_ID));
+  assert.equal(
+    await buildForTarget(GROUP_CHAT_ID, TARGET_CHARACTER_ID),
+    groupForTarget,
+    "Individual RP sources preserve the autonomous speaker's exact shared-context visibility",
+  );
+  assert.equal(await buildForTarget(GROUP_CHAT_ID, FRIEND_CHARACTER_ID), groupForFriend);
+  assert.equal(await buildForTarget(RP_CHAT_ID, TARGET_CHARACTER_ID), null, "autonomous RP targets stay excluded");
+  for (const groupChatMode of [null, "unknown", "", false, 1, [], {}]) {
+    await db
+      .update(chats)
+      .set({ metadata: JSON.stringify({ groupChatMode }) })
+      .where(eq(chats.id, RP_CHAT_ID));
+    assert.equal(await build(), null, "malformed RP source modes do not unlock autonomous context");
+  }
+  await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, RP_CHAT_ID));
   assert.equal(
     await buildForTarget(GROUP_CHAT_ID, "unmapped-character"),
     null,

@@ -248,6 +248,162 @@ try {
     assert.doesNotMatch(result.block!, /SHARED-GROUP-ONE|PRIVATE-DM/u);
   });
 
+  await check("RP sources allow merged or Individual without widening Conversation audiences", async () => {
+    try {
+      for (const groupChatMode of [undefined, "merged", "individual"]) {
+        await db
+          .update(chats)
+          .set({ metadata: JSON.stringify({ groupChatMode }) })
+          .where(eq(chats.id, rpId));
+        for (const generation of ["ordinary", "autonomous"] as const) {
+          const audience = generation === "ordinary" ? cast : [cast[0]!];
+          const result = await build(groups[0]!, audience, generation);
+          assert.ok(result.block?.includes("CURRENT-RP-ONLY"), `${generation}: ${groupChatMode}`);
+          assert.doesNotMatch(result.block!, /PRIVATE-DM/u);
+        }
+        assert.equal((await build(groups[0]!, [cast[0]!])).block, null, "ordinary groups still require everyone");
+      }
+      for (const groupChatMode of [null, "unknown", "", false, 1, [], {}]) {
+        await db
+          .update(chats)
+          .set({ metadata: JSON.stringify({ groupChatMode }) })
+          .where(eq(chats.id, rpId));
+        assert.equal((await build(groups[0]!)).block, null, "invalid RP source modes stay closed");
+      }
+    } finally {
+      await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, rpId));
+    }
+  });
+
+  await check("Individual RP requires one registered speaker and the entire registered active roster", async () => {
+    try {
+      await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, rpId));
+      for (const speaker of cast) {
+        const result = await build(rpId, [speaker]);
+        assert.equal(result.scope, "managed");
+        assert.ok(result.block?.includes("SHARED-GROUP-ONE"));
+        assert.doesNotMatch(result.block!, /PRIVATE-DM|CURRENT-RP-ONLY/u);
+      }
+      for (const audience of [[], cast, [cast[0]!, cast[0]!], ["outsider"]]) {
+        assert.equal((await build(rpId, audience)).block, null, "no implicit, combined, duplicate or unmapped speaker");
+      }
+      assert.equal((await build(rpId, [cast[0]!], "autonomous")).block, null, "autonomous RP remains unsupported");
+      for (const patch of [
+        { characterIds: JSON.stringify([cast[0]]) },
+        { characterIds: JSON.stringify([...cast, "outsider"]) },
+        {
+          characterIds: JSON.stringify(cast),
+          metadata: JSON.stringify({ groupChatMode: "individual", inactiveCharacterIds: [cast[1]] }),
+        },
+        { metadata: '{"groupChatMode":"individual","sceneStatus":"active"}' },
+        { metadata: '{"groupChatMode":"unknown"}' },
+        { metadata: '{"groupChatMode":"merged"}' },
+      ]) {
+        await db.update(chats).set(patch).where(eq(chats.id, rpId));
+        assert.equal((await build(rpId, [cast[0]!])).block, null, "narrow audience never bypasses target validation");
+      }
+      assert.ok((await build()).block, "merged still accepts its complete audience");
+      await db.update(chats).set({ metadata: "{}" }).where(eq(chats.id, rpId));
+      assert.ok((await build()).block, "omitted mode defaults to merged with a full audience");
+      assert.equal((await build(rpId, [cast[0]!])).block, null);
+      for (const groupChatMode of [null, "unknown", "", false, 1, [], {}]) {
+        await db
+          .update(chats)
+          .set({ metadata: JSON.stringify({ groupChatMode }) })
+          .where(eq(chats.id, rpId));
+        assert.equal((await build()).block, null, "malformed target mode cannot enter the merged path");
+        assert.equal(
+          (await build(rpId, [cast[0]!])).block,
+          null,
+          "malformed target mode cannot enter the speaker path",
+        );
+      }
+    } finally {
+      await db
+        .update(chats)
+        .set({ characterIds: JSON.stringify(cast), metadata: '{"groupChatMode":"merged"}' })
+        .where(eq(chats.id, rpId));
+    }
+  });
+
+  await check("Individual RP applies source visibility and conversation starts to its actual speaker", async () => {
+    await setMessages(groups[0]!, [
+      { content: "BEFORE-B-ONLY-START", minute: 1 },
+      {
+        content: "B-ONLY-START",
+        minute: 2,
+        extra: { conversationStartForCharacterIds: [cast[1]], hiddenFromAI: true },
+      },
+      { content: "FOR-A-ONLY", minute: 3, extra: { hiddenFromAICharacterIds: [cast[1]] } },
+      { content: "FOR-B-ONLY", minute: 4, extra: { hiddenFromAICharacterIds: [cast[0]] } },
+      { content: "SHARED-AFTER-START", minute: 5 },
+      { content: "GLOBALLY-HIDDEN", minute: 6, extra: { hiddenFromAI: true } },
+    ]);
+    await setMessages(groups[1]!, []);
+    try {
+      await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, rpId));
+      const a = await build(rpId, [cast[0]!]);
+      assert.match(a.block!, /BEFORE-B-ONLY-START/u);
+      assert.match(a.block!, /FOR-A-ONLY/u);
+      assert.doesNotMatch(a.block!, /FOR-B-ONLY|GLOBALLY-HIDDEN|PRIVATE-DM|CURRENT-RP-ONLY/u);
+      const b = await build(rpId, [cast[1]!]);
+      assert.match(b.block!, /FOR-B-ONLY/u);
+      assert.match(b.block!, /SHARED-AFTER-START/u);
+      assert.doesNotMatch(b.block!, /BEFORE-B-ONLY-START|FOR-A-ONLY|GLOBALLY-HIDDEN|PRIVATE-DM|CURRENT-RP-ONLY/u);
+      await db.update(chats).set({ metadata: '{"crossChatAwareness":true}' }).where(eq(chats.id, groups[0]!));
+      assert.equal((await build(rpId, [cast[0]!])).block, null, "source CWA remains fail-closed");
+    } finally {
+      await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, rpId));
+      await db.update(chats).set({ metadata: '{"crossChatAwareness":false}' }).where(eq(chats.id, groups[0]!));
+    }
+  });
+
+  await check("Individual RP respects managed unknownTo, character filters and local OFF overrides", async () => {
+    await setMessages(groups[0]!, [
+      { content: "COVERED-INDIVIDUAL-CONTEXT", minute: 1 },
+      { content: "UNCOVERED-INDIVIDUAL-CONTEXT", minute: 4 },
+    ]);
+    try {
+      await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, rpId));
+      for (const fixture of [
+        { unknownTo: ["b"], overrides: {}, visible: [true, false] },
+        { unknownTo: [], overrides: { characterFilterIds: JSON.stringify([cast[0]]) }, visible: [true, false] },
+        {
+          unknownTo: [],
+          overrides: { characterFilterMode: "exclude" as const, characterFilterIds: JSON.stringify([cast[0]]) },
+          visible: [false, true],
+        },
+        { unknownTo: [], overrides: { enabled: "false" }, visible: [false, false] },
+      ]) {
+        await managedRow(fixture.unknownTo, fixture.overrides);
+        for (const [index, speaker] of cast.entries()) {
+          const result = await build(rpId, [speaker]);
+          assert.ok(result.block?.includes("UNCOVERED-INDIVIDUAL-CONTEXT"));
+          assert.equal(result.block!.includes('message="COVERED-INDIVIDUAL-CONTEXT"'), fixture.visible[index]);
+        }
+      }
+      await managedRow();
+      await db
+        .update(chats)
+        .set({
+          metadata: JSON.stringify({
+            groupChatMode: "individual",
+            entryStateOverrides: { "managed-entry": { enabled: false } },
+          }),
+        })
+        .where(eq(chats.id, rpId));
+      assert.doesNotMatch((await build(rpId, [cast[0]!])).block!, /message="COVERED-INDIVIDUAL-CONTEXT"/u);
+      await db
+        .update(chats)
+        .set({ metadata: JSON.stringify({ groupChatMode: "individual", excludedLorebookIds: [bookId] }) })
+        .where(eq(chats.id, rpId));
+      assert.equal((await build(rpId, [cast[0]!])).block, null);
+    } finally {
+      await clearManaged();
+      await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, rpId));
+    }
+  });
+
   await check("a message hidden from any audience member stays private", async () => {
     await setMessages(groups[0]!, [
       { content: "VISIBLE-TO-ALL" },

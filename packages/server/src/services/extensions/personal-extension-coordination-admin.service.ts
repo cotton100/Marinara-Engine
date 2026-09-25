@@ -757,7 +757,8 @@ function validateChat(
   );
   if (!sameUniqueStrings(active, expectedCharacterIds)) throw validationError();
   if (role === "rp") {
-    if ((metadata.groupChatMode ?? "merged") !== "merged") throw validationError();
+    const groupChatMode = metadata.groupChatMode === undefined ? "merged" : metadata.groupChatMode;
+    if (groupChatMode !== "merged" && groupChatMode !== "individual") throw validationError();
   } else if (metadata.crossChatAwareness !== false) {
     throw validationError();
   }

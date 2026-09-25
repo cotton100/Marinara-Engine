@@ -39,6 +39,7 @@ import {
 } from "./config/runtime-config.js";
 import { corsDelegate } from "./config/cors-config.js";
 import { sidecarProcessService } from "./services/sidecar/sidecar-process.service.js";
+import { installSttPipelineHook } from "./services/sidecar/stt-pipeline-hook.js";
 import { startServerAutonomousScheduler } from "./services/conversation/server-autonomous-scheduler.service.js";
 import { preparePersonalExtensionTrust } from "./services/setup/personal-extension-trust.js";
 import { personalServerExtensionRuntime } from "./services/extensions/personal-server-extension-runtime.js";
@@ -296,6 +297,7 @@ export async function buildApp(https?: { cert: Buffer; key: Buffer }) {
 
   // ── Sidecar bootstrap (background, skipped in lite mode) ──
   if (!isLite) {
+    void installSttPipelineHook();
     void sidecarProcessService
       .syncForCurrentConfig({ suppressKnownFailure: true, allowRuntimeInstall: false })
       .catch((error) => {

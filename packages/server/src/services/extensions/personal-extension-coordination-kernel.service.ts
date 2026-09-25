@@ -1082,28 +1082,28 @@ export function createPersonalExtensionCoordinationKernel(
       }
 
       const safelyPrepared = journal.phase === "prepared" && journal.dispatchingAt === null && revisions.length === 0;
-      let provenDispatching = false;
-      if (
+      const preparedWithMarker = journal.phase === "prepared" && journal.dispatchingAt === null && revisions.length > 0;
+      const dispatched =
         journal.phase === "dispatching" &&
         Number.isFinite(dispatchingMs) &&
         dispatchingMs >= preparedMs &&
-        updatedMs >= dispatchingMs &&
-        proveBlockedJournalRecovery !== undefined
-      ) {
+        updatedMs >= dispatchingMs;
+      let provenRecovery = false;
+      if ((preparedWithMarker || dispatched) && proveBlockedJournalRecovery !== undefined) {
         try {
-          provenDispatching = await proveBlockedJournalRecovery(tx, {
+          provenRecovery = await proveBlockedJournalRecovery(tx, {
             coordination: row,
             journal,
             resourceRevisions: revisions,
           });
         } catch {
-          provenDispatching = false;
+          provenRecovery = false;
         }
       }
-      if (!safelyPrepared && !provenDispatching) {
-        // Prepared evidence is closable only before any marker commit. A
-        // dispatching journal needs a fresh server-owned marker proof; malformed
-        // or marker-free evidence stays operator-visible in blocked mode.
+      if (!safelyPrepared && !provenRecovery) {
+        // Only empty prepared evidence is self-proving. A prepared marker or
+        // dispatching journal needs a fresh server-owned recovery proof;
+        // malformed or unproven evidence stays operator-visible in blocked mode.
         throw kernelError("coordination-validation-failed");
       }
     }

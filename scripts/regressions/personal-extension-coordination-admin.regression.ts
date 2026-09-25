@@ -11,6 +11,7 @@ import {
   appSettings,
   characters,
   chats,
+  lorebookEntries,
   personalExtensionCoordination,
   personalExtensionOperationJournal,
   type PersonalExtensionOperationJournalRow,
@@ -1672,7 +1673,7 @@ try {
     };
   }
 
-  function interruptedVectorizeDiskState() {
+  function interruptedVectorizeDiskState(journalDigest = interruptedVectorizeDigest) {
     const readShard = (table: string, key: string) => {
       const primary = join(storageDir, "tables", table, `${encodeShardKey(key)}.json`);
       const path = existsSync(primary) ? primary : `${primary}.bak`;
@@ -1681,7 +1682,7 @@ try {
     return {
       row: readShard("personal_extension_coordination", EXTENSION_ID),
       storage: readShard("app_settings", STORAGE_KEY),
-      journal: readShard("personal_extension_operation_journal", interruptedVectorizeDigest),
+      journal: readShard("personal_extension_operation_journal", journalDigest),
     };
   }
 
@@ -2225,6 +2226,393 @@ try {
     await coordination.releaseLease(authority);
     await coordination.deactivateCoordination(EXTENSION_ID);
   }
+
+  // Reproduce the real interrupted browser prefix: persist only its pending
+  // marker, never dispatch a lorebook write, then let both authority timers expire.
+  await setConfig();
+  await lorebooks.updateEntryEmbedding(manualEntry.id, [0.125, -0.5, 0.75], "preserve-marker-vector");
+  const markerActivation = await app.inject({
+    method: "POST",
+    url: adminUrl("activate"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(markerActivation.statusCode, 200, markerActivation.body);
+  let markerClock = Date.now() - 600_000;
+  const markerService = createPersonalExtensionCoordinationService(db, {
+    wallNow: () => markerClock,
+    monotonicNow: () => markerClock,
+    eventPublisher: { publish() {} },
+  });
+  const markerAcquireInput = {
+    extensionId: EXTENSION_ID,
+    holderSessionId: "prepared-marker-tab",
+    serverBootId: PERSONAL_EXTENSION_COORDINATION_PROCESS_BOOT_ID,
+    contentHash: extension.contentHash,
+  };
+  const markerLease = await markerService.acquireLease(markerAcquireInput);
+  const markerAuthority = {
+    ...markerAcquireInput,
+    fence: markerLease.fence,
+    leaseToken: markerLease.leaseToken,
+  };
+  const markerOperation = await markerService.beginOperation({
+    ...markerAuthority,
+    kind: "mutation",
+    targetEnsembleId: ENSEMBLE_ID,
+  });
+  const markerContext = { ...markerAuthority, operationHandle: markerOperation.operationHandle };
+  const markerRevision = (await coordinationRow())!.configRevision;
+  const markerStorage = JSON.stringify({
+    unrelatedExtensionOptions: { keep: ["exact", "bytes"] },
+    convoMemoryBridgeV1: preparedActivationConfig(),
+  });
+  await markerService.runFencedResourceMutation(
+    markerContext,
+    [{ kind: "extension-storage", resourceId: EXTENSION_ID, expectedRevision: markerRevision }],
+    async (tx) => {
+      await tx.update(appSettings).set({ value: markerStorage }).where(eq(appSettings.key, STORAGE_KEY));
+      await tx
+        .update(personalExtensionCoordination)
+        .set({ configRevision: markerRevision + 1 })
+        .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+    },
+  );
+  const markerPrepared = await interruptedVectorizeState();
+  assert.equal(markerPrepared.journals.length, 1);
+  assert.equal(markerPrepared.journals[0]!.operationKind, "mutation");
+  assert.equal(markerPrepared.journals[0]!.phase, "prepared");
+  assert.equal(markerPrepared.journals[0]!.dispatchingAt, null);
+  assert.equal(markerPrepared.journals[0]!.finalAt, null);
+  assert.deepEqual(JSON.parse(markerPrepared.journals[0]!.protectedResourceRevisions), [
+    {
+      kind: "extension-storage",
+      resourceId: EXTENSION_ID,
+      presence: "present",
+      resourceRevision: markerRevision + 1,
+    },
+  ]);
+  markerClock += 181_000;
+  await assert.rejects(
+    markerService.acquireLease({ ...markerAcquireInput, holderSessionId: "next-marker-tab" }),
+    (error: unknown) =>
+      error instanceof PersonalExtensionCoordinationKernelError && error.code === "coordination-transition-blocked",
+  );
+  const markerBlocked = await interruptedVectorizeState();
+  assert.equal(markerBlocked.row!.mode, "blocked");
+  assert.equal(markerBlocked.row!.activeOperations, "[]");
+  assert.equal(markerBlocked.row!.leaseTokenDigest, null);
+  const markerDigest = markerBlocked.journals[0]!.operationDigest;
+  const markerDiskBefore = interruptedVectorizeDiskState(markerDigest);
+  const markerEntriesBefore = await db.select().from(lorebookEntries);
+  const markerEntryShard = join(storageDir, "tables", "lorebook_entries", `${encodeShardKey(lorebook.id)}.json`);
+  const markerEntryBytes = readFileSync(markerEntryShard);
+  const markerEventsBefore = publishedAdminDrafts.length;
+  failStrictWrite = true;
+  const markerStrictFailure = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-and-resume"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(markerStrictFailure.statusCode, 503, markerStrictFailure.body);
+  assert.deepEqual(await interruptedVectorizeState(), markerBlocked);
+  assert.deepEqual(interruptedVectorizeDiskState(markerDigest), markerDiskBefore);
+  assert.equal(publishedAdminDrafts.length, markerEventsBefore);
+  let markerBlockedBarrierSeen = false;
+  beforeActiveRecoveryWrite = () => {
+    beforeActiveRecoveryWrite = null;
+    const disk = interruptedVectorizeDiskState(markerDigest);
+    assert.equal(disk.row[0].mode, "blocked");
+    assert.equal(disk.journal, null, "marker journal must retire before active authority is persisted");
+    assert.deepEqual(disk.storage, markerDiskBefore.storage);
+    markerBlockedBarrierSeen = true;
+    throw new Error("simulated prepared-marker active barrier failure");
+  };
+  const markerActiveFailure = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-and-resume"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(markerActiveFailure.statusCode, 503, markerActiveFailure.body);
+  assert.equal(markerBlockedBarrierSeen, true);
+  assert.deepEqual(await interruptedVectorizeState(), markerBlocked);
+  assert.deepEqual(interruptedVectorizeDiskState(markerDigest), markerDiskBefore);
+  assert.equal(publishedAdminDrafts.length, markerEventsBefore);
+  const markerResume = await app.inject({
+    method: "POST",
+    url: adminUrl("recover-and-resume"),
+    headers: adminHeaders(exactSecret),
+    payload: {},
+  });
+  assert.equal(markerResume.statusCode, 200, `prepared marker-only recovery: ${markerResume.body}`);
+  const markerAfter = await interruptedVectorizeState();
+  assert.equal(markerAfter.row!.mode, "active");
+  assert.equal(markerAfter.row!.fence, markerBlocked.row!.fence + 1);
+  assert.equal(markerAfter.row!.configRevision, markerBlocked.row!.configRevision + 1);
+  assert.equal(markerAfter.journals.length, 0);
+  assert.equal(await settings.get(STORAGE_KEY), markerStorage, "recovery must retain exact pending marker storage");
+  for (const key of ["settings", "book", "entries", "otherBook", "otherEntries", "chats", "characters"] as const)
+    assert.deepEqual(markerAfter[key], markerBlocked[key], `marker-only recovery must preserve ${key}`);
+  assert.deepEqual(await db.select().from(lorebookEntries), markerEntriesBefore, "raw embeddings must stay exact");
+  assert.deepEqual(readFileSync(markerEntryShard), markerEntryBytes, "memory and vector shard bytes must stay exact");
+  assert.deepEqual(JSON.parse(markerAfter.row!.protectedLorebookRegistry), {
+    ...JSON.parse(markerBlocked.row!.protectedLorebookRegistry),
+    extensionStorage: { resourceRevision: markerAfter.row!.configRevision },
+  });
+  let staleMarkerWrote = false;
+  await assert.rejects(
+    markerService.runFencedResourceMutation(
+      markerContext,
+      [{ kind: "extension-storage", resourceId: EXTENSION_ID, expectedRevision: markerRevision + 1 }],
+      async () => {
+        staleMarkerWrote = true;
+      },
+    ),
+    (error: unknown) => error instanceof PersonalExtensionCoordinationKernelError,
+  );
+  assert.equal(staleMarkerWrote, false, "the interrupted tab cannot write after recovery");
+  const freshMarkerLease = await markerService.acquireLease({
+    ...markerAcquireInput,
+    holderSessionId: "recovered-marker-tab",
+  });
+  const freshMarkerAuthority = {
+    ...markerAcquireInput,
+    holderSessionId: "recovered-marker-tab",
+    fence: freshMarkerLease.fence,
+    leaseToken: freshMarkerLease.leaseToken,
+  };
+  const freshMarkerOperation = await markerService.beginOperation({
+    ...freshMarkerAuthority,
+    kind: "mutation",
+    targetEnsembleId: ENSEMBLE_ID,
+  });
+  await assert.rejects(
+    markerService.runFencedResourceMutation(
+      { ...freshMarkerAuthority, operationHandle: freshMarkerOperation.operationHandle },
+      [{ kind: "extension-storage", resourceId: EXTENSION_ID, expectedRevision: markerRevision + 1 }],
+      async () => {
+        staleMarkerWrote = true;
+      },
+    ),
+    (error: unknown) =>
+      error instanceof PersonalExtensionCoordinationKernelError && error.code === "storage-revision-conflict",
+  );
+  assert.equal(staleMarkerWrote, false, "fresh authority cannot reuse the pre-recovery storage revision");
+  await markerService.endOperation({
+    ...freshMarkerAuthority,
+    operationHandle: freshMarkerOperation.operationHandle,
+    disposition: "aborted",
+  });
+  await markerService.releaseLease(freshMarkerAuthority);
+  await coordination.deactivateCoordination(EXTENSION_ID);
+
+  async function preparedMarkerFixture() {
+    const fixture = await interruptedVectorizeFixture();
+    fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime = {
+      ...fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime,
+      semanticStatus: "pending",
+      pendingEmbeddingProfile: embedding,
+      manualRecoveryReasons: ["mutation-ambiguous", "vectorization-pending"],
+    };
+    fixture.revisions.splice(1);
+    Object.assign(fixture.journals[0]!, { operationKind: "mutation", phase: "prepared", dispatchingAt: null });
+    return fixture;
+  }
+  const invalidPreparedMarkers: Array<[string, (fixture: Awaited<ReturnType<typeof preparedMarkerFixture>>) => void]> =
+    [
+      [
+        "missing storage revision",
+        (fixture) => {
+          fixture.revisions[0]!.resourceRevision = undefined as unknown as number;
+        },
+      ],
+      [
+        "stale storage revision",
+        (fixture) => {
+          fixture.revisions[0]!.resourceRevision -= 1;
+        },
+      ],
+      [
+        "future storage revision",
+        (fixture) => {
+          fixture.revisions[0]!.resourceRevision += 1;
+        },
+      ],
+      [
+        "wrong storage resource",
+        (fixture) => {
+          fixture.revisions[0]!.resourceId = BOOTSTRAP_EXTENSION_ID;
+        },
+      ],
+      [
+        "missing storage resource ID",
+        (fixture) => {
+          fixture.revisions[0]!.resourceId = undefined as unknown as string;
+        },
+      ],
+      [
+        "absent storage resource",
+        (fixture) => {
+          fixture.revisions[0]!.presence = "absent";
+        },
+      ],
+      [
+        "extra lorebook revision",
+        (fixture) => {
+          fixture.revisions.push({
+            kind: "lorebook",
+            resourceId: lorebook.id,
+            presence: "present",
+            resourceRevision: 0,
+          });
+        },
+      ],
+      [
+        "duplicate storage revision",
+        (fixture) => {
+          fixture.revisions.push({ ...fixture.revisions[0]! });
+        },
+      ],
+      [
+        "wrong target ensemble",
+        (fixture) => {
+          fixture.journals[0]!.targetEnsembleId = SECOND_ENSEMBLE_ID;
+        },
+      ],
+      [
+        "wrong operation kind",
+        (fixture) => {
+          fixture.journals[0]!.operationKind = "vectorize";
+        },
+      ],
+      [
+        "dispatch time present",
+        (fixture) => {
+          fixture.journals[0]!.dispatchingAt = timestamp;
+        },
+      ],
+      [
+        "final time present",
+        (fixture) => {
+          fixture.journals[0]!.finalAt = timestamp;
+        },
+      ],
+      [
+        "malformed prepared time",
+        (fixture) => {
+          fixture.journals[0]!.preparedAt = "not-a-date";
+        },
+      ],
+      [
+        "malformed updated time",
+        (fixture) => {
+          fixture.journals[0]!.updatedAt = "not-a-date";
+        },
+      ],
+      [
+        "backwards journal times",
+        (fixture) => {
+          fixture.journals[0]!.updatedAt = "2020-01-01T00:00:00.000Z";
+        },
+      ],
+      [
+        "journal fence from future authority",
+        (fixture) => {
+          fixture.journals[0]!.fence = fixture.row.fence + 1;
+        },
+      ],
+      [
+        "missing ambiguity reason",
+        (fixture) => {
+          fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.manualRecoveryReasons = ["vectorization-pending"];
+        },
+      ],
+      [
+        "missing pending reason",
+        (fixture) => {
+          fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.manualRecoveryReasons = ["mutation-ambiguous"];
+        },
+      ],
+      [
+        "additional recovery reason",
+        (fixture) => {
+          fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.manualRecoveryReasons.push("source-read-incomplete");
+        },
+      ],
+      [
+        "semantic state not pending",
+        (fixture) => {
+          fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.semanticStatus = "ready";
+        },
+      ],
+      [
+        "missing pending profile",
+        (fixture) => {
+          fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.pendingEmbeddingProfile = null;
+        },
+      ],
+      [
+        "different pending profile",
+        (fixture) => {
+          fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.pendingEmbeddingProfile = {
+            ...embedding,
+            connectionId: "wrong-connection",
+            model: "wrong",
+          };
+        },
+      ],
+      [
+        "different last successful profile",
+        (fixture) => {
+          fixture.stored.convoMemoryBridgeV1.ensembles[0]!.runtime.lastSuccessfulEmbeddingProfile = {
+            ...embedding,
+            connectionId: "wrong",
+          };
+        },
+      ],
+      [
+        "auto sync disabled",
+        (fixture) => {
+          fixture.stored.convoMemoryBridgeV1.ensembles[0]!.autoSync = false;
+        },
+      ],
+      [
+        "live authority",
+        (fixture) => {
+          fixture.row.holderSessionId = "still-live-holder";
+          fixture.row.leaseTokenDigest = "a".repeat(64);
+          fixture.row.expiresAt = new Date(Date.now() + 60_000).toISOString();
+        },
+      ],
+    ];
+  for (const [label, mutate] of invalidPreparedMarkers) {
+    const fixture = await preparedMarkerFixture();
+    mutate(fixture);
+    await seedInterruptedVectorize(fixture);
+    const before = await interruptedVectorizeState();
+    const diskBefore = interruptedVectorizeDiskState();
+    const eventsBefore = publishedAdminDrafts.length;
+    const rejected = await app.inject({
+      method: "POST",
+      url: adminUrl("recover-and-resume"),
+      headers: adminHeaders(exactSecret),
+      payload: {},
+    });
+    assert.equal(rejected.statusCode, 409, `${label}: ${rejected.body}`);
+    assert.deepEqual(await interruptedVectorizeState(), before, `${label} must preserve all state`);
+    assert.deepEqual(interruptedVectorizeDiskState(), diskBefore, `${label} must preserve durable evidence`);
+    assert.equal(publishedAdminDrafts.length, eventsBefore, `${label} must not publish recovery success`);
+    await db
+      .delete(personalExtensionOperationJournal)
+      .where(eq(personalExtensionOperationJournal.operationDigest, interruptedVectorizeDigest));
+  }
+  await db
+    .update(personalExtensionCoordination)
+    .set(markerAfter.row!)
+    .where(eq(personalExtensionCoordination.extensionId, EXTENSION_ID));
+  await coordination.deactivateCoordination(EXTENSION_ID);
 
   // A marker-current mutation can pass recovery proof but still fail the
   // stricter activation contract (autoSync was disabled). Keep it blocked.

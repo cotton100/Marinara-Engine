@@ -4,6 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- Administrator CMB recovery can resume an expired mutation interrupted after only its initial storage marker was saved. Recovery requires the exact current marker and embedding profile, preserves memories, vectors and pending work, and does not loosen automatic lease takeover.
+
 - CMB supports registered Roleplay rooms in Individual as well as Merged mode without changing the room's speaking mode. Opt-in recent context for Individual replies is filtered for the actual responder, including sequential and smart turns, and reused per speaker across follow-ups; existing roster and memory-visibility checks remain required.
 
 - Memory-limited servers now use the existing eight-chat residency default when the OS reports a limit up to 4 GiB; clean read-only chats can also be released on the idle safety tick. With a residency cap enabled, global scans release their extra clean cached rows afterward instead of keeping whole tables resident. Explicit residency settings still take precedence; a large scan or export can still have a high memory peak.

@@ -1,0 +1,42 @@
+{
+  "$comment": "Local Whisper hallucination filter list. Entries are matched against NORMALIZED text: NFKC, lower-case, everything except letters/digits removed (spaces and punctuation stripped). `exact` = whole-segment match, `regex` = whole-segment match (anchored automatically), `tailSuspects` = substring match used only by rule 3 (short final segment after a long gap). Edit freely; the server reloads this file when it changes.",
+  "exact": [
+    "감사합니다",
+    "고맙습니다",
+    "시청해주셔서감사합니다",
+    "시청해주셔서감사합니다다음영상에서만나요",
+    "구독과좋아요부탁드립니다",
+    "구독좋아요알림설정",
+    "자막제공",
+    "자막",
+    "끝",
+    "네",
+    "음",
+    "다음영상에서만나요",
+    "오늘도시청해주셔서감사합니다",
+    "imsorry",
+    "thankyou",
+    "thanks",
+    "thanksforwatching",
+    "thankyouforwatching",
+    "pleasesubscribe",
+    "subscribe",
+    "bye",
+    "you",
+    "sorry",
+    "okay",
+    "hmm",
+    "subtitlesbytheamaraorgcommunity",
+    "transcribedby",
+    "icantsharethat"
+  ],
+  "regex": [
+    "^mbc뉴스.{1,5}입니다$",
+    "^kbs뉴스.{1,5}입니다$",
+    "^sbs뉴스.{1,5}입니다$",
+    "^뉴스.{1,5}입니다$",
+    "^(im)?sorry(imsorry)*$",
+    "^(thankyou)+$"
+  ],
+  "tailSuspects": ["감사합니다", "죄송합니다", "sorry", "thankyou", "bye"]
+}

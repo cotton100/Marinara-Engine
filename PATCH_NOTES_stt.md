@@ -1,6 +1,6 @@
 # Local Whisper STT 필터 — 현재 적용 기준
 
-2026-09-25 수정본. Engine 기반은 `eb01019fed14`이며 최신 CMB·RAM·RP Individual 관련 5커밋을 보존한다. 페이블 원본 `e8bc99167c27ddde6a4277824d8ae0c781a7db32`의 STT를 가져와 보완했다.
+2026-09-25 통합본. STT 수정 커밋 `bbcbd32e98b2`와 최신 CMB 복구 커밋 `8d39d46ceeb6`을 합쳤다. 기존 CMB·RAM·RP Individual 관련 5커밋과 후속 prepared-marker 복구 수정을 모두 보존한다. 페이블 원본 `e8bc99167c27ddde6a4277824d8ae0c781a7db32`의 STT를 가져와 보완했다.
 
 ## 현재 동작
 
@@ -50,9 +50,9 @@ Node 24에서 `node scripts/run-regressions.mjs --filter stt-` **3/3 PASS**, `--
 
 ## 통합·배포
 
-이 PC에서 개인 포크는 `fork`, `origin`은 Pasta-Devs 원본이다. 기존 `2d7a2f48` 기반 STT 2커밋을 현재 candidate에 fast-forward할 수 있다고 가정하지 않는다. 현재 작업은 최신 기준의 분리된 로컬 수정본이며 기존 candidate 브랜치는 이동하지 않았다.
+이 PC에서 개인 포크는 `fork`, `origin`은 Pasta-Devs 원본이다. 기존 `2d7a2f48` 기반 STT 2커밋을 그대로 머지하지 않는다. 분리 작업본에서 `bbcbd32e98b2`와 `8d39d46ceeb6` 양쪽 이력을 보존한 통합 커밋을 만든 뒤 검증된 커밋만 로컬 candidate에 fast-forward한다. 과거 STT 전용 빌드로 최신 CMB 운영 코드를 교체하지 않는다.
 
-배포 전에 최종 Engine 커밋 SHA를 확정하고, Companion에 `contract246IndividualRp`를 상속한 exact-build 계약·registry·혼합 identity 회귀를 추가한다. commit 전 기존/가짜 SHA로 계약을 등록하지 않는다. 서버·화면은 같은 최종 SHA로 빌드해야 한다. 로컬 dirty 빌드는 운영 배포용이 아니다.
+배포 전에 최종 Engine 커밋 SHA를 확정하고, Companion에 `contract246CmbPreparedRecovery`를 상속한 exact-build 계약·registry·혼합 identity 회귀를 추가한다. 기존 `8d39d46ceeb6` 및 과거 지원 계약도 유지한다. 서버·화면은 같은 최종 SHA로 빌드해야 한다. 로컬 dirty 빌드는 운영 배포용이 아니다. 최종 커밋 번호와 검증 결과는 Companion의 `marinara/stt-hallucination-filter/README.md` 및 작업공간 결과 기록을 따른다.
 
 운영 변경 승인을 받은 뒤 CMB·백업·알림봇 교체 절차와 무발송 probe/doctor를 확인한다. 이번 수정 요청에 push·운영 배포 승인이 포함되었다고 해석하지 않는다.
 

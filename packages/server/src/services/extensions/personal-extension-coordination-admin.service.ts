@@ -514,16 +514,17 @@ export const proveCmbOperationVectorizeTransition: PersonalExtensionOperationVec
 };
 
 /**
- * Operator recovery may close a dispatching journal only with one of two
- * server-owned proofs: the exact CMB ensemble still carries its durable
- * ambiguity marker, or one older mutation journal was superseded by a later
- * fully-ready protected state. Recovery closes only stale server authority;
- * it neither removes a current marker nor rewrites user storage or lorebooks.
+ * Operator recovery may close a prepared mutation with only its exact pending
+ * storage marker, or a dispatching journal with one of two server-owned proofs:
+ * the exact CMB ensemble still carries its durable ambiguity marker, or one
+ * older mutation journal was superseded by a later fully-ready protected state.
+ * Recovery closes only stale server authority; it neither removes a current
+ * marker nor rewrites user storage or lorebooks.
  */
 export const proveCmbBlockedJournalRecovery: PersonalExtensionBlockedJournalRecoveryProof = async (tx, evidence) => {
   try {
     if (
-      evidence.journal.phase !== "dispatching" ||
+      (evidence.journal.phase !== "prepared" && evidence.journal.phase !== "dispatching") ||
       evidence.journal.extensionId !== evidence.coordination.extensionId ||
       evidence.journal.fence < 0 ||
       evidence.journal.fence > evidence.coordination.fence
@@ -540,6 +541,22 @@ export const proveCmbBlockedJournalRecovery: PersonalExtensionBlockedJournalReco
     const lorebookRevisions = evidence.resourceRevisions.filter((resource) => resource.kind === "lorebook");
     const storageRevision = storageRevisions[0];
     const lorebookRevision = lorebookRevisions[0];
+    if (evidence.journal.phase === "prepared") {
+      // A storage-only marker does not cross the server's dispatch barrier.
+      // Keep the pending state for normal reconciliation, but close this stale
+      // admission only when the exact marker and embedding profile still match.
+      return (
+        evidence.journal.operationKind === "mutation" &&
+        evidence.journal.dispatchingAt === null &&
+        evidence.journal.finalAt === null &&
+        evidence.resourceRevisions.length === 1 &&
+        storageRevisions.length === 1 &&
+        storageRevision?.resourceId === evidence.journal.extensionId &&
+        storageRevision.presence === "present" &&
+        storageRevision.resourceRevision === fresh.configRevision &&
+        exactPreparedAutoRecoveryState(ensemble)
+      );
+    }
     const reasons = ensemble.runtime.manualRecoveryReasons;
     const setupReasons = reasons.filter((reason) => SETUP_RECOVERY_REASONS.has(reason));
     const markerStillCurrent =

@@ -957,6 +957,32 @@ export function ChatSettingsDrawer({
     () => (typeof chat.metadata === "string" ? JSON.parse(chat.metadata) : (chat.metadata ?? {})),
     [chat.metadata],
   );
+  const cmbCwaConflictWarning =
+    isConversation && metadata.crossChatAwareness !== false ? (
+      <p className="px-3 text-xs leading-relaxed text-amber-700 dark:text-amber-400/80">
+        {localizeUi("ui.chat.chatsettingsdrawer.cmbRecentContextCwaConflict")}
+      </p>
+    ) : null;
+  const renderCmbRecentContextToggle = () =>
+    metadata.sceneStatus != null ? null : (
+      <>
+        <SettingsSwitch
+          label={localizeUi("ui.chat.chatsettingsdrawer.cmbRecentContext")}
+          description={localizeUi("ui.chat.chatsettingsdrawer.cmbRecentContextDescription")}
+          checked={metadata.cmbRecentContextEnabled === true}
+          onChange={(cmbRecentContextEnabled) => updateMeta.mutate({ id: chat.id, cmbRecentContextEnabled })}
+          labelPosition="start"
+          className={cn(
+            "justify-between rounded-md px-3 py-2.5 text-left",
+            metadata.cmbRecentContextEnabled === true
+              ? "bg-[var(--primary)]/10 ring-1 ring-[var(--primary)]/30"
+              : "bg-[var(--secondary)] hover:bg-[var(--accent)]",
+          )}
+          labelClassName="text-xs font-medium"
+        />
+        {metadata.cmbRecentContextEnabled === true && cmbCwaConflictWarning}
+      </>
+    );
   // Package integrations only show while their package is installed and active.
   const noodleInstalled = installedCapabilities.some(
     (capability) => capability.id === "noodle" && capability.status === "active",
@@ -6467,24 +6493,27 @@ export function ChatSettingsDrawer({
                 </div>
 
                 {metadata.autonomousMessages && chatCharIds.length > 0 && (
-                  <SettingsSwitch
-                    label={localizeUi("ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessages")}
-                    description={localizeUi(
-                      "ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessagesDescription",
-                    )}
-                    checked={metadata.autonomousCmbContextRefreshEnabled === true}
-                    onChange={(autonomousCmbContextRefreshEnabled) =>
-                      updateMeta.mutate({ id: chat.id, autonomousCmbContextRefreshEnabled })
-                    }
-                    labelPosition="start"
-                    className={cn(
-                      "justify-between rounded-md px-3 py-2.5 text-left",
-                      metadata.autonomousCmbContextRefreshEnabled === true
-                        ? "bg-[var(--primary)]/10 ring-1 ring-[var(--primary)]/30"
-                        : "bg-[var(--secondary)] hover:bg-[var(--accent)]",
-                    )}
-                    labelClassName="text-xs font-medium"
-                  />
+                  <>
+                    <SettingsSwitch
+                      label={localizeUi("ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessages")}
+                      description={localizeUi(
+                        "ui.chat.chatsettingsdrawer.refreshCmbContextBeforeAutonomousMessagesDescription",
+                      )}
+                      checked={metadata.autonomousCmbContextRefreshEnabled === true}
+                      onChange={(autonomousCmbContextRefreshEnabled) =>
+                        updateMeta.mutate({ id: chat.id, autonomousCmbContextRefreshEnabled })
+                      }
+                      labelPosition="start"
+                      className={cn(
+                        "justify-between rounded-md px-3 py-2.5 text-left",
+                        metadata.autonomousCmbContextRefreshEnabled === true
+                          ? "bg-[var(--primary)]/10 ring-1 ring-[var(--primary)]/30"
+                          : "bg-[var(--secondary)] hover:bg-[var(--accent)]",
+                      )}
+                      labelClassName="text-xs font-medium"
+                    />
+                    {metadata.autonomousCmbContextRefreshEnabled === true && cmbCwaConflictWarning}
+                  </>
                 )}
 
                 {/* Character exchanges toggle (group chats only) */}
@@ -6984,6 +7013,7 @@ export function ChatSettingsDrawer({
                   )}
                   labelClassName="text-xs font-medium"
                 />
+                {renderCmbRecentContextToggle()}
                 {chat.connectedChatId ? (
                   (() => {
                     const linked = (allChats ?? []).find((c: Chat) => c.id === chat.connectedChatId);
@@ -7085,6 +7115,7 @@ export function ChatSettingsDrawer({
               help={localizeUi("ui.chat.chatsettingsdrawer.linkToAnOocConversationAndOptionallyLetRoleplay")}
             >
               <div className="space-y-2">
+                {renderCmbRecentContextToggle()}
                 <SettingsSwitch
                   label={localizeUi("ui.chat.chatsettingsdrawer.allowCharacterDms")}
                   description={localizeUi("roleplay.commands.dm.shortcutDescription")}

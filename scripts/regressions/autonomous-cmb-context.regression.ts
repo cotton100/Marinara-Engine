@@ -12,6 +12,7 @@ import {
   chats,
   installedExtensions,
   lorebookEntries,
+  lorebooks,
   messages,
   personalExtensionCoordination,
   personas,
@@ -405,6 +406,23 @@ async function setConfig(config: unknown): Promise<void> {
     .update(appSettings)
     .set({ value: JSON.stringify({ convoMemoryBridgeV1: config }), updatedAt: timestamp(0) })
     .where(eq(appSettings.key, `extension-storage:${CMB_ID}`));
+  const candidate = config as ReturnType<typeof cmbConfig>;
+  if (Array.isArray(candidate?.ensembles) && candidate.ensembles.length === 1) {
+    const ensemble = candidate.ensembles[0]!;
+    await db
+      .update(lorebooks)
+      .set({
+        scope: JSON.stringify({
+          mode: "specific",
+          chatIds: [
+            ensemble.rpChatId,
+            ...ensemble.groupConvoChatIds,
+            ...ensemble.members.map((member) => member.dmChatId),
+          ],
+        }),
+      })
+      .where(eq(lorebooks.id, "cmb-lorebook"));
+  }
 }
 
 async function setMessages(chatId: string, fixtures: MessageFixture[]): Promise<void> {
@@ -512,6 +530,14 @@ async function buildForTarget(
 }
 
 try {
+  await db.insert(lorebooks).values({
+    id: "cmb-lorebook",
+    name: "Synthetic CMB book",
+    enabled: "true",
+    scope: JSON.stringify({ mode: "specific", chatIds: [RP_CHAT_ID, TARGET_CHAT_ID, FRIEND_CHAT_ID] }),
+    createdAt: timestamp(0),
+    updatedAt: timestamp(0),
+  });
   await db.insert(installedExtensions).values({
     id: CMB_ID,
     name: "Convo Memory Bridge",
@@ -678,8 +704,8 @@ try {
   assert.doesNotMatch(anchored, /anchored-[12]\b/u);
   for (let index = 3; index <= 7; index += 1) assert.match(anchored, new RegExp(`anchored-${index}\\b`, "u"));
 
-  // A row that is not currently usable by this target must not suppress raw
-  // tail context merely because it carries CMB-shaped metadata.
+  // Vector readiness must not suppress recent text, but an explicit audience
+  // restriction must not be bypassed by reading that text through the raw tail.
   await db
     .update(lorebookEntries)
     .set({ embeddingSpaceId: null })
@@ -696,7 +722,9 @@ try {
     .where(eq(lorebookEntries.id, `${RP_CHAT_ID}-managed-1-5`));
   const targetHiddenBoundary = await build();
   assert.ok(targetHiddenBoundary);
-  assert.match(targetHiddenBoundary, /anchored-3\b/u);
+  assert.doesNotMatch(targetHiddenBoundary, /anchored-[1-5]\b/u);
+  assert.match(targetHiddenBoundary, /anchored-6\b/u);
+  assert.match(targetHiddenBoundary, /anchored-7\b/u);
 
   // A deduplicated CMB memory can carry occurrences from multiple chats, but
   // its one timestamp range is canonical rather than per-occurrence. Do not
@@ -893,6 +921,7 @@ try {
   // Markdown structural headings and control bytes from stored content are
   // neutralized, each message is truncated, and the complete block is bounded.
   await setConfig(cmbConfig());
+  await clearManagedEntries();
   await setMessages(
     RP_CHAT_ID,
     Array.from({ length: 8 }, (_, index) => ({
@@ -1096,7 +1125,7 @@ try {
   const requestGatePin =
     /const autonomousCmbRequestTargetCharacterId\s*=\s*chatMode === "conversation"\s*&&\s*input\.autonomous === true\s*&&\s*input\.impersonate !== true\s*&&\s*!input\.regenerateMessageId\s*&&\s*!input\.continueMessageId\s*&&\s*input\.turnGameBots !== true\s*&&\s*chatMeta\.autonomousCmbContextRefreshEnabled === true\s*&&\s*autonomousCmbTargetCharacterId\s*\?\s*autonomousCmbTargetCharacterId\s*:\s*null;/u;
   const buildCallPin =
-    /buildAutonomousCmbPendingContext\(\{\s*db:\s*app\.db,\s*targetChatId:\s*input\.chatId,\s*targetCharacterId:\s*autonomousCmbRequestTargetCharacterId,[^}]*\}\)\.catch\(\(error\) => \{[^}]*return null;\s*\}\)/u;
+    /buildCmbRecentContext\(\{\s*db:\s*app\.db,\s*targetChatId:\s*input\.chatId,\s*targetCharacterIds:\s*\[autonomousCmbRequestTargetCharacterId\],\s*generation:\s*"autonomous",[^}]*signal:\s*abortController\.signal,\s*\}\)/u;
   const lateRosterPin =
     /const autonomousCmbPendingContextBlock\s*=\s*autonomousCmbRequestTargetCharacterId !== null\s*&&\s*characterIds\.includes\(autonomousCmbRequestTargetCharacterId\)\s*\?\s*await autonomousCmbPendingContextPromise\s*:\s*null;/u;
   const singleSpeakerPin =
@@ -1104,7 +1133,7 @@ try {
   const memoryScopePin =
     /characterIds:\s*autonomousCmbSingleSpeaker && autonomousCmbRequestTargetCharacterId\s*\?\s*\[autonomousCmbRequestTargetCharacterId\]\s*:\s*characterIds,/u;
   const awarenessCollectionPin =
-    /const conversationAwarenessBlocks = \[convoAwarenessBlock, autonomousCmbPendingContextBlock\]\.filter\(\s*\(block\): block is string => typeof block === "string" && block\.length > 0,\s*\);/u;
+    /const conversationAwarenessBlocks = \[\s*convoAwarenessBlock,\s*autonomousCmbPendingContextBlock,\s*ordinaryCmbRecentContextBlock,?\s*\]\.filter\(\s*\(block\): block is string => typeof block === "string" && block\.length > 0,?\s*\);/u;
   const awarenessInsertionPin =
     /finalMessages\.splice\(\s*insertAt,\s*0,\s*\.\.\.conversationAwarenessBlocks\.map\(\(content\) => \(\{ role: "system" as const, content \}\)\),\s*\);/u;
   const mentionsPin =
@@ -1115,7 +1144,7 @@ try {
     /const mergedSpeaksOnlyTarget\s*=\s*!isGroupChat\s*\|\|\s*Boolean\(regenGroupChatIndividual\)\s*\|\|\s*mentionedConversationCharacters\.length === 1\s*\|\|\s*autonomousCmbSingleSpeaker;/u;
   const commandAttributionPin =
     /characterId:\s*mergedSpeaksOnlyTarget\s*\?\s*genResult\.characterId\s*:\s*\(genResult\.commandCharacterIds\?\.\[cmdIndex\]\s*\?\?\s*genResult\.characterId\),/u;
-  const uiGatePin = /\{metadata\.autonomousMessages && chatCharIds\.length > 0 && \(\s*<SettingsSwitch\s/u;
+  const uiGatePin = /\{metadata\.autonomousMessages && chatCharIds\.length > 0 && \(\s*<>\s*<SettingsSwitch\s/u;
   const foregroundTargetPin =
     /generate\(\{\s*chatId,\s*connectionId:\s*null,\s*forCharacterId:\s*characterId,\s*autonomous:\s*true,/u;
   const backgroundTargetPin =
@@ -1123,7 +1152,7 @@ try {
   const serverTargetPin =
     /url:\s*"\/api\/generate",\s*payload:\s*\{\s*chatId,\s*connectionId:\s*null,\s*forCharacterId:\s*characterId,\s*streaming:\s*false,\s*userStatus:\s*"idle",\s*userActivity:\s*"away or offline",\s*autonomous:\s*true,/u;
 
-  assert.match(generateRouteSource, /import \{ buildAutonomousCmbPendingContext \}/u);
+  assert.match(generateRouteSource, /import \{ buildCmbRecentContext \}/u);
   // Releasing the known in-memory WeakSet slot is not a database deletion.
   assert.doesNotMatch(
     cmbServiceSource.replaceAll("activeReads.delete(input.db)", ""),
@@ -1237,14 +1266,14 @@ try {
     generateRouteSource,
     buildCallPin,
     (match) =>
-      match.replace("targetCharacterId: autonomousCmbRequestTargetCharacterId", "targetCharacterId: characterIds[0]"),
+      match.replace("targetCharacterIds: [autonomousCmbRequestTargetCharacterId]", "targetCharacterIds: characterIds"),
     "CMB target forwarding",
   );
   assertPinRejectsMutation(
     generateRouteSource,
     buildCallPin,
-    (match) => match.replace("return null;", 'return "";'),
-    "CMB read fail-open catch",
+    (match) => match.replace("signal: abortController.signal,", "signal: undefined,"),
+    "CMB read cancellation forwarding",
   );
   assertPinRejectsMutation(
     generateRouteSource,

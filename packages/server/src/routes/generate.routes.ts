@@ -652,7 +652,7 @@ import { injectCommittedTrackerContext } from "../services/generation/committed-
 import { loadPriorBeholderState } from "../services/agents/beholder-state.js";
 import { injectGameGmPromptRuntime } from "../services/generation/game-gm-prompt-runtime.js";
 import { mergeConversationCharacterMemories } from "../services/generation/conversation-memory-context.js";
-import { buildAutonomousCmbPendingContext } from "../services/conversation/autonomous-cmb-context.service.js";
+import { buildCmbRecentContext } from "../services/conversation/autonomous-cmb-context.service.js";
 import { injectMemoryRecallContext } from "../services/generation/memory-recall-context.js";
 import { shouldSkipAgentByMessageInterval } from "../services/generation/agent-cadence.js";
 import {
@@ -2005,22 +2005,20 @@ export async function generateRoutes(app: FastifyInstance) {
         autonomousCmbTargetCharacterId
           ? autonomousCmbTargetCharacterId
           : null;
-      const autonomousCmbPendingContextPromise = autonomousCmbRequestTargetCharacterId
-        ? buildAutonomousCmbPendingContext({
+      const autonomousCmbRecentContextPromise = autonomousCmbRequestTargetCharacterId
+        ? buildCmbRecentContext({
             db: app.db,
             targetChatId: input.chatId,
-            targetCharacterId: autonomousCmbRequestTargetCharacterId,
+            targetCharacterIds: [autonomousCmbRequestTargetCharacterId],
+            generation: "autonomous",
             timeZone: promptTimeZone,
             wrapFormat: resolvedPreset ? normalizePromptWrapFormat(resolvedPreset.wrapFormat) : "xml",
-          }).catch((error) => {
-            logger.warn(
-              error,
-              "[autonomous-cmb] Could not prepare pending shared context for chat %s; continuing without it",
-              input.chatId,
-            );
-            return null;
+            signal: abortController.signal,
           })
         : Promise.resolve(null);
+      const autonomousCmbPendingContextPromise = autonomousCmbRecentContextPromise.then(
+        (result) => result?.block ?? null,
+      );
 
       const eligibleCharacterActivityConfigs: typeof characterActivityAgentConfigs = [];
       if (
@@ -2259,6 +2257,33 @@ export async function generateRoutes(app: FastifyInstance) {
         throw new Error("All characters in this chat are disabled. Enable at least one character before generating.");
       }
 
+      // Ordinary replies use the complete post-activity audience, even when a
+      // caller requests one responder. This does not enable the autonomous
+      // single-speaker/command path and never reads another member's private DM.
+      const ordinaryCmbAudience =
+        (chatMode === "conversation" || chatMode === "roleplay") &&
+        input.autonomous !== true &&
+        input.impersonate !== true &&
+        !input.regenerateMessageId &&
+        !input.continueMessageId &&
+        input.turnGameBots !== true &&
+        chatMeta.sceneStatus == null &&
+        chatMeta.cmbRecentContextEnabled === true &&
+        characterIds.length > 0
+          ? [...characterIds]
+          : null;
+      const ordinaryCmbRecentContextPromise = ordinaryCmbAudience
+        ? buildCmbRecentContext({
+            db: app.db,
+            targetChatId: input.chatId,
+            targetCharacterIds: ordinaryCmbAudience,
+            generation: "ordinary",
+            timeZone: promptTimeZone,
+            wrapFormat: resolvedPreset ? normalizePromptWrapFormat(resolvedPreset.wrapFormat) : "xml",
+            signal: abortController.signal,
+          })
+        : Promise.resolve(null);
+
       let groupHistoryCharacterNamesByIdPromise: Promise<Map<string, string>> | null = null;
       const getGroupHistoryCharacterNamesById = () => {
         groupHistoryCharacterNamesByIdPromise ??= resolveCharacterNameMap(allCharacterIds, (id) => chars.getById(id));
@@ -2339,6 +2364,10 @@ export async function generateRoutes(app: FastifyInstance) {
 
       // eslint-disable-next-line no-constant-condition
       while (true) {
+        // Reuse one bounded read across Mari follow-ups; no additional tail scans.
+        const cmbRecentContextResult = await (ordinaryCmbAudience
+          ? ordinaryCmbRecentContextPromise
+          : autonomousCmbRecentContextPromise);
         // Per-iteration flag: set when a Mari [fetch:] command actually returned
         // data AND persisted mariContext. The follow-up branch at the bottom of
         // the loop body gates on this so a fetch that found nothing or threw
@@ -3318,6 +3347,11 @@ export async function generateRoutes(app: FastifyInstance) {
               chars,
               gameStateStore,
               wrapFormat,
+              omitRoleplayTranscript:
+                cmbRecentContextResult !== null &&
+                (cmbRecentContextResult.scope === "unavailable" ||
+                  (cmbRecentContextResult.scope === "managed" &&
+                    cmbRecentContextResult.rpChatId === chat.connectedChatId)),
             });
           if (connectedChatSystemPrompt) {
             conversationSystemPrompt += "\n\n" + connectedChatSystemPrompt;
@@ -4240,9 +4274,17 @@ export async function generateRoutes(app: FastifyInstance) {
         }
 
         // ── Inject cross-chat awareness and opt-in CMB pending context after persona info. ──
-        const conversationAwarenessBlocks = [convoAwarenessBlock, autonomousCmbPendingContextBlock].filter(
-          (block): block is string => typeof block === "string" && block.length > 0,
-        );
+        const ordinaryCmbRecentContextBlock =
+          ordinaryCmbAudience !== null &&
+          ordinaryCmbAudience.length === characterIds.length &&
+          ordinaryCmbAudience.every((id) => characterIds.includes(id))
+            ? (cmbRecentContextResult?.block ?? null)
+            : null;
+        const conversationAwarenessBlocks = [
+          convoAwarenessBlock,
+          autonomousCmbPendingContextBlock,
+          ordinaryCmbRecentContextBlock,
+        ].filter((block): block is string => typeof block === "string" && block.length > 0);
         if (conversationAwarenessBlocks.length > 0) {
           const firstUserIdx = finalMessages.findIndex((m) => m.role === "user" || m.role === "assistant");
           const insertAt = firstUserIdx >= 0 ? firstUserIdx : finalMessages.length;

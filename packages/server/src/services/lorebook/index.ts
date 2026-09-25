@@ -27,6 +27,7 @@ import {
   updateTimingStatesForScan,
 } from "./keyword-scanner.js";
 import { applyTokenBudget, processActivatedEntries } from "./prompt-injector.js";
+import { withCmbProvenance } from "./cmb-provenance.js";
 
 export interface LorebookScanResult {
   worldInfoBefore: string;
@@ -546,7 +547,7 @@ function resolveLorebookResolutionPass(
       rawContent: candidate.rawContent ?? candidate.entry.content,
       entry: {
         ...candidate.entry,
-        content: resolved.content,
+        content: withCmbProvenance(candidate.entry, resolved.content),
       },
     });
   }

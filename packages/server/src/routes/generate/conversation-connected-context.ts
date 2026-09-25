@@ -47,6 +47,8 @@ export async function resolveConversationConnectedChatContext(args: {
   chars: ConnectedCharactersStore;
   gameStateStore: ConnectedGameStateStore;
   wrapFormat: WrapFormat;
+  /** Managed CMB context supplies its own filtered RP tail; never read the native transcript as a fallback. */
+  omitRoleplayTranscript?: boolean;
 }): Promise<{ connectedChatBlock: string | null; systemPromptAppend: string | null }> {
   if (!args.connectedChatId) return { connectedChatBlock: null, systemPromptAppend: null };
 
@@ -61,7 +63,7 @@ export async function resolveConversationConnectedChatContext(args: {
   const nestedSection = (content: string, name: string): string => wrapContent(content, name, args.wrapFormat, 1);
 
   if (connectedChat && connectedChat.mode === "roleplay") {
-    const rpMessages = await args.chats.listMessages(connectedChat.id);
+    const rpMessages = args.omitRoleplayTranscript === true ? [] : await args.chats.listMessages(connectedChat.id);
     const recentRp = rpMessages.slice(-20);
 
     const rpCharIds: string[] =
@@ -88,19 +90,30 @@ export async function resolveConversationConnectedChatContext(args: {
       recentMessageLines.push(`[${safe(speaker)}]: ${safe(String(m.content ?? "").slice(0, 500))}`);
     }
     const safeConnectedChatName = safe(connectedChat.name ?? "Connected roleplay");
-    connectedChatBlock = wrapContent(
-      [`Connected roleplay: ${safeConnectedChatName}`, nestedSection(recentMessageLines.join("\n"), "Recent Messages")]
-        .filter(Boolean)
-        .join("\n\n"),
-      "Connected Roleplay",
-      args.wrapFormat,
-    );
+    if (args.omitRoleplayTranscript !== true) {
+      connectedChatBlock = wrapContent(
+        [
+          `Connected roleplay: ${safeConnectedChatName}`,
+          nestedSection(recentMessageLines.join("\n"), "Recent Messages"),
+        ]
+          .filter(Boolean)
+          .join("\n\n"),
+        "Connected Roleplay",
+        args.wrapFormat,
+      );
+    }
 
     if (connectedInfluenceCommandEnabled || connectedNoteCommandEnabled) {
-      const connectedInstructionLines = [
-        `You have access to context from a connected roleplay: "${safeConnectedChatName}".`,
-        `Recent messages from that roleplay are provided so you can naturally reference or discuss events happening there.`,
-      ];
+      const connectedInstructionLines =
+        args.omitRoleplayTranscript === true
+          ? [
+              `You have a link to a connected roleplay: "${safeConnectedChatName}".`,
+              `Reference or discuss its events only when relevant context is actually supplied in this prompt; the link alone does not provide its recent messages.`,
+            ]
+          : [
+              `You have access to context from a connected roleplay: "${safeConnectedChatName}".`,
+              `Recent messages from that roleplay are provided so you can naturally reference or discuss events happening there.`,
+            ];
       if (connectedInfluenceCommandEnabled) {
         connectedInstructionLines.push(
           ``,

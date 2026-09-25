@@ -9,6 +9,9 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 - Advanced Memory checks for a new scene or summary record stay within the current chat instead of promoting every chat's memory records into RAM.
 - Professor Mari's single-chat detail and message reads no longer load every chat's messages. Optional CMB recent-context reads stop before further queries after their deadline and cannot accumulate behind an unfinished read.
 
+- Retrieved CMB memories now include source room identifiers and UTC record dates in the model input, distinguish record time from in-world events, and mark missing or ambiguous provenance without rewriting stored memories or embeddings.
+- Ordinary Conversation and registered Roleplay replies can separately opt into recent shared CMB context (off by default). The shared reader checks at most four recently updated source rooms and includes up to five messages, preserving per-character hiding, conversation-start boundaries, and managed-memory visibility. Private DM transcripts are never promoted into shared prompts. Native connected-RP transcripts are omitted when this managed path takes responsibility, without changing Influence/Note commands; Cross-Chat Awareness conflicts are explained instead of changing user settings.
+
 - Opt-in CMB autonomous messages retain the newest five visible shared messages even after those messages are saved to memory, so semantic retrieval cannot silently replace recent context with older memories.
 
 - Administrators can recover and resume a safely recoverable blocked CMB without closing browser tabs; recovery keeps writes fenced until activation validation and durable journal retirement finish.

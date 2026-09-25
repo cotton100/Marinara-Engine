@@ -1,5 +1,6 @@
 import {
   PERSONAL_EXTENSION_FULL_PAGE_CAPABILITY,
+  collectEffectivelyDisabledFolderIds,
   normalizePersonalExtensionCapabilities,
   type PersonalExtensionCapability,
   type PersonalExtensionSource,
@@ -13,6 +14,9 @@ import {
   characters,
   chats,
   installedExtensions,
+  lorebookEntries,
+  lorebookFolders,
+  lorebooks,
   messages,
   personalExtensionCoordination,
   personas,
@@ -21,6 +25,11 @@ import { computePersonalExtensionHash } from "../extensions/personal-extension-h
 import { wrapContent } from "../prompt/format-engine.js";
 import { sanitizePromptLeaf } from "../prompt/prompt-escaping.js";
 import { formatZonedConversationDate, formatZonedConversationTime } from "./timezone.js";
+import {
+  isCmbSourceMessageRestricted,
+  resolveCmbSourceRestrictions,
+  type CmbSourceRestriction,
+} from "./cmb-source-visibility.js";
 
 const CMB_EXTENSION_NAME = "Convo Memory Bridge";
 const CMB_STORAGE_KEY = "convoMemoryBridgeV1";
@@ -36,6 +45,11 @@ const MAX_ENSEMBLES = 32;
 const MAX_MEMBERS_PER_ENSEMBLE = 32;
 const MAX_GROUP_SOURCES_PER_ENSEMBLE = 12;
 const MAX_MAPPED_SOURCES = MAX_GROUP_SOURCES_PER_ENSEMBLE + 1;
+// ponytail: rank by persisted chat activity; a dedicated tail index is only
+// needed if four recently updated sources cannot cover a larger ensemble.
+const MAX_READ_SOURCES = 4;
+const MAX_MANAGED_ENTRIES = 2048;
+const MAX_MANAGED_FOLDERS = 256;
 const MAX_OUTPUT_MESSAGES = 5;
 const MAX_MESSAGE_CHARS = 2_000;
 const MAX_CONTEXT_CHARS = 12_000;
@@ -50,7 +64,10 @@ const CAST_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu;
 
 type ExtensionRow = typeof installedExtensions.$inferSelect;
-type ChatRow = Pick<typeof chats.$inferSelect, "id" | "name" | "mode" | "characterIds" | "metadata" | "personaId">;
+type ChatRow = Pick<
+  typeof chats.$inferSelect,
+  "id" | "name" | "mode" | "characterIds" | "metadata" | "personaId" | "updatedAt"
+>;
 
 type CmbMember = {
   castId: string;
@@ -79,7 +96,7 @@ type SourceDescriptor = {
 
 type TargetMapping = {
   ensemble: CmbEnsemble;
-  targetRole: "dm" | "group";
+  targetRole: "dm" | "group" | "rp";
 };
 
 type PendingMessage = {
@@ -112,6 +129,19 @@ type AutonomousCmbPendingContextInput = {
   wrapFormat?: WrapFormat;
   /** Regression-only shortening; production callers cannot extend the 750ms ceiling. */
   timeoutMs?: number;
+  signal?: AbortSignal;
+};
+
+export type CmbRecentContextInput = Omit<AutonomousCmbPendingContextInput, "targetCharacterId"> & {
+  targetCharacterIds: string[];
+  generation: "autonomous" | "ordinary";
+};
+
+export type CmbRecentContextResult = {
+  block: string | null;
+  /** Unavailable is not permission to fall back to an unfiltered native RP transcript. */
+  scope: "unavailable" | "unmanaged" | "managed";
+  rpChatId: string | null;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -320,7 +350,7 @@ function validateRecentMessages(rows: RecentMessage[], chatId: string): boolean 
   return true;
 }
 
-function isHiddenFromTarget(extra: string, targetCharacterId: string): boolean | null {
+function isHiddenFromTarget(extra: string, targetCharacterIds: readonly string[]): boolean | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(extra) as unknown;
@@ -331,7 +361,7 @@ function isHiddenFromTarget(extra: string, targetCharacterId: string): boolean |
   if (parsed.hiddenFromAI === true || parsed.commandOnly === true) return true;
   if (parsed.hiddenFromAICharacterIds === undefined) return false;
   const hiddenFrom = parseStableStringArray(parsed.hiddenFromAICharacterIds, MAX_MEMBERS_PER_ENSEMBLE);
-  return hiddenFrom === null ? null : hiddenFrom.includes(targetCharacterId);
+  return hiddenFrom === null ? null : hiddenFrom.some((id) => targetCharacterIds.includes(id));
 }
 
 function promptDataText(value: string, maxChars: number, wrapFormat: WrapFormat): string {
@@ -350,7 +380,7 @@ function renderPendingContext(
   wrapFormat: WrapFormat,
 ): string {
   const introduction =
-    "These are the newest shared messages from linked Convo Memory Bridge chats, including messages already saved in CMB memory. Respect their timestamps; they are shared context for this autonomous message, not new messages in the current conversation.";
+    "These are recent shared messages from linked Convo Memory Bridge chats, including messages already saved in CMB memory. They are a limited selection from recently updated rooms, not a complete history. Timestamps describe source message records, not in-world event dates. Use this shared context for the current response; these are not new messages in the current chat.";
   const sourceOrder = [...new Set(messagesToRender.map((message) => message.sourceIndex))];
   const blocks: string[] = [];
 
@@ -358,7 +388,9 @@ function renderPendingContext(
     const sourceMessages = messagesToRender.filter((message) => message.sourceIndex === sourceIndex);
     const first = sourceMessages[0];
     if (!first) continue;
-    const lines = [`chat=${promptDataText(first.chatName, MAX_NAME_CHARS, wrapFormat)}`];
+    const lines = [
+      `chat=${promptDataText(first.chatName, MAX_NAME_CHARS, wrapFormat)} source_chat_id=${promptDataText(first.chatId, MAX_ID_CHARS, wrapFormat)}`,
+    ];
     for (const message of sourceMessages) {
       const sender =
         message.role === "user"
@@ -366,7 +398,7 @@ function renderPendingContext(
           : message.role === "narrator" || message.role === "system"
             ? "Narrator"
             : ((message.characterId && characterNames.get(message.characterId)) ?? "Character");
-      const timestamp = `[${formatZonedConversationDate(new Date(message.createdAt), timeZone)} ${formatZonedConversationTime(new Date(message.createdAt), timeZone)}]`;
+      const timestamp = `[${formatZonedConversationDate(new Date(message.createdAt), timeZone)} ${formatZonedConversationTime(new Date(message.createdAt), timeZone)}; UTC ${message.createdAt}]`;
       lines.push(
         `${timestamp} sender=${promptDataText(sender, MAX_NAME_CHARS, wrapFormat)} message=${promptDataText(message.content, MAX_MESSAGE_CHARS, wrapFormat)}`,
       );
@@ -380,9 +412,10 @@ function renderPendingContext(
 async function readPendingSourceMessages(
   db: DB,
   descriptor: SourceDescriptor,
-  targetCharacterId: string,
+  targetCharacterIds: string[],
   allowedCharacterIds: ReadonlySet<string>,
   userName: string,
+  restrictions: readonly CmbSourceRestriction[],
 ): Promise<PendingMessage[] | null> {
   const recentRows = (await db
     .select({
@@ -401,14 +434,35 @@ async function readPendingSourceMessages(
   recentRows.reverse();
   if (!validateRecentMessages(recentRows, descriptor.chat.id)) return null;
 
+  // Reset boundaries apply before visibility filtering, including a hidden marker.
+  // A shared prompt uses the latest boundary of any member of its audience.
+  let startIndex = 0;
+  for (const [index, message] of recentRows.entries()) {
+    let extra: unknown;
+    try {
+      extra = JSON.parse(message.extra) as unknown;
+    } catch {
+      return null;
+    }
+    if (!isRecord(extra)) return null;
+    if (extra.isConversationStart !== undefined && typeof extra.isConversationStart !== "boolean") return null;
+    const starts =
+      extra.conversationStartForCharacterIds === undefined
+        ? []
+        : parseStableStringArray(extra.conversationStartForCharacterIds, MAX_MEMBERS_PER_ENSEMBLE);
+    if (starts === null) return null;
+    if (extra.isConversationStart === true || starts.some((id) => targetCharacterIds.includes(id))) startIndex = index;
+  }
+
   const pending: PendingMessage[] = [];
   // Saved memory is not necessarily selected by semantic retrieval. Always
   // include a bounded recent visible tail, independent of CMB sync progress.
-  for (const message of recentRows.slice().reverse()) {
-    const hidden = isHiddenFromTarget(message.extra, targetCharacterId);
+  for (const message of recentRows.slice(startIndex).reverse()) {
+    const hidden = isHiddenFromTarget(message.extra, targetCharacterIds);
     if (hidden === null) return null;
     if (
       hidden ||
+      isCmbSourceMessageRestricted(restrictions, descriptor.chat.id, message.createdAt) ||
       (message.characterId !== null && !allowedCharacterIds.has(message.characterId)) ||
       (message.role === "assistant" && message.characterId === null)
     ) {
@@ -430,13 +484,18 @@ async function readPendingSourceMessages(
   return pending.reverse();
 }
 
-async function buildAutonomousCmbPendingContextInner(
-  { db, targetChatId, targetCharacterId, timeZone, wrapFormat = "xml" }: AutonomousCmbPendingContextInput,
+async function buildCmbRecentContextInner(
+  { db, targetChatId, targetCharacterIds, generation, timeZone, wrapFormat = "xml" }: CmbRecentContextInput,
   expired: () => boolean,
+  result: CmbRecentContextResult,
 ): Promise<string | null> {
   if (
+    expired() ||
     stableString(targetChatId) === null ||
-    stableString(targetCharacterId) === null ||
+    parseStableStringArray(targetCharacterIds, MAX_MEMBERS_PER_ENSEMBLE) === null ||
+    targetCharacterIds.length === 0 ||
+    (generation !== "autonomous" && generation !== "ordinary") ||
+    (generation === "autonomous" && targetCharacterIds.length !== 1) ||
     (wrapFormat !== "xml" && wrapFormat !== "markdown" && wrapFormat !== "none")
   ) {
     return null;
@@ -445,17 +504,12 @@ async function buildAutonomousCmbPendingContextInner(
   const extensionRows = await db
     .select()
     .from(installedExtensions)
-    .where(
-      and(
-        eq(installedExtensions.name, CMB_EXTENSION_NAME),
-        eq(installedExtensions.runtime, "client"),
-        eq(installedExtensions.enabled, "true"),
-      ),
-    )
+    .where(and(eq(installedExtensions.name, CMB_EXTENSION_NAME), eq(installedExtensions.runtime, "client")))
     .limit(MAX_MATCHING_EXTENSION_ROWS + 1);
   if (expired() || extensionRows.length > MAX_MATCHING_EXTENSION_ROWS) return null;
   const extensions = extensionRows.filter(isApprovedClientCmb);
   const extension = extensions[0];
+  if (extensionRows.length === 0) result.scope = "unmanaged";
   if (extensions.length !== 1 || !extension) return null;
 
   const coordinationRows = await db
@@ -493,16 +547,58 @@ async function buildAutonomousCmbPendingContextInner(
 
   const mappingMatches: TargetMapping[] = [];
   for (const ensemble of config.ensembles) {
-    const targetMember = ensemble.members.find((member) => member.characterId === targetCharacterId);
-    if (!targetMember) continue;
-    if (targetMember.dmChatId === targetChatId) {
+    if (!targetCharacterIds.every((id) => ensemble.members.some((member) => member.characterId === id))) continue;
+    const targetMember = ensemble.members.find((member) => member.dmChatId === targetChatId);
+    if (targetMember && sameStringSet(targetCharacterIds, [targetMember.characterId])) {
       mappingMatches.push({ ensemble, targetRole: "dm" });
     } else if (ensemble.groupConvoChatIds.includes(targetChatId)) {
       mappingMatches.push({ ensemble, targetRole: "group" });
+    } else if (generation === "ordinary" && ensemble.rpChatId === targetChatId) {
+      mappingMatches.push({ ensemble, targetRole: "rp" });
     }
+  }
+  if (mappingMatches.length === 0) {
+    // Only a genuinely unregistered target may keep the native-only path.
+    const registered = config.ensembles.some((e) =>
+      [e.rpChatId, ...e.groupConvoChatIds, ...e.members.map((m) => m.dmChatId)].includes(targetChatId),
+    );
+    if (!registered) result.scope = "unmanaged";
   }
   if (mappingMatches.length !== 1) return null;
   const { ensemble, targetRole } = mappingMatches[0]!;
+  result.scope = "managed";
+  result.rpChatId = ensemble.rpChatId;
+
+  const bookRows = await db
+    .select({ enabled: lorebooks.enabled, scope: lorebooks.scope })
+    .from(lorebooks)
+    .where(eq(lorebooks.id, ensemble.lorebookId))
+    .limit(2);
+  const book = bookRows[0];
+  if (expired() || bookRows.length !== 1 || book?.enabled !== "true" || book.scope.length > MAX_CONFIG_BYTES)
+    return null;
+  let bookScope: unknown;
+  try {
+    bookScope = JSON.parse(book.scope) as unknown;
+  } catch {
+    return null;
+  }
+  // CMB owns a specific scope containing exactly its mapped RP, groups and DMs.
+  const mappedBookChatIds = [
+    ensemble.rpChatId,
+    ...ensemble.groupConvoChatIds,
+    ...ensemble.members.map((member) => member.dmChatId),
+  ];
+  const scopedChatIds = isRecord(bookScope)
+    ? parseStableStringArray(bookScope.chatIds, MAX_MAPPED_SOURCES + MAX_MEMBERS_PER_ENSEMBLE)
+    : null;
+  if (
+    !isRecord(bookScope) ||
+    bookScope.mode !== "specific" ||
+    scopedChatIds === null ||
+    !sameStringSet(scopedChatIds, mappedBookChatIds)
+  )
+    return null;
 
   // Pending raw DM text has not yet passed CMB's per-cast visibility policy,
   // so even a group speaker's own DM is never promoted into a shared prompt.
@@ -527,6 +623,7 @@ async function buildAutonomousCmbPendingContextInner(
       characterIds: chats.characterIds,
       metadata: chats.metadata,
       personaId: chats.personaId,
+      updatedAt: chats.updatedAt,
     })
     .from(chats)
     .where(inArray(chats.id, requestedChatIds))) as ChatRow[];
@@ -537,16 +634,30 @@ async function buildAutonomousCmbPendingContextInner(
   const memberCharacterIds = ensemble.members.map((member) => member.characterId);
   const targetChat = chatById.get(targetChatId);
   const targetChatState = targetChat ? parseChatState(targetChat) : null;
-  const expectedTargetCharacterIds = targetRole === "dm" ? [targetCharacterId] : memberCharacterIds;
+  const excludedBooks =
+    targetChatState?.metadata.excludedLorebookIds === undefined
+      ? []
+      : parseStableStringArray(targetChatState.metadata.excludedLorebookIds, MAX_MANAGED_ENTRIES);
+  const expectedTargetCharacterIds = targetRole === "dm" ? targetCharacterIds : memberCharacterIds;
   if (
     !targetChat ||
-    targetChat.mode !== "conversation" ||
+    targetChat.mode !== (targetRole === "rp" ? "roleplay" : "conversation") ||
     targetChatState === null ||
+    excludedBooks === null ||
+    excludedBooks.includes(ensemble.lorebookId) ||
     !sameStringSet(targetChatState.activeCharacterIds, expectedTargetCharacterIds) ||
-    targetChatState.metadata.crossChatAwareness !== false
+    (generation === "ordinary" && !sameStringSet(targetChatState.activeCharacterIds, targetCharacterIds)) ||
+    targetChatState.metadata.sceneStatus != null ||
+    (targetRole === "rp"
+      ? (targetChatState.metadata.groupChatMode ?? "merged") !== "merged"
+      : targetChatState.metadata.crossChatAwareness !== false)
   ) {
     return null;
   }
+
+  const entryOverrides =
+    targetChatState.metadata.entryStateOverrides ?? targetChatState.metadata.lorebookEntryStateOverrides;
+  if (entryOverrides !== undefined && !isRecord(entryOverrides)) return null;
 
   const sourceDescriptors: SourceDescriptor[] = [];
   for (const [sourceIndex, source] of sourceSpecs.entries()) {
@@ -557,7 +668,9 @@ async function buildAutonomousCmbPendingContextInner(
       !sourceChat ||
       stableString(sourceChat.name, MAX_NAME_CHARS) === null ||
       sourceChat.mode !== expectedMode ||
+      !canonicalIsoTimestamp(sourceChat.updatedAt) ||
       sourceChatState === null ||
+      sourceChatState.metadata.sceneStatus != null ||
       !sameStringSet(sourceChatState.activeCharacterIds, memberCharacterIds) ||
       (expectedMode === "roleplay"
         ? (sourceChatState.metadata.groupChatMode ?? "merged") !== "merged"
@@ -568,6 +681,64 @@ async function buildAutonomousCmbPendingContextInner(
     sourceDescriptors.push({ chat: sourceChat, sourceIndex, chatRole: source.chatRole });
   }
   if (sourceDescriptors.length === 0) return null;
+  sourceDescriptors.sort(
+    (a, b) => b.chat.updatedAt.localeCompare(a.chat.updatedAt) || a.chat.id.localeCompare(b.chat.id),
+  );
+  sourceDescriptors.splice(MAX_READ_SOURCES);
+
+  // Read metadata only: a hidden materialized memory must not re-enter through
+  // the recent raw tail. Do not read its body or embedding for this check.
+  const managedEntries = await db
+    .select({
+      id: lorebookEntries.id,
+      folderId: lorebookEntries.folderId,
+      enabled: lorebookEntries.enabled,
+      characterFilterMode: lorebookEntries.characterFilterMode,
+      characterFilterIds: lorebookEntries.characterFilterIds,
+      dynamicState: lorebookEntries.dynamicState,
+    })
+    .from(lorebookEntries)
+    .where(and(eq(lorebookEntries.lorebookId, ensemble.lorebookId), eq(lorebookEntries.tag, "convo-memory-bridge")))
+    .limit(MAX_MANAGED_ENTRIES + 1);
+  if (expired() || managedEntries.length > MAX_MANAGED_ENTRIES) return null;
+  const folderRows = await db
+    .select({
+      id: lorebookFolders.id,
+      parentFolderId: lorebookFolders.parentFolderId,
+      enabled: lorebookFolders.enabled,
+    })
+    .from(lorebookFolders)
+    .where(eq(lorebookFolders.lorebookId, ensemble.lorebookId))
+    .limit(MAX_MANAGED_FOLDERS + 1);
+  if (expired() || folderRows.length > MAX_MANAGED_FOLDERS) return null;
+  const folderIds = new Set(folderRows.map((folder) => folder.id));
+  if (
+    folderIds.size !== folderRows.length ||
+    folderRows.some(
+      (folder) =>
+        stableString(folder.id) === null ||
+        (folder.enabled !== "true" && folder.enabled !== "false") ||
+        (folder.parentFolderId !== null && !folderIds.has(folder.parentFolderId)),
+    ) ||
+    managedEntries.some((entry) => entry.folderId !== null && !folderIds.has(entry.folderId))
+  )
+    return null;
+  const disabledFolderIds = collectEffectivelyDisabledFolderIds(
+    folderRows.map((folder) => ({ ...folder, enabled: folder.enabled === "true" })),
+  );
+  const scopedEntries = [];
+  for (const entry of managedEntries) {
+    const override = entryOverrides?.[entry.id];
+    if (
+      override !== undefined &&
+      (!isRecord(override) || (override.enabled !== undefined && typeof override.enabled !== "boolean"))
+    )
+      return null;
+    const disabled = override?.enabled === false || (entry.folderId !== null && disabledFolderIds.has(entry.folderId));
+    scopedEntries.push(disabled ? { ...entry, enabled: "false" } : entry);
+  }
+  const restrictions = resolveCmbSourceRestrictions(scopedEntries, ensemble, targetCharacterIds);
+  if (restrictions === null) return null;
 
   const characterRows = await db
     .select({ id: characters.id, data: characters.data })
@@ -628,9 +799,10 @@ async function buildAutonomousCmbPendingContextInner(
     const sourceMessages = await readPendingSourceMessages(
       db,
       descriptor,
-      targetCharacterId,
+      targetCharacterIds,
       allowedCharacterIds,
       userName,
+      restrictions,
     );
     if (expired() || sourceMessages === null) return null;
     pendingMessages.push(...sourceMessages);
@@ -657,9 +829,21 @@ async function buildAutonomousCmbPendingContextInner(
 export async function buildAutonomousCmbPendingContext(
   input: AutonomousCmbPendingContextInput,
 ): Promise<string | null> {
+  return (
+    await buildCmbRecentContext({
+      ...input,
+      targetCharacterIds: [input.targetCharacterId],
+      generation: "autonomous",
+    })
+  ).block;
+}
+
+/** Both prompt modes share one optional read slot and one deadline per DB. */
+export async function buildCmbRecentContext(input: CmbRecentContextInput): Promise<CmbRecentContextResult> {
+  const result: CmbRecentContextResult = { block: null, scope: "unavailable", rpChatId: null };
   // No queue or cached prompt body: a concurrent caller uses the ordinary
   // memory path instead of retaining another task and its message arrays.
-  if (activeReads.has(input.db)) return null;
+  if (activeReads.has(input.db) || input.signal?.aborted) return result;
   const requestedTimeout = input.timeoutMs;
   const timeoutMs =
     typeof requestedTimeout === "number" && Number.isFinite(requestedTimeout) && requestedTimeout > 0
@@ -667,17 +851,22 @@ export async function buildAutonomousCmbPendingContext(
       : DEFAULT_TIMEOUT_MS;
   const deadline = performance.now() + timeoutMs;
   activeReads.add(input.db);
-  const work = buildAutonomousCmbPendingContextInner(input, () => performance.now() >= deadline)
+  const work = buildCmbRecentContextInner(
+    input,
+    () => performance.now() >= deadline || input.signal?.aborted === true,
+    result,
+  )
     .catch(() => null)
     .finally(() => activeReads.delete(input.db));
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
+    const block = await Promise.race([
       work,
       new Promise<null>((resolve) => {
         timeout = setTimeout(() => resolve(null), timeoutMs);
       }),
     ]);
+    return { ...result, block: input.signal?.aborted ? null : block };
   } finally {
     if (timeout !== undefined) clearTimeout(timeout);
   }

@@ -519,6 +519,8 @@ export interface ChatMetadata {
   autonomousDailyCapOverride?: number | null;
   /** Include the newest CMB shared tail in autonomous prompts. Missing/false preserves the normal prompt path. */
   autonomousCmbContextRefreshEnabled?: boolean;
+  /** Supplement ordinary Conversation and registered non-Scene Roleplay replies with recent shared CMB context. Missing/false disables it; autonomous check-ins use their separate option. */
+  cmbRecentContextEnabled?: boolean;
   /** Last successful autonomous message timestamp by character and intent key. */
   intentCooldowns?: Record<string, Record<string, string>>;
 

@@ -28,7 +28,14 @@
     "hmm",
     "subtitlesbytheamaraorgcommunity",
     "transcribedby",
-    "icantsharethat"
+    "icantsharethat",
+    "ご視聴ありがとうございました",
+    "ご視聴ありがとうございます",
+    "チャンネル登録お願いします",
+    "チャンネル登録よろしくお願いします",
+    "字幕",
+    "おやすみなさい",
+    "ありがとうございました"
   ],
   "regex": [
     "^mbc뉴스.{1,5}입니다$",
@@ -38,5 +45,5 @@
     "^(im)?sorry(imsorry)*$",
     "^(thankyou)+$"
   ],
-  "tailSuspects": ["감사합니다", "죄송합니다", "sorry", "thankyou", "bye"]
+  "tailSuspects": ["감사합니다", "죄송합니다", "sorry", "thankyou", "bye", "ありがとうございました", "ありがとう"]
 }

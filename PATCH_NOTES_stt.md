@@ -43,11 +43,12 @@
 
 ## 5. 환경변수
 
-`HANDOFF_marinara_stt_filter.md` §5 표와 동일. 추가된 것은 `STT_PHRASES_PATH` 하나. `.env.example`/`docs/CONFIGURATION.md`는 충돌 면적을 줄이기 위해 수정하지 않았다. 필요하면 아래 블록을 `.env`에 넣는다.
+`HANDOFF_marinara_stt_filter.md` §5 표와 동일. 추가된 것은 `STT_PHRASES_PATH` 하나. `STT_LANGUAGE`는 기본 자동감지이며 `auto` / `ko` / `en` / `ja` 중 선택한다(영·일·한 혼용 사용자 결정). `.env.example`/`docs/CONFIGURATION.md`는 충돌 면적을 줄이기 위해 수정하지 않았다. 필요하면 아래 블록을 `.env`에 넣는다.
 
 ```
 # Local Whisper hallucination filter (see PATCH_NOTES_stt.md)
-STT_LANGUAGE=ko
+# auto(기본) | ko | en | ja
+STT_LANGUAGE=auto
 STT_SANITIZE=on
 STT_SANITIZE_LOG=on
 STT_REPEAT_THRESHOLD=3
@@ -87,6 +88,6 @@ pnpm --filter @marinara-engine/server build       # dist/assets/stt-hallucinatio
 1. 서버 기동 로그에 `[stt-hook] Local Whisper filter applied …`가 있는가. 없으면 Calls 설치 여부·Lite 여부·바인딩 여부를 로그에서 확인.
 2. 정상 발화 + 5초 무음 → 채팅에 환각 문장 0건. 로그에 `[stt-trim] …` 또는 `[stt-sanitize] rule=N …`가 찍히는가.
 3. 순수 무음 10초 → 채팅 미삽입, LLM 미호출. **단, Calls 클라이언트는 400 응답에 "Local Whisper did not return a transcript" 토스트를 띄운다(패키지 동작, 기존과 동일).**
-4. 한국어 문장 중 영어 단어 혼용 → `ko` 고정에 따른 오인식 수준 확인. 심하면 `STT_LANGUAGE=` (빈 값)으로 자동감지.
+4. 영·일·한 혼용 발화 → 자동감지(기본)가 어느 언어로 잡는지 확인. 한 언어가 지배적이면 `STT_LANGUAGE=ko` 등으로 고정하는 편이 인식률이 높다.
 5. 문장을 실제로 "감사합니다"로 끝내기 → 유지되는가. 주의: 앞 문장과 1.5초 이상 떨어져 "감사합니다"만 따로 세그먼트가 되면 규칙 3이 지운다. 자주 그러면 `STT_TAIL_GAP_S`를 올리거나 `tailSuspects`에서 제거.
 6. `<DATA_DIR>/stt-hallucination-phrases.json`을 편집하고 재시작 없이 다음 통화에 반영되는가.

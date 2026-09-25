@@ -129,15 +129,32 @@ assert.equal(normalizeSttText("..."), "");
   assert.equal(readSttConfig({ STT_SANITIZE: "0" }).sanitize, false);
   assert.equal(readSttConfig({}).sanitize, true);
   assert.equal(readSttConfig({ STT_SANITIZE: "garbage" }).sanitize, true, "unknown values fall back to default");
-  assert.equal(readSttConfig({}).language, "ko");
+  assert.equal(readSttConfig({}).language, "", "default is auto-detect (mixed ko/en/ja speech)");
   assert.equal(readSttConfig({ STT_LANGUAGE: "" }).language, "", "empty language = auto-detect");
+  assert.equal(readSttConfig({ STT_LANGUAGE: "auto" }).language, "", '"auto" is an alias for auto-detect');
+  assert.equal(readSttConfig({ STT_LANGUAGE: "ko" }).language, "ko");
   assert.equal(readSttConfig({ STT_LANGUAGE: " EN " }).language, "en");
+  assert.equal(readSttConfig({ STT_LANGUAGE: "ja" }).language, "ja");
   assert.equal(readSttConfig({ STT_REPEAT_THRESHOLD: "1" }).repeatThreshold, 3, "threshold below 2 is rejected");
   assert.equal(readSttConfig({ STT_REPEAT_THRESHOLD: "5" }).repeatThreshold, 5);
   assert.equal(readSttConfig({ STT_TRIM_THRESHOLD_DB: "abc" }).trimThresholdDb, -45);
   assert.equal(readSttConfig({ STT_TAIL_GAP_S: "2.5" }).tailGapSeconds, 2.5);
   assert.equal(readSttConfig({ STT_PHRASES_PATH: "  " }).phrasesPath, null);
   assert.equal(readSttConfig({ STT_PHRASES_PATH: "/tmp/x.json" }).phrasesPath, "/tmp/x.json");
+}
+
+// ── Japanese hallucinations (auto-detect can land in ja) ───────────────
+{
+  assert.equal(sanitizeSttSegments(texts(["ご視聴ありがとうございました。"]), phrases, options).text, "");
+  assert.equal(
+    sanitizeSttSegments(texts(["今日は手伝ってくれてありがとうございました"]), phrases, options).dropped.length,
+    0,
+  );
+  const tail = [
+    { text: "ご飯食べた？", start: 0, end: 1.0 },
+    { text: "ありがとう、本当に", start: 3.5, end: 4.4 },
+  ];
+  assert.deepEqual(sanitizeSttSegments(tail, phrases, options).dropped, [{ rule: 3, text: "ありがとう、本当に" }]);
 }
 
 // ── regex entries are whole-segment matches ───────────────────────────

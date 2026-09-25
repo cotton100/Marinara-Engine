@@ -7,7 +7,11 @@
  */
 
 export interface SttConfig {
-  /** Whisper language code passed to the pipeline. Empty string = auto-detect. */
+  /**
+   * Whisper language passed to the pipeline: a code such as "ko", "en", "ja".
+   * Empty string = auto-detect (Whisper picks one language per utterance).
+   * STT_LANGUAGE accepts "auto" as an alias for the empty string.
+   */
   language: string;
   /** Gate C (text hallucination filter) on/off. */
   sanitize: boolean;
@@ -36,7 +40,7 @@ export interface SttConfig {
 }
 
 export const STT_DEFAULT_CONFIG: Readonly<SttConfig> = Object.freeze({
-  language: "ko",
+  language: "",
   sanitize: true,
   sanitizeLog: true,
   repeatThreshold: 3,
@@ -83,7 +87,8 @@ function parseNumber(
 /** Reads STT_* variables from `env` (defaults to process.env). Pure: no caching, no side effects. */
 export function readSttConfig(env: EnvLike = process.env): SttConfig {
   const defaults = STT_DEFAULT_CONFIG;
-  const language = env.STT_LANGUAGE === undefined ? defaults.language : env.STT_LANGUAGE.trim().toLowerCase();
+  const rawLanguage = env.STT_LANGUAGE === undefined ? defaults.language : env.STT_LANGUAGE.trim().toLowerCase();
+  const language = rawLanguage === "auto" ? "" : rawLanguage;
   const phrasesPath = env.STT_PHRASES_PATH?.trim();
   return {
     language,

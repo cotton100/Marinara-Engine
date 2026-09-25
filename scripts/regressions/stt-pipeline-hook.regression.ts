@@ -61,7 +61,13 @@ function withTail(seconds: number, tailSeconds: number): Float32Array {
 
 // ── gate B: option merge ─────────────────────────────────────────────
 {
-  const merged = mergeSttAsrOptions({ chunk_length_s: 30, stride_length_s: 5, task: "translate" }, STT_DEFAULT_CONFIG);
+  const merged = mergeSttAsrOptions(
+    { chunk_length_s: 30, stride_length_s: 5, task: "translate" },
+    {
+      ...STT_DEFAULT_CONFIG,
+      language: "ko",
+    },
+  );
   assert.deepEqual(merged, {
     chunk_length_s: 30,
     stride_length_s: 5,
@@ -69,8 +75,8 @@ function withTail(seconds: number, tailSeconds: number): Float32Array {
     return_timestamps: true,
     language: "ko",
   });
-  const auto = mergeSttAsrOptions(undefined, { ...STT_DEFAULT_CONFIG, language: "" });
-  assert.equal("language" in auto, false, "empty STT_LANGUAGE keeps auto-detect");
+  const auto = mergeSttAsrOptions(undefined, STT_DEFAULT_CONFIG);
+  assert.equal("language" in auto, false, "default (auto-detect) passes no language option");
   assert.equal(auto.return_timestamps, true);
 }
 
@@ -136,7 +142,7 @@ function withTail(seconds: number, tailSeconds: number): Float32Array {
   const call = calls[0]!;
   assert.ok(call.audio instanceof Float32Array);
   assert.ok(Math.abs((call.audio as Float32Array).length / RATE - 1.3) < 0.05, "gate A trimmed the 4 s tail to 300 ms");
-  assert.deepEqual(call.kwargs, { task: "transcribe", return_timestamps: true, language: "ko" });
+  assert.deepEqual(call.kwargs, { task: "transcribe", return_timestamps: true });
   assert.equal(output.text, "안녕 잘 지냈어");
   assert.equal(output.chunks.length, 1);
 

@@ -19,7 +19,7 @@ process.on("exit", () => rmSync(testDataDir, { recursive: true, force: true }));
 
 const { applySttPipelineHook, mergeSttAsrOptions, sanitizeSttAsrOutput, STT_NO_SPEECH_MESSAGE } =
   await import("../../packages/server/src/services/sidecar/stt-pipeline-hook.js");
-const { STT_DEFAULT_CONFIG } = await import("../../packages/server/src/services/sidecar/stt-config.js");
+const { readSttConfig, STT_DEFAULT_CONFIG } = await import("../../packages/server/src/services/sidecar/stt-config.js");
 const { compileSttPhraseList } = await import("../../packages/server/src/services/sidecar/stt-sanitize.js");
 
 const RATE = 16_000;
@@ -84,14 +84,20 @@ function withTail(seconds: number, tailSeconds: number): Float32Array {
     return_timestamps: true,
     language: "ko",
   });
-  const auto = mergeSttAsrOptions(undefined, STT_DEFAULT_CONFIG);
-  assert.equal("language" in auto, false, "default (auto-detect) passes no language option");
-  assert.equal(auto.return_timestamps, true);
+  const defaults = mergeSttAsrOptions(undefined, STT_DEFAULT_CONFIG);
+  assert.equal(defaults.language, "ko", "default explicitly selects Korean");
+  assert.equal(defaults.return_timestamps, true);
   assert.equal(
-    "language" in mergeSttAsrOptions({ language: "ko" }, STT_DEFAULT_CONFIG),
-    false,
-    "auto-detect also clears a caller-supplied language",
+    mergeSttAsrOptions({ language: "en" }, STT_DEFAULT_CONFIG).language,
+    "ko",
+    "configured language overrides a caller-supplied language",
   );
+  for (const language of ["ko", "en", "ja"]) {
+    assert.equal(mergeSttAsrOptions(undefined, readSttConfig({ STT_LANGUAGE: language })).language, language);
+  }
+  for (const language of ["", "auto", "not-a-language"]) {
+    assert.equal(mergeSttAsrOptions({ language: "en" }, readSttConfig({ STT_LANGUAGE: language })).language, "ko");
+  }
 }
 
 // ── gate C adapter keeps the output shape ────────────────────────────
@@ -182,7 +188,7 @@ function withTail(seconds: number, tailSeconds: number): Float32Array {
   const call = calls[0]!;
   assert.ok(call.audio instanceof Float32Array);
   assert.ok(Math.abs((call.audio as Float32Array).length / RATE - 1.3) < 0.05, "gate A trimmed the 4 s tail to 300 ms");
-  assert.deepEqual(call.kwargs, { task: "transcribe", return_timestamps: true });
+  assert.deepEqual(call.kwargs, { task: "transcribe", return_timestamps: true, language: "ko" });
   assert.equal(output.text, "안녕 잘 지냈어");
   assert.equal(output.chunks.length, 1);
 
@@ -206,6 +212,11 @@ function withTail(seconds: number, tailSeconds: number): Float32Array {
   assert.equal((rawCalls[0]!.audio as Float32Array).length, RATE * 5, "STT_TRIM=off sends the full buffer");
   assert.equal(untouched.text, " I'm sorry.", "STT_SANITIZE=off returns the model text verbatim");
   assert.equal(rawCalls[0]!.kwargs?.return_timestamps, true, "gate B still applies");
+  assert.equal(
+    rawCalls[0]!.kwargs?.language,
+    "ko",
+    "turning trim and sanitize off does not remove the language setting",
+  );
 }
 
 // Recognition failure is an error for the existing Calls toast, never spoken text.

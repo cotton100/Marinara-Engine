@@ -244,12 +244,13 @@ function isLikelySilenceHallucination(text: string, stats: { rms: number; peak: 
   return stats.rms <= SILENCE_HALLUCINATION_MAX_RMS || stats.peak <= SILENCE_HALLUCINATION_MAX_PEAK;
 }
 
-class SidecarSpeechService {
+export class SidecarSpeechService {
   private config: SidecarSpeechConfig;
   private status: SidecarSpeechStatus = "not_downloaded";
   private activeModelId: SidecarSpeechModelId | null = null;
   private pipeline: AsrPipeline | null = null;
-  private loadingPromise: Promise<AsrPipeline> | null = null;
+  private operationTail: Promise<void> = Promise.resolve();
+  private pendingTranscriptions = 0;
   private removingAllModels = false;
   private downloadProgress: SidecarDownloadProgress | null = null;
   private lastError: string | null = null;
@@ -258,6 +259,22 @@ class SidecarSpeechService {
     mkdirSync(MODELS_DIR, { recursive: true });
     this.config = this.loadConfig();
     this.status = this.detectStatus();
+  }
+
+  private enqueueOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.operationTail.then(operation);
+    this.operationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private runOperation<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.removingAllModels) {
+      return Promise.reject(new Error("Local Whisper is being removed with the Calls package."));
+    }
+    return this.enqueueOperation(operation);
   }
 
   private loadConfig(): SidecarSpeechConfig {
@@ -354,38 +371,18 @@ class SidecarSpeechService {
     modelId: SidecarSpeechModelId,
     options: { localFilesOnly: boolean; progress?: (data: TransformersProgress) => void },
   ): Promise<AsrPipeline> {
-    if (this.removingAllModels) {
-      throw new Error("Local Whisper is being removed with the Calls package.");
-    }
     if (this.pipeline && this.activeModelId === modelId) return this.pipeline;
-    if (this.loadingPromise && this.activeModelId === modelId) return this.loadingPromise;
 
     await this.disposeCurrentPipeline();
     this.activeModelId = modelId;
     this.status = options.localFilesOnly ? "loading" : "downloading_model";
     this.lastError = null;
 
-    this.loadingPromise = (async () => {
-      if (!this.isAvailable()) {
-        const runtime = getOnnxRuntimeDiagnostics();
-        const installed = runtime.installedBindingArchs.length > 0 ? runtime.installedBindingArchs.join(", ") : "none";
-        throw new Error(
-          `Local Whisper is unavailable because onnxruntime-node is not installed for ${process.platform}/${process.arch}. Installed native runtime architectures for this platform: ${installed}.`,
-        );
-      }
+    try {
       const model = getSpeechModel(modelId);
-      const { pipeline: createPipeline, env } = await import("@huggingface/transformers");
-      env.cacheDir = MODELS_DIR;
-      env.allowLocalModels = true;
-      env.useBrowserCache = false;
-
       logger.info("[sidecar-speech] Loading %s...", model.repoId);
       const startedAt = Date.now();
-      const loaded = (await createPipeline("automatic-speech-recognition", model.repoId, {
-        dtype: "q8",
-        local_files_only: options.localFilesOnly,
-        progress_callback: options.progress as never,
-      })) as AsrPipeline;
+      const loaded = await this.createPipeline(modelId, options);
       logger.info("[sidecar-speech] Loaded %s in %dms", model.repoId, Date.now() - startedAt);
       this.pipeline = loaded;
       this.status = "ready";
@@ -393,20 +390,39 @@ class SidecarSpeechService {
       this.config = { modelId };
       this.saveConfig();
       return loaded;
-    })();
-
-    try {
-      return await this.loadingPromise;
     } catch (error) {
-      this.pipeline = null;
-      this.activeModelId = null;
+      // A loaded native session must also be released if persisting its config fails.
+      await this.disposeCurrentPipeline();
       this.lastError = error instanceof Error ? error.message : "Local Whisper failed to load";
       this.status = "error";
       throw error;
     } finally {
-      this.loadingPromise = null;
       if ((this.status as SidecarSpeechStatus) !== "ready") this.downloadProgress = null;
     }
+  }
+
+  protected async createPipeline(
+    modelId: SidecarSpeechModelId,
+    options: { localFilesOnly: boolean; progress?: (data: TransformersProgress) => void },
+  ): Promise<AsrPipeline> {
+    if (!this.isAvailable()) {
+      const runtime = getOnnxRuntimeDiagnostics();
+      const installed = runtime.installedBindingArchs.length > 0 ? runtime.installedBindingArchs.join(", ") : "none";
+      throw new Error(
+        `Local Whisper is unavailable because onnxruntime-node is not installed for ${process.platform}/${process.arch}. Installed native runtime architectures for this platform: ${installed}.`,
+      );
+    }
+    const { pipeline: createPipeline, env } = await import("@huggingface/transformers");
+    env.cacheDir = MODELS_DIR;
+    env.allowLocalModels = true;
+    env.useBrowserCache = false;
+    return (await createPipeline("automatic-speech-recognition", getSpeechModel(modelId).repoId, {
+      dtype: "q8",
+      // Avoid retaining ONNX arena/pattern allocations between short call turns.
+      session_options: { enableCpuMemArena: false, enableMemPattern: false },
+      local_files_only: options.localFilesOnly,
+      progress_callback: options.progress as never,
+    })) as AsrPipeline;
   }
 
   getStatus(): SidecarSpeechStatusResponse {
@@ -438,11 +454,17 @@ class SidecarSpeechService {
     modelId: SidecarSpeechModelId = SIDECAR_SPEECH_DEFAULT_MODEL_ID,
     onProgress?: (progress: SidecarDownloadProgress) => void,
   ): Promise<void> {
-    const progress = this.createProgressCallback(modelId, onProgress);
-    await this.loadPipeline(modelId, { localFilesOnly: false, progress });
+    return this.runOperation(async () => {
+      const progress = this.createProgressCallback(modelId, onProgress);
+      await this.loadPipeline(modelId, { localFilesOnly: false, progress });
+    });
   }
 
   async deleteModel(modelId?: SidecarSpeechModelId | null): Promise<void> {
+    return this.runOperation(() => this.deleteModelNow(modelId));
+  }
+
+  private async deleteModelNow(modelId?: SidecarSpeechModelId | null): Promise<void> {
     const targetModelId = modelId ?? this.config.modelId ?? this.getDownloadedModelId();
     if (!targetModelId) return;
     await this.disposeCurrentPipeline();
@@ -457,27 +479,42 @@ class SidecarSpeechService {
   }
 
   async deleteAllModels(): Promise<void> {
+    if (this.removingAllModels) throw new Error("Local Whisper is being removed with the Calls package.");
     this.removingAllModels = true;
     try {
-      // A disconnected download request can still be finishing on the server.
-      // Wait for it before removing the cache so it cannot recreate package-owned
-      // Whisper files after Conversation Calls has been uninstalled.
-      await this.loadingPromise?.catch(() => undefined);
-      await this.disposeCurrentPipeline();
-      for (const model of SIDECAR_SPEECH_MODELS) {
-        rmSync(safeModelCachePath(model.repoId), { recursive: true, force: true });
-      }
-      rmSync(SPEECH_CONFIG_PATH, { force: true });
-      this.config = { modelId: null };
-      this.status = "not_downloaded";
-      this.lastError = null;
-      this.downloadProgress = null;
+      // Previously accepted inference/downloads finish before package removal;
+      // new work is rejected until the cache and pipeline have both been removed.
+      await this.enqueueOperation(async () => {
+        await this.disposeCurrentPipeline();
+        for (const model of SIDECAR_SPEECH_MODELS) {
+          rmSync(safeModelCachePath(model.repoId), { recursive: true, force: true });
+        }
+        rmSync(SPEECH_CONFIG_PATH, { force: true });
+        this.config = { modelId: null };
+        this.status = "not_downloaded";
+        this.lastError = null;
+        this.downloadProgress = null;
+      });
     } finally {
       this.removingAllModels = false;
     }
   }
 
   async transcribeWav(buffer: Buffer): Promise<string> {
+    // ponytail: one active utterance plus one waiter bounds retained audio and
+    // inference memory. Use a cancellable scheduler if multi-call capacity grows.
+    if (this.pendingTranscriptions >= 2) {
+      throw new Error("Local Whisper is busy. Please wait for the current speech to finish.");
+    }
+    this.pendingTranscriptions += 1;
+    try {
+      return await this.runOperation(() => this.transcribeWavNow(buffer));
+    } finally {
+      this.pendingTranscriptions -= 1;
+    }
+  }
+
+  private async transcribeWavNow(buffer: Buffer): Promise<string> {
     const configuredModelId = this.config.modelId;
     const modelId =
       configuredModelId && this.isModelDownloaded(configuredModelId)
@@ -519,4 +556,9 @@ class SidecarSpeechService {
   }
 }
 
-export const sidecarSpeechService = new SidecarSpeechService();
+// Calls bundles this service too. Share one model/queue with the Engine's
+// Connections routes instead of retaining two ONNX sessions in the same process.
+// Bump this key in both copies if their service contract becomes incompatible.
+const SHARED_SPEECH_SERVICE = Symbol.for("marinara.sidecar-speech-service.v1");
+const sharedServices = globalThis as typeof globalThis & { [SHARED_SPEECH_SERVICE]?: SidecarSpeechService };
+export const sidecarSpeechService = (sharedServices[SHARED_SPEECH_SERVICE] ??= new SidecarSpeechService());

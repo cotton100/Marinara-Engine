@@ -183,21 +183,22 @@ assert.equal(normalizeSttText("..."), "");
   assert.equal(readSttConfig({ STT_SANITIZE: "0" }).sanitize, false);
   assert.equal(readSttConfig({}).sanitize, true);
   assert.equal(readSttConfig({ STT_SANITIZE: "garbage" }).sanitize, true, "unknown values fall back to default");
-  assert.equal(readSttConfig({}).language, "", "default is auto-detect (mixed ko/en/ja speech)");
-  assert.equal(readSttConfig({ STT_LANGUAGE: "" }).language, "", "empty language = auto-detect");
-  assert.equal(readSttConfig({ STT_LANGUAGE: "auto" }).language, "", '"auto" is an alias for auto-detect');
+  assert.equal(
+    readSttConfig({}).language,
+    "ko",
+    "default explicitly selects Korean instead of the runtime English fallback",
+  );
+  assert.equal(readSttConfig({ STT_LANGUAGE: "" }).language, "ko", "empty language falls back to Korean");
+  assert.equal(readSttConfig({ STT_LANGUAGE: "  " }).language, "ko", "blank language falls back to Korean");
+  assert.equal(readSttConfig({ STT_LANGUAGE: "auto" }).language, "ko", 'unsupported "auto" falls back to Korean');
   assert.equal(readSttConfig({ STT_LANGUAGE: "ko" }).language, "ko");
   assert.equal(readSttConfig({ STT_LANGUAGE: " EN " }).language, "en");
   assert.equal(readSttConfig({ STT_LANGUAGE: "ja" }).language, "ja");
-  assert.equal(
-    readSttConfig({ STT_LANGUAGE: "ko-KR" }).language,
-    "",
-    "unsupported locale tags fall back to auto-detect",
-  );
+  assert.equal(readSttConfig({ STT_LANGUAGE: "ko-KR" }).language, "ko", "unsupported locale tags fall back to Korean");
   assert.equal(
     readSttConfig({ STT_LANGUAGE: "not-a-language" }).language,
-    "",
-    "unknown languages fall back to auto-detect",
+    "ko",
+    "unknown languages fall back to Korean",
   );
   assert.equal(readSttConfig({ STT_REPEAT_THRESHOLD: "1" }).repeatThreshold, 3, "threshold below 2 is rejected");
   assert.equal(readSttConfig({ STT_REPEAT_THRESHOLD: "5" }).repeatThreshold, 5);
@@ -207,7 +208,7 @@ assert.equal(normalizeSttText("..."), "");
   assert.equal(readSttConfig({ STT_PHRASES_PATH: "/tmp/x.json" }).phrasesPath, "/tmp/x.json");
 }
 
-// ── Japanese hallucinations (auto-detect can land in ja) ───────────────
+// ── Japanese output is sanitized when Japanese is explicitly selected ─
 {
   assert.equal(sanitizeSttSegments(texts(["ご視聴ありがとうございました。"]), phrases, options).text, "");
   assert.equal(

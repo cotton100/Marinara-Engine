@@ -2,10 +2,12 @@
 
 2026-09-25 통합본. STT 수정 커밋 `bbcbd32e98b2`와 최신 CMB 복구 커밋 `8d39d46ceeb6`을 합쳤다. 기존 CMB·RAM·RP Individual 관련 5커밋과 후속 prepared-marker 복구 수정을 모두 보존한다. 페이블 원본 `e8bc99167c27ddde6a4277824d8ae0c781a7db32`의 STT를 가져와 보완했다.
 
+**2026-09-25 언어 후속 정정:** Transformers.js 3.8.1의 Whisper 언어 감지는 구현되지 않았다. 실제 `WhisperForConditionalGeneration._retrieve_init_tokens`는 언어를 생략하면 영어(`en`)를 선택한다. 기존의 “기본 자동감지” 설명은 잘못됐으며, 이번 수정은 기본값을 한국어(`ko`)로 지정한다.
+
 ## 현재 동작
 
 - PCM 앞뒤 무음을 잘라 Whisper 입력을 줄인다. 완전 무음은 모델을 호출하지 않는다.
-- 언어는 기본 자동감지. `auto` / 빈 값 / `ko` / `en` / `ja`를 지원하며 다른 값은 자동감지로 돌아간다. 한 발화 안의 모든 언어를 따로 인식한다는 보장은 아니다.
+- 언어는 기본 한국어(`ko`). `ko` / `en` / `ja`를 명시할 수 있으며, `auto` / 빈 값 / 그 밖의 값은 한국어로 돌아간다. 자동감지 선택지는 제공하지 않는다. 언어를 명시해도 한 발화 안의 혼용 인식 정확도를 보장하지는 않는다.
 - 기본 목록은 구체적인 방송·시청·자막 문구를 거른다. `네`, `감사합니다`, `I'm sorry`, `okay`, `おやすみなさい` 등 일상 발화는 단독이거나 앞 발화와 오래 떨어져도 보존한다.
 - 같은 세그먼트가 3회 이상 연속되면 1회만 남긴다. 사과·감사가 환각인지 텍스트만으로 구별할 수 없으므로 모두 지우지 않는다. 의미 있는 반복도 접힐 수 있다.
 - 문장부호만 남는 결과는 빈 결과로 취급한다.
@@ -19,7 +21,7 @@
 ## 기본 설정
 
 ```dotenv
-STT_LANGUAGE=auto
+STT_LANGUAGE=ko
 STT_SANITIZE=on
 STT_SANITIZE_LOG=on
 STT_REPEAT_THRESHOLD=3
@@ -36,6 +38,8 @@ STT_MIN_AUDIO_MS=300
 
 설정 생략 시 위 기본값이다. 언어·게이트 설정은 기동 시 읽으므로 변경 후 재시작이 필요하다. 문구 목록은 다음 호출 때 변경 시각을 보고 재로드한다. `STT_SANITIZE_LOG=off`는 삭제 원문 로그를 끈다.
 
+`STT_TRIM=off`와 `STT_SANITIZE=off`는 각각 무음 트림과 텍스트 필터를 끈다. 이 두 값을 꺼도 `language`·`task=transcribe`·타임스탬프 설정은 유지한다. 예전 `STT_LANGUAGE=auto` 설정은 재시작 후 한국어 기본값으로 처리한다.
+
 기본 목록은 사용자 파일이 없을 때만 `<DATA_DIR>/stt-hallucination-phrases.json`에 복사한다. **기존 파일은 덮어쓰지 않는다.** 예전 목록을 이미 seed했다면 코드 업데이트만으로 정상 인사 삭제가 사라지지 않는다. 사용자 지정 항목을 보존하면서 `exact`·`regex`·`tailSuspects`를 새 기본 목록과 대조해야 한다. gap 조정만으로 exact 규칙은 꺼지지 않는다. 이번 작업에서 운영 데이터 파일은 열거나 수정하지 않았다.
 
 ## 검증
@@ -46,7 +50,7 @@ Node 24에서 `node scripts/run-regressions.mjs --filter stt-` **3/3 PASS**, `--
 - 실제 Transformers 3.8.1 클래스 부착 및 무음 오류 경로 확인. import/assert 실패는 skip/PASS로 숨기지 않는다.
 - 테스트 DATA_DIR은 임시 폴더로 격리한다.
 - 타입·전체 형식·lint·빌드 최종 결과는 작업공간 현황판이 연결한 수정 결과 기록을 기준으로 한다.
-- 모델 가중치 다운로드, 실제 음성 인식·브라우저 표시·VPS·Telegram 수신은 미검증.
+- 위 회귀는 모델 가중치를 사용하지 않으므로 실제 음성 인식·브라우저 표시·VPS·Telegram 수신을 입증하지 않는다. 별도 실행 결과와 구분한다.
 
 ## 통합·배포
 
@@ -58,4 +62,4 @@ Node 24에서 `node scripts/run-regressions.mjs --filter stt-` **3/3 PASS**, `--
 
 ## 실통화 확인
 
-기동 로그 `[stt-hook] Local Whisper filter applied`는 부착 증거다. 정상 발화+긴 무음, 순수 무음/전체 제거 시 감지 실패 알림과 채팅·AI 미호출, 한영일 혼용, 작은 목소리·첫/끝 음절 보존, 사용자 목록 재로드는 실제 통화로 별도 확인한다.
+기동 로그 `[stt-hook] Local Whisper filter applied`는 부착 증거다. 정상 발화+긴 무음, 순수 무음/전체 제거 시 감지 실패 알림과 채팅·AI 미호출, `ko`·`en`·`ja`별 정상 발화와 혼용 인식, 작은 목소리·첫/끝 음절 보존, 사용자 목록 재로드는 실제 통화로 별도 확인한다.

@@ -8,6 +8,7 @@ import {
   APP_VERSION,
   parseCapabilityCatalogWithCompat,
   capabilityPackageManifestSchema,
+  capabilityCatalogPackageSchema,
   compareCapabilityPackageVersions,
   getCapabilityApiCompatibilityIssue,
   GM_VERB_TABLE_ASSET_PATH,
@@ -681,7 +682,23 @@ export function findPendingCapabilityPackageUpdates(
     }));
 }
 
-async function installCatalogPackage(entry: CapabilityCatalogPackage, activateDuringStartup = false) {
+/** Operator-only offline install helper; deliberately not exposed by an HTTP route. */
+export async function installLocalCapabilityArchive(entry: unknown, archive: Buffer, expectedArtifactSha256: string) {
+  const parsed = capabilityCatalogPackageSchema.parse(entry);
+  if (!/^[a-f0-9]{64}$/.test(expectedArtifactSha256) || parsed.artifact.sha256 !== expectedArtifactSha256) {
+    throw new Error("Local package checksum does not match the operator's approved artifact");
+  }
+  if (!Buffer.isBuffer(archive) || archive.byteLength === 0 || archive.byteLength > MAX_ARTIFACT_BYTES) {
+    throw new Error("Local package archive size is invalid");
+  }
+  return installCatalogPackage(parsed, false, Buffer.from(archive));
+}
+
+async function installCatalogPackage(
+  entry: CapabilityCatalogPackage,
+  activateDuringStartup = false,
+  localArchive?: Buffer,
+) {
   const { manifest, artifact } = entry;
   const installIssue = getCapabilityPackageInstallIssue(manifest);
   if (installIssue) throw new Error(installIssue);
@@ -692,7 +709,7 @@ async function installCatalogPackage(entry: CapabilityCatalogPackage, activateDu
   if (!supportsEngineVersion(entry, APP_VERSION)) {
     throw new Error(`Package requires Marinara Engine ${manifest.engine.min} to below ${manifest.engine.maxExclusive}`);
   }
-  const archive = await fetchBytes(artifact.url, Math.min(artifact.bytes + 1, MAX_ARTIFACT_BYTES));
+  const archive = localArchive ?? (await fetchBytes(artifact.url, Math.min(artifact.bytes + 1, MAX_ARTIFACT_BYTES)));
   if (archive.byteLength !== artifact.bytes) throw new Error("Downloaded package size does not match the catalog");
   const digest = createHash("sha256").update(archive).digest("hex");
   if (digest !== artifact.sha256) throw new Error("Downloaded package checksum does not match the catalog");

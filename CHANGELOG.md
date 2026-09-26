@@ -4,7 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
-- Local Whisper call transcription trims silence and filters broadcast-style hallucinations while preserving ordinary Korean, English, and Japanese replies. Filtered empty results display a recognition-failure notice without sending a chat message. Language defaults to automatic detection; punctuation-only output stays empty, and compatibility checks now fail on broken Transformers integration.
+- Local Whisper call transcription trims silence and filters broadcast-style hallucinations while preserving ordinary Korean, English, and Japanese replies. Filtered empty results display a recognition-failure notice without sending a chat message. Language defaults to Korean, with explicit English and Japanese overrides; the installed Whisper runtime does not implement automatic language detection. Punctuation-only output stays empty, and compatibility checks fail on broken Transformers integration.
+- Local Whisper shares one model service between the Engine and compatible Calls packages, serializes model changes and transcription, and bounds pending audio requests to avoid duplicate models and overlapping inference.
 
 - Administrator CMB recovery can resume an expired mutation interrupted after only its initial storage marker was saved. Recovery requires the exact current marker and embedding profile, preserves memories, vectors and pending work, and does not loosen automatic lease takeover.
 

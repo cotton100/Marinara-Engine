@@ -191,10 +191,6 @@ export function bundledSttPhrasePath(): string {
 async function install(): Promise<boolean> {
   if (isLite) return false;
   const config = readSttConfig();
-  if (!config.trim && !config.sanitize && !config.language) {
-    logger.info("[stt-hook] All STT gates disabled by environment; Local Whisper output is not filtered");
-    return false;
-  }
   if (!hasNativeOnnxRuntimeBinding()) return false;
   if (!(await isConversationCallsInstalled())) {
     logger.debug("[stt-hook] Calls package not installed; skipping Local Whisper filter hook");
@@ -222,7 +218,7 @@ async function install(): Promise<boolean> {
   logger.info(
     "[stt-hook] Local Whisper filter %s (language=%s trim=%s sanitize=%s phrases=%s)",
     status,
-    config.language || "auto",
+    config.language,
     config.trim ? "on" : "off",
     config.sanitize ? "on" : "off",
     phrasePath,

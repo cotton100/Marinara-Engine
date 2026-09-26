@@ -9,8 +9,9 @@
 export interface SttConfig {
   /**
    * Whisper language passed to the pipeline: "ko", "en", or "ja".
-   * Empty string = auto-detect (Whisper picks one language per utterance).
-   * STT_LANGUAGE accepts "auto" as an alias for the empty string.
+   * Defaults to Korean. Transformers.js 3.8.1 does not implement language
+   * detection: omitting the option silently selects English. Empty, "auto",
+   * and unsupported STT_LANGUAGE values therefore fall back to "ko".
    */
   language: string;
   /** Gate C (text hallucination filter) on/off. */
@@ -40,7 +41,7 @@ export interface SttConfig {
 }
 
 export const STT_DEFAULT_CONFIG: Readonly<SttConfig> = Object.freeze({
-  language: "",
+  language: "ko",
   sanitize: true,
   sanitizeLog: true,
   repeatThreshold: 3,

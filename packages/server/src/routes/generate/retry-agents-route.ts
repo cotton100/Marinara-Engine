@@ -4657,6 +4657,8 @@ export async function registerRetryAgentsRoute(
           source: context.memory._userIdentitySource === "character" ? "character" : null,
         });
         await resolveAgentGenerationTools({
+          db: app.db,
+          lorebookGenerationTriggers: [context.chatMode, "chat"],
           requestBody: toolInputs.requestBody,
           chatId,
           chatMetadata: chatMeta,

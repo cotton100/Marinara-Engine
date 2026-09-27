@@ -169,6 +169,115 @@ export const personalExtensionCoordinationLorebookEntryUpdateRequestSchema = gua
 
 export const personalExtensionCoordinationLorebookEntryDeleteRequestSchema = guardedLorebookMutationBaseSchema;
 
+const cmbCastIdSchema = z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/u);
+const cmbCompressionFingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+const cmbImportanceModeSchema = z.enum(["auto", "detail", "core"]);
+const cmbCompressionText = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max)
+    .refine((value) => value.trim().length > 0);
+const cmbCompressionFields = {
+  summary: cmbCompressionText(8000),
+  importanceReason: cmbCompressionText(1000),
+  retention: z.enum(["detail", "essentials"]),
+  evidence: z
+    .array(z.object({ quote: cmbCompressionText(3000) }).strict())
+    .min(1)
+    .max(12),
+  facts: z
+    .array(
+      z
+        .object({
+          actors: z.array(cmbCompressionText(200)).min(1).max(12),
+          negation: cmbCompressionText(1000).nullable(),
+          condition: cmbCompressionText(1000).nullable(),
+          status: cmbCompressionText(1000).nullable(),
+          evidenceQuote: cmbCompressionText(3000),
+        })
+        .strict(),
+    )
+    .min(1)
+    .max(12),
+};
+
+export const personalExtensionCoordinationCmbCompressionRecordSchema = z
+  .object({
+    revision: personalExtensionCoordinationFenceSchema,
+    active: z.boolean(),
+    basisFingerprint: cmbCompressionFingerprintSchema,
+    importanceMode: cmbImportanceModeSchema,
+    ...cmbCompressionFields,
+    appliedAt: z.string().datetime(),
+    sourceChatId: z.string().min(1).max(512),
+    clock: z.enum(["real", "story"]),
+    stageDays: z.number().int().positive().safe(),
+  })
+  .strict();
+
+export const personalExtensionCoordinationCmbCompressionInspectQuerySchema = z
+  .object({
+    castId: cmbCastIdSchema,
+    importanceMode: cmbImportanceModeSchema,
+  })
+  .strict();
+
+export const personalExtensionCoordinationCmbCompressionInspectResponseSchema = z
+  .object({
+    resourceRevision: personalExtensionCoordinationFenceSchema,
+    basisFingerprint: cmbCompressionFingerprintSchema.nullable(),
+    eligibility: z.object({ status: z.enum(["ready", "held"]), reason: z.string().max(200).nullable() }).strict(),
+    current: personalExtensionCoordinationCmbCompressionRecordSchema.nullable(),
+    state: z.enum(["active", "held", "released", "none"]),
+    reason: z.string().max(200).nullable(),
+  })
+  .strict();
+
+export const personalExtensionCoordinationCmbCompressionApplyInputSchema = z
+  .object({
+    castId: cmbCastIdSchema,
+    importanceMode: cmbImportanceModeSchema,
+    expectedBasisFingerprint: cmbCompressionFingerprintSchema,
+    expectedCompressionRevision: personalExtensionCoordinationFenceSchema,
+    ...cmbCompressionFields,
+  })
+  .strict();
+export const personalExtensionCoordinationCmbCompressionRemoveInputSchema = z
+  .object({
+    castId: cmbCastIdSchema,
+    expectedCompressionRevision: personalExtensionCoordinationFenceSchema,
+  })
+  .strict();
+export const personalExtensionCoordinationCmbCompressionApplyRequestSchema = guardedLorebookMutationBaseSchema
+  .extend(personalExtensionCoordinationCmbCompressionApplyInputSchema.shape)
+  .strict();
+export const personalExtensionCoordinationCmbCompressionRemoveRequestSchema = guardedLorebookMutationBaseSchema
+  .extend(personalExtensionCoordinationCmbCompressionRemoveInputSchema.shape)
+  .strict();
+
+export type PersonalExtensionCoordinationCmbCompressionRecord = z.infer<
+  typeof personalExtensionCoordinationCmbCompressionRecordSchema
+>;
+export type PersonalExtensionCoordinationCmbCompressionInspectQuery = z.infer<
+  typeof personalExtensionCoordinationCmbCompressionInspectQuerySchema
+>;
+export type PersonalExtensionCoordinationCmbCompressionInspectResponse = z.infer<
+  typeof personalExtensionCoordinationCmbCompressionInspectResponseSchema
+>;
+export type PersonalExtensionCoordinationCmbCompressionApplyInput = z.infer<
+  typeof personalExtensionCoordinationCmbCompressionApplyInputSchema
+>;
+export type PersonalExtensionCoordinationCmbCompressionRemoveInput = z.infer<
+  typeof personalExtensionCoordinationCmbCompressionRemoveInputSchema
+>;
+export type PersonalExtensionCoordinationCmbCompressionApplyRequest = z.infer<
+  typeof personalExtensionCoordinationCmbCompressionApplyRequestSchema
+>;
+export type PersonalExtensionCoordinationCmbCompressionRemoveRequest = z.infer<
+  typeof personalExtensionCoordinationCmbCompressionRemoveRequestSchema
+>;
+
 export const personalExtensionCoordinationLorebookVectorizeRequestSchema = guardedLorebookMutationBaseSchema
   .extend({
     connectionId: z.string().min(1).max(512),
@@ -279,6 +388,148 @@ export const personalExtensionCoordinationRevisionedLorebookResponseSchema = z
     resourceRevision: personalExtensionCoordinationFenceSchema,
   })
   .strict();
+
+export const personalExtensionCoordinationCmbOriginalStateSchema = z
+  .object({
+    state: z.enum(["inline", "archived"]),
+    characters: z.number().int().nonnegative().safe(),
+    sha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .nullable(),
+  })
+  .strict();
+
+export const personalExtensionCoordinationCmbOriginalInputSchema = z
+  .object({
+    expectedArchiveSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/u)
+      .nullable(),
+  })
+  .strict();
+
+export const personalExtensionCoordinationCmbOriginalRequestSchema = guardedLorebookMutationBaseSchema
+  .extend(personalExtensionCoordinationCmbOriginalInputSchema.shape)
+  .strict();
+
+export const personalExtensionCoordinationCmbOriginalResponseSchema = z
+  .object({
+    entryId: z.string().min(1),
+    lorebookId: z.string().min(1),
+    archive: personalExtensionCoordinationCmbOriginalStateSchema,
+    resourceRevision: personalExtensionCoordinationFenceSchema,
+  })
+  .strict();
+
+const cmbCatalogIdSchema = z
+  .string()
+  .min(1)
+  .max(256)
+  .refine((value) => value.trim() === value);
+const cmbCatalogTimestampSchema = z.string().refine((value) => {
+  try {
+    return new Date(value).toISOString() === value;
+  } catch {
+    return false;
+  }
+});
+const cmbCatalogSourceSchema = z.discriminatedUnion("kind", [
+  z
+    .object({
+      kind: z.literal("manual"),
+      createdAt: cmbCatalogTimestampSchema,
+      lastEditedAt: cmbCatalogTimestampSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("native-memory-chunk"),
+      canonicalFingerprint: cmbCatalogIdSchema,
+      firstMessageAt: cmbCatalogTimestampSchema,
+      lastMessageAt: cmbCatalogTimestampSchema,
+      occurrences: z
+        .array(
+          z
+            .object({
+              chatId: cmbCatalogIdSchema,
+              chatRole: z.enum(["rp", "group", "dm"]),
+              chunkId: cmbCatalogIdSchema,
+              locatorFingerprint: cmbCatalogIdSchema,
+            })
+            .strict(),
+        )
+        .max(8),
+    })
+    .strict(),
+]);
+
+export const personalExtensionCoordinationCmbMemoryCatalogItemSchema = z
+  .object({
+    entryId: cmbCatalogIdSchema,
+    lorebookId: cmbCatalogIdSchema,
+    memoryId: cmbCatalogIdSchema,
+    ensembleId: cmbCatalogIdSchema,
+    name: z.string(),
+    enabled: z.boolean(),
+    folderId: z.string().nullable(),
+    unknownToCastIds: z.array(cmbCastIdSchema).max(32),
+    rosterBindings: z
+      .array(z.object({ castId: cmbCastIdSchema, characterId: cmbCatalogIdSchema }).strict())
+      .min(1)
+      .max(32),
+    source: cmbCatalogSourceSchema,
+    sourceStatus: z.literal("missing").nullable(),
+    ambiguousProvenance: z.boolean(),
+    embeddingState: z.enum(["missing", "ready", "invalid"]),
+    archive: personalExtensionCoordinationCmbOriginalStateSchema,
+    compressionApplications: z
+      .array(
+        personalExtensionCoordinationCmbCompressionRecordSchema
+          .pick({
+            revision: true,
+            active: true,
+            importanceMode: true,
+            summary: true,
+            appliedAt: true,
+            sourceChatId: true,
+            clock: true,
+            stageDays: true,
+          })
+          .extend({ castId: cmbCastIdSchema })
+          .strict(),
+      )
+      .max(32),
+  })
+  .strict()
+  .refine(
+    ({ source, sourceStatus }) =>
+      sourceStatus === (source.kind === "native-memory-chunk" && source.occurrences.length === 0 ? "missing" : null),
+    { message: "Source status must match its available occurrences", path: ["sourceStatus"] },
+  );
+
+export const personalExtensionCoordinationCmbMemoryCatalogSchema = z
+  .object({
+    projection: z.literal("cmb-memory-catalog-v1"),
+    items: z.array(personalExtensionCoordinationCmbMemoryCatalogItemSchema),
+    policyEntries: z.array(personalExtensionCoordinationLorebookEntryProjectionSchema),
+    invalidEntries: z.number().int().nonnegative().safe(),
+  })
+  .strict();
+export const personalExtensionCoordinationRevisionedCmbMemoryCatalogSchema =
+  personalExtensionCoordinationCmbMemoryCatalogSchema
+    .extend({ resourceRevision: personalExtensionCoordinationFenceSchema })
+    .strict();
+
+export type PersonalExtensionCoordinationCmbMemoryCatalog = z.infer<
+  typeof personalExtensionCoordinationCmbMemoryCatalogSchema
+>;
+export type PersonalExtensionCoordinationCmbOriginalInput = z.infer<
+  typeof personalExtensionCoordinationCmbOriginalInputSchema
+>;
+export type PersonalExtensionCoordinationCmbOriginalState = z.infer<
+  typeof personalExtensionCoordinationCmbOriginalStateSchema
+>;
 
 export const personalExtensionCoordinationRevisionedLorebookListResponseSchema = z
   .object({

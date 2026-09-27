@@ -31,6 +31,10 @@ import {
   personalExtensionCoordinationLorebookReadAuthoritySchema,
   personalExtensionCoordinationLorebookUpdateRequestSchema,
   personalExtensionCoordinationLorebookVectorizeRequestSchema,
+  personalExtensionCoordinationCmbCompressionInspectQuerySchema,
+  personalExtensionCoordinationCmbCompressionApplyRequestSchema,
+  personalExtensionCoordinationCmbCompressionRemoveRequestSchema,
+  personalExtensionCoordinationCmbOriginalRequestSchema,
   updateLorebookFolderSchema,
   LOCAL_SIDECAR_CONNECTION_ID,
   canReparentFolder,
@@ -622,6 +626,35 @@ export async function lorebooksRoutes(app: FastifyInstance) {
     }
   });
 
+  app.get<{ Params: { id: string } }>("/:id/coordination/cmb-memory-catalog", async (req, reply) => {
+    try {
+      return await storage.listCmbMemoryCatalogFenced(readCoordinationAuthority(req.headers), req.params.id);
+    } catch (error) {
+      return sendCoordinationError(error, reply);
+    }
+  });
+
+  for (const action of ["archive", "restore"] as const) {
+    app.post<{ Params: { id: string; entryId: string }; Body: unknown }>(
+      `/:id/coordination/entries/:entryId/cmb-original/${action}`,
+      async (req, reply) => {
+        try {
+          const input = personalExtensionCoordinationCmbOriginalRequestSchema.parse(req.body);
+          return await storage.mutateCmbOriginalFenced(
+            mutationContext(input, req.headers),
+            req.params.id,
+            req.params.entryId,
+            input.expectedResourceRevision,
+            input,
+            action,
+          );
+        } catch (error) {
+          return sendCoordinationError(error, reply);
+        }
+      },
+    );
+  }
+
   app.post<{ Params: { id: string }; Body: unknown }>("/:id/coordination/entries", async (req, reply) => {
     try {
       const input = personalExtensionCoordinationLorebookEntryCreateRequestSchema.parse(req.body);
@@ -643,6 +676,60 @@ export async function lorebooksRoutes(app: FastifyInstance) {
       return sendCoordinationError(error, reply);
     }
   });
+
+  app.get<{ Params: { id: string; entryId: string }; Querystring: unknown }>(
+    "/:id/coordination/entries/:entryId/cmb-compression",
+    async (req, reply) => {
+      try {
+        const input = personalExtensionCoordinationCmbCompressionInspectQuerySchema.parse(req.query);
+        return await storage.inspectCmbCompressionFenced(
+          readCoordinationAuthority(req.headers),
+          req.params.id,
+          req.params.entryId,
+          input.castId,
+          input.importanceMode,
+        );
+      } catch (error) {
+        return sendCoordinationError(error, reply);
+      }
+    },
+  );
+
+  app.post<{ Params: { id: string; entryId: string }; Body: unknown }>(
+    "/:id/coordination/entries/:entryId/cmb-compression/apply",
+    async (req, reply) => {
+      try {
+        const input = personalExtensionCoordinationCmbCompressionApplyRequestSchema.parse(req.body);
+        return await storage.applyCmbCompressionFenced(
+          mutationContext(input, req.headers),
+          req.params.id,
+          req.params.entryId,
+          input.expectedResourceRevision,
+          input,
+        );
+      } catch (error) {
+        return sendCoordinationError(error, reply);
+      }
+    },
+  );
+
+  app.post<{ Params: { id: string; entryId: string }; Body: unknown }>(
+    "/:id/coordination/entries/:entryId/cmb-compression/remove",
+    async (req, reply) => {
+      try {
+        const input = personalExtensionCoordinationCmbCompressionRemoveRequestSchema.parse(req.body);
+        return await storage.removeCmbCompressionFenced(
+          mutationContext(input, req.headers),
+          req.params.id,
+          req.params.entryId,
+          input.expectedResourceRevision,
+          input,
+        );
+      } catch (error) {
+        return sendCoordinationError(error, reply);
+      }
+    },
+  );
 
   app.patch<{ Params: { id: string; entryId: string }; Body: unknown }>(
     "/:id/coordination/entries/:entryId",
@@ -945,6 +1032,9 @@ export async function lorebooksRoutes(app: FastifyInstance) {
   app.get<{ Params: { id: string } }>("/:id/entry-projections", async (req) => {
     return storage.listEntryProjections(req.params.id);
   });
+  app.get<{ Params: { id: string } }>("/:id/cmb-memory-catalog", async (req) =>
+    storage.listCmbMemoryCatalog(req.params.id),
+  );
 
   app.get<{ Params: { id: string; entryId: string } }>("/:id/entries/:entryId", async (req, reply) => {
     const entry = await storage.getEntry(req.params.entryId);

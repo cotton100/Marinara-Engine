@@ -4,6 +4,12 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- Compatible Calls packages request host-selected lorebook and recent conversation context, respecting CMB compression, character knowledge, disabled entries and archived originals without a raw-memory fallback.
+
+- Reviewed CMB originals can be explicitly archived to verified files and restored under the same memory ID. The CMB catalog omits original bodies, recall reads eligible originals on demand, and exports retain complete text. Full backups hold a consistent snapshot; storage format 7 prevents older hosts from opening archived references.
+
+- CMB can apply reviewed per-character memory summaries while preserving the original entry and vector. Recall uses valid summaries, holds stale ones until review, and supports explicit undo plus optional bounded detail recall.
+
 - Local Whisper call transcription trims silence and filters broadcast-style hallucinations while preserving ordinary Korean, English, and Japanese replies. Filtered empty results display a recognition-failure notice without sending a chat message. Language defaults to Korean, with explicit English and Japanese overrides; the installed Whisper runtime does not implement automatic language detection. Punctuation-only output stays empty, and compatibility checks fail on broken Transformers integration.
 - Local Whisper shares one model service between the Engine and compatible Calls packages, serializes model changes and transcription, and bounds pending audio requests to avoid duplicate models and overlapping inference.
 

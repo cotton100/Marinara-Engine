@@ -1,3 +1,5 @@
+import { hasActiveCmbCompression } from "../lorebook/cmb-compression-retrieval.js";
+
 export type CmbSourceRestriction = {
   chatId: string;
   firstMessageAt: string | null;
@@ -136,6 +138,7 @@ export function resolveCmbSourceRestrictions(
     const filterIds = new Set(filters.map((id) => id.trim().toLowerCase()));
     const restricted =
       entry.enabled === "false" ||
+      hasActiveCmbCompression(entry.dynamicState) ||
       unknownTo.some((id) => audienceCharacterIds.includes(membersByCast.get(id)!)) ||
       (filters.length > 0 &&
         audienceCharacterIds.some((id) =>

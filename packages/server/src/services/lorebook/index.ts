@@ -28,6 +28,7 @@ import {
 } from "./keyword-scanner.js";
 import { applyTokenBudget, processActivatedEntries } from "./prompt-injector.js";
 import { withCmbProvenance } from "./cmb-provenance.js";
+import { resolveCmbCompressionEntries } from "./cmb-compression-retrieval.js";
 
 export interface LorebookScanResult {
   worldInfoBefore: string;
@@ -51,6 +52,18 @@ export interface LorebookScanResult {
   updatedEntryStateOverrides?: Record<string, { ephemeral?: number | null; enabled?: boolean }>;
   /** Updated per-chat timing states for sticky/cooldown/delay. Caller should persist to chat metadata. */
   updatedEntryTimingStates?: Record<string, LorebookEntryTimingState>;
+}
+
+// Ephemeral call context, never serialized or persisted. Individual speakers must scan
+// all candidates with their own audience, including candidates held by the merged scan.
+const characterRescans = new WeakMap<LorebookScanResult, (characterIds: string[]) => Promise<LorebookScanResult>>();
+
+export async function refreshLorebookScanResultForAudience(
+  result: LorebookScanResult,
+  characterIds: string[],
+): Promise<LorebookScanResult> {
+  const rescan = characterRescans.get(result);
+  return rescan ? rescan(characterIds) : result;
 }
 
 export function scopeLorebookScanResultToCharacterContext(
@@ -119,17 +132,36 @@ export async function scopeLorebookScanResultToCharacter(
   characterId: string,
   generationTriggers: string[] = ["chat"],
 ): Promise<LorebookScanResult> {
+  const rescan = characterRescans.get(result);
+  if (rescan) return rescan([characterId]);
   const lorebooks = createLorebooksStorage(db);
   const characters = createCharactersStorage(db);
   const entryIds = uniqueStrings([
     ...result.activatedEntryIds,
     ...result.budgetSkippedEntries.map((entry) => entry.id),
   ]);
-  const entries = await lorebooks.listEligibleEntriesByIds(entryIds);
+  const entries = await lorebooks.listEligibleEntriesByIds(entryIds, { deferCmbOriginals: true });
   const character = await characters.getById(characterId);
   const data = character ? safeJsonParse<CharacterData | null>((character as { data?: unknown }).data, null) : null;
+  const selectedEntries = await resolveCmbCompressionEntries(db, entries, {
+    audienceCharacterIds: [characterId],
+    activeCharacterTags: data ? readStringArray(data.tags) : [],
+    generationTriggers,
+  });
+  const selectedById = new Map(selectedEntries.map((entry) => [entry.id, entry]));
+  const currentResult = {
+    ...result,
+    activatedEntries: result.activatedEntries.flatMap((activation) => {
+      const entry = selectedById.get(activation.id);
+      if (!entry) return [];
+      if (entry.tag !== "convo-memory-bridge") return [activation];
+      const content = withCmbProvenance(entry, entry.content);
+      // Re-scoping must not silently exceed the budget already accepted upstream.
+      return estimateTextTokens(content) <= estimateTextTokens(activation.content) ? [{ ...activation, content }] : [];
+    }),
+  };
 
-  return scopeLorebookScanResultToCharacterContext(result, entries, {
+  return scopeLorebookScanResultToCharacterContext(currentResult, selectedEntries, {
     characterId,
     characterTags: data ? readStringArray(data.tags) : [],
     generationTriggers,
@@ -1009,6 +1041,8 @@ export async function processLorebooks(
   options?: {
     chatId?: string;
     characterIds?: string[];
+    /** Actual readers, excluding a user-identity card added only for book ownership scope. */
+    cmbAudienceCharacterIds?: string[];
     personaId?: string | null;
     activeLorebookIds?: string[];
     excludedLorebookIds?: string[];
@@ -1059,6 +1093,30 @@ export async function processLorebooks(
   },
 ): Promise<LorebookScanResult> {
   const storage = createLorebooksStorage(db);
+  const retainedOptions = options
+    ? {
+        ...options,
+        entryStateOverrides: options.entryStateOverrides ? structuredClone(options.entryStateOverrides) : undefined,
+        entryTimingStates: options.entryTimingStates ? structuredClone(options.entryTimingStates) : undefined,
+      }
+    : undefined;
+  let hasCmbCandidates = false;
+  const captureCharacterRescan = (result: LorebookScanResult): LorebookScanResult => {
+    const audience = retainedOptions?.cmbAudienceCharacterIds ?? retainedOptions?.characterIds ?? [];
+    if (hasCmbCandidates)
+      characterRescans.set(result, (characterIds) =>
+        processLorebooks(db, messages, gameState, {
+          ...retainedOptions,
+          characterIds: uniqueStrings([
+            ...characterIds,
+            ...(retainedOptions?.characterIds ?? []).filter((id) => !audience.includes(id)),
+          ]),
+          cmbAudienceCharacterIds: characterIds,
+          previewOnly: true,
+        }),
+      );
+    return result;
+  };
 
   // Build filters for scoped lorebook selection.
   // When the caller provides options (even with empty arrays), scope to matching
@@ -1084,6 +1142,7 @@ export async function processLorebooks(
   const forcedIds = uniqueStrings(options?.forcedEntryIds ?? []);
   const requestedForcedEntryIds = forcedEntriesOnly ? forcedIds : forcedIds.slice(0, LIMITS.MAX_LOREBOOK_ENTRIES);
   let forcedEntries = (await storage.listEligibleEntriesByIds(requestedForcedEntryIds, {
+    deferCmbOriginals: true,
     unlimited: forcedEntriesOnly,
     excludedLorebookIds: options?.excludedLorebookIds,
     excludedSourceAgentIds: options?.excludedSourceAgentIds,
@@ -1111,11 +1170,12 @@ export async function processLorebooks(
   // keyword scan, out of the recursion pool and out of the budgets below.
   const normallyActiveEntries = forcedEntriesOnly
     ? []
-    : ((await storage.listActiveEntries(filters)) as unknown as LorebookEntry[]);
+    : ((await storage.listActiveEntries(filters, true)) as unknown as LorebookEntry[]);
   let allEntries = applyLorebookDefaults(
     Array.from(new Map([...normallyActiveEntries, ...forcedEntries].map((entry) => [entry.id, entry])).values()),
     relevantLorebooksById,
   );
+  hasCmbCandidates = allEntries.some((entry) => entry.tag === "convo-memory-bridge");
 
   // Apply per-chat entry state overrides — an entry that was disabled by ephemeral
   // countdown in *this* chat should be excluded, and ephemeral values should
@@ -1139,13 +1199,29 @@ export async function processLorebooks(
       });
   }
 
+  const matchingContext = await buildLorebookMatchingContext(
+    db,
+    options?.characterIds,
+    options?.personaId ?? null,
+    gameState ?? null,
+  );
+  allEntries = await resolveCmbCompressionEntries(db, allEntries, {
+    audienceCharacterIds: options?.cmbAudienceCharacterIds ?? matchingContext.activeCharacterIds,
+    contextCharacterIds: matchingContext.activeCharacterIds,
+    activeCharacterTags: matchingContext.activeCharacterTags,
+    generationTriggers: options?.generationTriggers,
+    query: messages
+      .slice(-4)
+      .map((message) => message.content)
+      .join("\n"),
+  });
   const activeEntriesById = new Map(allEntries.map((entry) => [entry.id, entry]));
   forcedEntries = forcedEntries.flatMap((entry) => activeEntriesById.get(entry.id) ?? []);
 
   const previewOnly = options?.previewOnly === true;
 
   if (allEntries.length === 0) {
-    return {
+    return captureCharacterRescan({
       worldInfoBefore: "",
       worldInfoAfter: "",
       depthEntries: [],
@@ -1158,7 +1234,7 @@ export async function processLorebooks(
       ...(!previewOnly && hasSerializedTimingStates(options?.entryTimingStates)
         ? { updatedEntryTimingStates: {} }
         : {}),
-    };
+    });
   }
 
   let resolveContent = options?.resolveContent;
@@ -1176,13 +1252,6 @@ export async function processLorebooks(
   const tokenBudget = forcedEntriesOnly ? 0 : (options?.tokenBudget ?? LIMITS.DEFAULT_LOREBOOK_TOKEN_BUDGET);
   const timingStates = toTimingStateMap(options?.entryTimingStates);
   const currentMessageIndex = messages.length;
-  const matchingContext = await buildLorebookMatchingContext(
-    db,
-    options?.characterIds,
-    options?.personaId ?? null,
-    gameState ?? null,
-  );
-
   // Scan for activated entries.
   // Bound the default global scan window so a lorebook/entry that leaves
   // scanDepth unset doesn't re-scan the full chat history every turn. An
@@ -1334,7 +1403,7 @@ export async function processLorebooks(
 
   const result = processActivatedEntries(finalActivated, 0);
 
-  return {
+  return captureCharacterRescan({
     ...result,
     activatedEntryIds: finalActivated.map((a) => a.entry.id),
     activatedEntries: finalActivated.map((a) => {
@@ -1367,5 +1436,5 @@ export async function processLorebooks(
     })),
     ...(updatedOverrides ? { updatedEntryStateOverrides: updatedOverrides } : {}),
     ...(updatedEntryTimingStates ? { updatedEntryTimingStates } : {}),
-  };
+  });
 }

@@ -14,6 +14,7 @@ import type {
 import type { DB } from "../../db/connection.js";
 import { createCharactersStorage } from "../storage/characters.storage.js";
 import { createLorebooksStorage } from "../storage/lorebooks.storage.js";
+import { resolveConversationCallContext } from "../conversation/conversation-call-context.js";
 
 type LorebookEntrySource = {
   id: string;
@@ -31,6 +32,8 @@ export function createCapabilityResourceHost(db: DB): CapabilityResourceHost {
   const characters = createCharactersStorage(db);
   const lorebooks = createLorebooksStorage(db);
   return {
+    resolveConversationCallContext: (input) => resolveConversationCallContext(db, input),
+
     async listCharacters(characterIds): Promise<CapabilityCharacterRecord[]> {
       const requestedIds = characterIds ? uniqueStrings(characterIds) : null;
       const records = requestedIds

@@ -7,6 +7,10 @@ import {
   personalExtensionCoordinationRevisionedLorebookEntryProjectionListResponseSchema,
   personalExtensionCoordinationRevisionedLorebookResponseSchema,
 } from "../../packages/shared/dist/index.js";
+import {
+  personalExtensionCoordinationCmbMemoryCatalogSchema,
+  personalExtensionCoordinationCmbOriginalRequestSchema,
+} from "../../packages/shared/src/index.js";
 
 const EXTENSION_ID = "coordination-facade-fixture";
 const CONTENT_HASH = `sha256:${"a".repeat(64)}`;
@@ -19,6 +23,7 @@ const EVENT_EPOCH_B = "22222222-2222-4222-8222-222222222222";
 const LOREBOOK_ID = "protected-lorebook";
 const CREATED_LOREBOOK_ID = "created-protected-lorebook";
 const ENTRY_ID = "protected-entry";
+const ORIGINAL_SHA256 = "c".repeat(64);
 const trustedJsonStringify = JSON.stringify.bind(JSON);
 const nativeSetTimeout = globalThis.setTimeout;
 const nativeReflectApply = Reflect.apply;
@@ -185,6 +190,149 @@ function entryProjectionFixture(name = "Protected entry", embeddingState: "missi
   return { ...entry, embeddingState };
 }
 
+function cmbCatalogFixture() {
+  return {
+    projection: "cmb-memory-catalog-v1" as const,
+    items: [
+      {
+        entryId: ENTRY_ID,
+        lorebookId: LOREBOOK_ID,
+        memoryId: "memory-fixture",
+        ensembleId: "ensemble-facade",
+        name: "Archived memory",
+        enabled: true,
+        folderId: null,
+        unknownToCastIds: [],
+        rosterBindings: [{ castId: "leo", characterId: "character-leo" }],
+        source: {
+          kind: "native-memory-chunk",
+          canonicalFingerprint: "canonical-fixture",
+          firstMessageAt: "2026-08-01T00:00:00.000Z",
+          lastMessageAt: "2026-08-01T01:00:00.000Z",
+          occurrences: [
+            { chatId: "chat-leo", chatRole: "dm", chunkId: "chunk-fixture", locatorFingerprint: "locator-fixture" },
+          ],
+        },
+        sourceStatus: null,
+        ambiguousProvenance: false,
+        embeddingState: "ready" as const,
+        archive: { state: "archived" as const, characters: 1000, sha256: ORIGINAL_SHA256 },
+        compressionApplications: [
+          {
+            castId: "leo",
+            revision: 1,
+            active: true,
+            importanceMode: "auto" as const,
+            summary: "Leo remembers a promise.",
+            appliedAt: "2026-08-16T00:00:00.000Z",
+            sourceChatId: "chat-leo",
+            clock: "real" as const,
+            stageDays: 7,
+          },
+        ],
+      },
+    ],
+    policyEntries: [
+      { ...entryProjectionFixture("Memory policy"), tag: "convo-memory-bridge-policy", content: "Policy rules" },
+    ],
+    invalidEntries: 0,
+  };
+}
+
+assert.equal(personalExtensionCoordinationCmbMemoryCatalogSchema.safeParse(cmbCatalogFixture()).success, true);
+const catalogItem = cmbCatalogFixture().items[0]!;
+const missingCatalogItem = {
+  ...catalogItem,
+  source: { ...catalogItem.source, occurrences: [] },
+  sourceStatus: "missing",
+};
+assert.equal(
+  personalExtensionCoordinationCmbMemoryCatalogSchema.safeParse({ ...cmbCatalogFixture(), items: [missingCatalogItem] })
+    .success,
+  true,
+  "an archived memory with a missing source remains available for management",
+);
+const invalidSourceStatusItems = [
+  { ...missingCatalogItem, sourceStatus: null },
+  { ...catalogItem, sourceStatus: "missing" },
+  { ...catalogItem, sourceStatus: "arbitrary-status" },
+  {
+    ...missingCatalogItem,
+    source: {
+      kind: "manual",
+      createdAt: "2026-08-01T00:00:00.000Z",
+      lastEditedAt: "2026-08-01T01:00:00.000Z",
+    },
+  },
+];
+for (const item of invalidSourceStatusItems) {
+  assert.equal(
+    personalExtensionCoordinationCmbMemoryCatalogSchema.safeParse({ ...cmbCatalogFixture(), items: [item] }).success,
+    false,
+    "source status must match the actual manual/native provenance contract",
+  );
+}
+for (const extra of [{ content: "private original" }, { rawContent: "private original" }, { embedding: [0.1] }]) {
+  assert.equal(
+    personalExtensionCoordinationCmbMemoryCatalogSchema.safeParse({
+      ...cmbCatalogFixture(),
+      items: [{ ...catalogItem, ...extra }],
+    }).success,
+    false,
+    "the management catalog must reject original bodies and vectors",
+  );
+}
+for (const source of [
+  { ...catalogItem.source, content: "private original" },
+  { ...catalogItem.source, occurrences: [{ ...catalogItem.source.occurrences[0], rawContent: "private original" }] },
+  { ...catalogItem.source, occurrences: Array.from({ length: 9 }, () => catalogItem.source.occurrences[0]) },
+  { ...catalogItem.source, firstMessageAt: "invalid-timestamp" },
+]) {
+  assert.equal(
+    personalExtensionCoordinationCmbMemoryCatalogSchema.safeParse({
+      ...cmbCatalogFixture(),
+      items: [{ ...catalogItem, source }],
+    }).success,
+    false,
+    "source metadata must stay closed and bounded",
+  );
+}
+assert.equal(
+  personalExtensionCoordinationCmbMemoryCatalogSchema.safeParse({
+    ...cmbCatalogFixture(),
+    items: [
+      {
+        ...catalogItem,
+        source: {
+          kind: "manual",
+          createdAt: "2026-08-01T00:00:00.000Z",
+          lastEditedAt: "2026-08-01T01:00:00.000Z",
+        },
+      },
+    ],
+  }).success,
+  true,
+  "manual source metadata remains supported without a body",
+);
+assert.equal(
+  personalExtensionCoordinationCmbMemoryCatalogSchema.safeParse({
+    ...cmbCatalogFixture(),
+    items: [
+      {
+        ...catalogItem,
+        compressionApplications: [
+          {
+            ...catalogItem.compressionApplications[0],
+            evidence: [{ quote: "private original" }],
+          },
+        ],
+      },
+    ],
+  }).success,
+  false,
+  "the catalog excludes stored evidence quotes",
+);
+
 assert.equal(
   personalExtensionCoordinationLorebookSchema.safeParse(lorebookFixture()).success,
   true,
@@ -254,6 +402,8 @@ let malformedState = false;
 let buildingTrustedResponse = false;
 let blockNextRequest = false;
 let lorebookRevision = 7;
+let nextCatalogResponse: unknown;
+let nextOriginalResponse: unknown;
 let createdLorebookRevision = 0;
 let dirtyRateLimited = false;
 let leaseHeldOnce = false;
@@ -391,7 +541,72 @@ const trustedFetch: typeof fetch = async (input, init = {}) => {
       );
       return json(200, payload);
     }
+    if (url === `/api/lorebooks/${LOREBOOK_ID}/coordination/cmb-memory-catalog` && method === "GET") {
+      const payload = nextCatalogResponse ?? { ...cmbCatalogFixture(), resourceRevision: lorebookRevision };
+      nextCatalogResponse = undefined;
+      return json(200, payload);
+    }
+    if (
+      (url === `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}/cmb-original/archive` ||
+        url === `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}/cmb-original/restore`) &&
+      method === "POST"
+    ) {
+      assert.equal(
+        body?.expectedResourceRevision,
+        lorebookRevision,
+        "archive/restore must use the latest trusted revision",
+      );
+      assert.equal(body?.operationHandle, RAW_OPERATION_HANDLE);
+      assert.equal(headers["x-marinara-csrf"], "1");
+      assert.equal("content" in body!, false);
+      assert.equal("summary" in body!, false);
+      if (nextOriginalResponse !== undefined) {
+        const payload = nextOriginalResponse;
+        nextOriginalResponse = undefined;
+        return json(200, payload);
+      }
+      const archived = url.endsWith("/archive");
+      assert.equal(body?.expectedArchiveSha256, archived ? null : ORIGINAL_SHA256);
+      lorebookRevision += 1;
+      return json(200, {
+        entryId: ENTRY_ID,
+        lorebookId: LOREBOOK_ID,
+        resourceRevision: lorebookRevision,
+        archive: {
+          state: archived ? "archived" : "inline",
+          characters: 1000,
+          sha256: archived ? ORIGINAL_SHA256 : null,
+        },
+      });
+    }
     if (url === `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}` && method === "GET") {
+      return json(200, { value: entryFixture(), resourceRevision: lorebookRevision });
+    }
+    if (
+      url ===
+        `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}/cmb-compression?castId=leo&importanceMode=auto` &&
+      method === "GET"
+    ) {
+      return json(200, {
+        resourceRevision: lorebookRevision,
+        basisFingerprint: "a".repeat(64),
+        eligibility: { status: "ready", reason: null },
+        current: null,
+        state: "none",
+        reason: null,
+      });
+    }
+    if (
+      ["apply", "remove"].some(
+        (action) => url === `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}/cmb-compression/${action}`,
+      ) &&
+      method === "POST"
+    ) {
+      assert.equal(body?.expectedResourceRevision, lorebookRevision);
+      assert.equal(body?.castId, "leo");
+      assert.equal(body?.expectedCompressionRevision, 0);
+      assert.equal(body?.operationHandle, RAW_OPERATION_HANDLE);
+      lorebookRevision += 1;
       return json(200, { value: entryFixture(), resourceRevision: lorebookRevision });
     }
     if (url === "/api/lorebooks/coordination" && method === "POST") {
@@ -1249,6 +1464,81 @@ assert.deepEqual(await facade.lorebooks.get({ lorebookId: LOREBOOK_ID }), lorebo
 assert.deepEqual(await facade.lorebooks.listEntries({ lorebookId: LOREBOOK_ID }), [entryFixture()]);
 assert.deepEqual(await facade.lorebooks.listEntryProjections({ lorebookId: LOREBOOK_ID }), [entryProjectionFixture()]);
 assert.deepEqual(await facade.lorebooks.getEntry({ lorebookId: LOREBOOK_ID, entryId: ENTRY_ID }), entryFixture());
+assert.equal(
+  (
+    await facade.lorebooks.inspectCmbCompression({
+      lorebookId: LOREBOOK_ID,
+      entryId: ENTRY_ID,
+      castId: "leo",
+      importanceMode: "auto",
+    })
+  ).state,
+  "none",
+);
+lorebookRevision += 1;
+assert.deepEqual(await facade.lorebooks.listCmbMemoryCatalog({ lorebookId: LOREBOOK_ID }), cmbCatalogFixture());
+const missingCatalog = { ...cmbCatalogFixture(), items: [missingCatalogItem] };
+nextCatalogResponse = { ...missingCatalog, resourceRevision: lorebookRevision };
+assert.deepEqual(
+  await facade.lorebooks.listCmbMemoryCatalog({ lorebookId: LOREBOOK_ID }),
+  missingCatalog,
+  "the transport keeps missing archived source metadata visible without requesting its original",
+);
+for (const item of invalidSourceStatusItems) {
+  nextCatalogResponse = { ...cmbCatalogFixture(), items: [item], resourceRevision: lorebookRevision + 100 };
+  await assert.rejects(
+    facade.lorebooks.listCmbMemoryCatalog({ lorebookId: LOREBOOK_ID }),
+    (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "coordination-unavailable",
+    "mismatched provenance is rejected before caching the response revision",
+  );
+}
+const catalogRequestsBeforeInvalidInput = trustedRequests.length;
+for (const input of [
+  { lorebookId: LOREBOOK_ID, includeOriginal: true },
+  { lorebookId: LOREBOOK_ID, expectedResourceRevision: 999 },
+  { lorebookId: LOREBOOK_ID, leaseToken: "caller-supplied-token" },
+  {},
+]) {
+  await assert.rejects(
+    facade.lorebooks.listCmbMemoryCatalog(input as never),
+    (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "invalid-request",
+  );
+}
+assert.equal(trustedRequests.length, catalogRequestsBeforeInvalidInput, "invalid catalog inputs never dispatch");
+for (const payload of [
+  { ...cmbCatalogFixture(), items: [{ ...catalogItem, content: "private original" }] },
+  {
+    ...cmbCatalogFixture(),
+    items: [{ ...catalogItem, source: { ...catalogItem.source, rawContent: "private original" } }],
+  },
+]) {
+  nextCatalogResponse = { ...payload, resourceRevision: lorebookRevision + 100 };
+  await assert.rejects(
+    facade.lorebooks.listCmbMemoryCatalog({ lorebookId: LOREBOOK_ID }),
+    (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "coordination-unavailable",
+    "body-bearing catalog responses must fail closed without updating the revision cache",
+  );
+}
+const nativeArraySome = Array.prototype.some;
+try {
+  Array.prototype.some = () => false;
+  for (const payload of [
+    { ...cmbCatalogFixture(), items: [{ ...catalogItem, lorebookId: "foreign-book" }] },
+    {
+      ...cmbCatalogFixture(),
+      policyEntries: [{ ...cmbCatalogFixture().policyEntries[0], lorebookId: "foreign-book" }],
+    },
+  ]) {
+    nextCatalogResponse = { ...payload, resourceRevision: lorebookRevision + 100 };
+    await assert.rejects(
+      facade.lorebooks.listCmbMemoryCatalog({ lorebookId: LOREBOOK_ID }),
+      (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "coordination-unavailable",
+      "page Array hooks cannot bypass catalog book identity checks",
+    );
+  }
+} finally {
+  Array.prototype.some = nativeArraySome;
+}
 blockNextRequest = true;
 accelerateNextDeadline = true;
 await assert.rejects(
@@ -1268,12 +1558,72 @@ assert.equal(Object.isFrozen(operation.lorebooks), true);
 assert.equal(Object.isFrozen(operation.storage.patch), true);
 assert.equal(Object.isFrozen(operation.transitionToVectorize), true);
 assert.equal(nativeObjectHasOwn(operation, "operationHandle"), false);
+assert.equal(nativeObjectHasOwn(facade.lorebooks, "archiveCmbOriginal"), false);
+assert.equal(nativeObjectHasOwn(facade.lorebooks, "restoreCmbOriginal"), false);
+assert.equal(Object.isFrozen(operation.lorebooks.archiveCmbOriginal), true);
+assert.equal(Object.isFrozen(operation.lorebooks.restoreCmbOriginal), true);
+const archiveInput = { lorebookId: LOREBOOK_ID, entryId: ENTRY_ID, expectedArchiveSha256: null };
+const restoreInput = { ...archiveInput, expectedArchiveSha256: ORIGINAL_SHA256 };
+const beforeInvalidArchive = trustedRequests.length;
+for (const input of [
+  { ...archiveInput, content: "private original" },
+  { ...archiveInput, expectedResourceRevision: 999 },
+  { ...archiveInput, operationHandle: "caller-supplied-handle" },
+  { ...archiveInput, expectedArchiveSha256: "invalid" },
+  { lorebookId: LOREBOOK_ID, entryId: ENTRY_ID },
+]) {
+  await assert.rejects(
+    operation.lorebooks.archiveCmbOriginal(input as never),
+    (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "invalid-request",
+  );
+  await assert.rejects(
+    operation.lorebooks.restoreCmbOriginal(input as never),
+    (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "invalid-request",
+  );
+}
+await assert.rejects(
+  operation.lorebooks.archiveCmbOriginal({ ...archiveInput, lorebookId: "unread-book" }),
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "coordination-unavailable",
+  "an unread book has no trusted revision and cannot dispatch archive",
+);
+assert.equal(trustedRequests.length, beforeInvalidArchive);
+for (const identity of [
+  { entryId: "foreign-entry", lorebookId: LOREBOOK_ID },
+  { entryId: ENTRY_ID, lorebookId: "foreign-book" },
+]) {
+  nextOriginalResponse = { ...identity, archive: catalogItem.archive, resourceRevision: lorebookRevision + 100 };
+  await assert.rejects(
+    operation.lorebooks.archiveCmbOriginal(archiveInput),
+    (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "coordination-unavailable",
+    "archive response identity cannot replace the requested entry or cached revision",
+  );
+}
+nextOriginalResponse = {
+  entryId: ENTRY_ID,
+  lorebookId: LOREBOOK_ID,
+  archive: catalogItem.archive,
+  content: "private original",
+  resourceRevision: lorebookRevision + 100,
+};
+await assert.rejects(
+  operation.lorebooks.restoreCmbOriginal(restoreInput),
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "coordination-unavailable",
+  "restore responses must remain metadata-only",
+);
+assert.deepEqual(await operation.lorebooks.archiveCmbOriginal(archiveInput), {
+  entryId: ENTRY_ID,
+  lorebookId: LOREBOOK_ID,
+  archive: catalogItem.archive,
+});
+assert.deepEqual(await operation.lorebooks.restoreCmbOriginal(restoreInput), {
+  entryId: ENTRY_ID,
+  lorebookId: LOREBOOK_ID,
+  archive: { state: "inline", characters: 1000, sha256: null },
+});
 const beforePrematureVectorize = trustedRequests.length;
 await assert.rejects(
   operation.lorebooks.vectorizeMissing({ lorebookId: LOREBOOK_ID, connectionId: "embedding-fixture" }),
-  (error) =>
-    error instanceof PersonalExtensionCoordinationFacadeError
-    && error.code === "operation-kind-unsupported",
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "operation-kind-unsupported",
   "a mutation capability must reject vector dispatch before the explicit transition",
 );
 assert.equal(trustedRequests.length, beforePrematureVectorize);
@@ -1319,6 +1669,39 @@ assert.equal(
   "Updated entry",
 );
 assert.equal(await operation.lorebooks.deleteEntry({ lorebookId: LOREBOOK_ID, entryId: ENTRY_ID }), undefined);
+const compressionInput = {
+  lorebookId: LOREBOOK_ID,
+  entryId: ENTRY_ID,
+  compression: {
+    castId: "leo",
+    importanceMode: "auto" as const,
+    expectedCompressionRevision: 0,
+    expectedBasisFingerprint: "a".repeat(64),
+    summary: "Leo remembers.",
+    importanceReason: "A promise.",
+    retention: "detail" as const,
+    evidence: [{ quote: "Leo remembers." }],
+    facts: [{ actors: ["Leo"], negation: null, condition: null, status: null, evidenceQuote: "Leo remembers." }],
+  },
+};
+assert.deepEqual(await operation.lorebooks.applyCmbCompression(compressionInput), entryFixture());
+assert.deepEqual(
+  await operation.lorebooks.removeCmbCompression({
+    lorebookId: LOREBOOK_ID,
+    entryId: ENTRY_ID,
+    compression: { castId: "leo", expectedCompressionRevision: 0 },
+  }),
+  entryFixture(),
+);
+const beforeInvalidCompression = trustedRequests.length;
+await assert.rejects(
+  operation.lorebooks.applyCmbCompression({
+    ...compressionInput,
+    compression: { ...compressionInput.compression, expectedBasisFingerprint: "not-a-fingerprint" },
+  }),
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "invalid-request",
+);
+assert.equal(trustedRequests.length, beforeInvalidCompression);
 
 const initialOperationDeadlineAt = operation.deadlineAt;
 const initialOperationRemainingMs = operation.remainingMs;
@@ -1328,9 +1711,7 @@ const cancelledTransition = operation.transitionToVectorize({ signal: transition
 transitionAbort.abort();
 await assert.rejects(
   cancelledTransition,
-  (error) =>
-    error instanceof PersonalExtensionCoordinationFacadeError
-    && error.code === "request-cancelled",
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "request-cancelled",
   "an interrupted transition must remain retryable without exposing or replacing its handle",
 );
 assert.equal(operation.kind, "mutation");
@@ -1345,26 +1726,29 @@ assert.equal(operation.kind, "vectorize");
 assert.equal(operation.deadlineAt, "2026-08-16T00:10:00.000Z");
 assert.equal(operation.remainingMs, 600_000);
 assert.equal(
-  trustedRequests.findLast((request) =>
-    request.url.endsWith("/coordination/operations/transition-to-vectorize"),
-  )?.body?.targetEnsembleId,
+  trustedRequests.findLast((request) => request.url.endsWith("/coordination/operations/transition-to-vectorize"))?.body
+    ?.targetEnsembleId,
   "ensemble-facade",
 );
 assert.equal(await operation.transitionToVectorize(), undefined);
 assert.equal(
-  trustedRequests.filter((request) =>
-    request.url.endsWith("/coordination/operations/transition-to-vectorize"),
-  ).length,
+  trustedRequests.filter((request) => request.url.endsWith("/coordination/operations/transition-to-vectorize")).length,
   transitionRequestCount + 1,
   "a completed local transition must be an idempotent no-op",
 );
 
 const beforePostTransitionMutation = trustedRequests.length;
 await assert.rejects(
+  operation.lorebooks.archiveCmbOriginal(archiveInput),
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "operation-kind-unsupported",
+);
+await assert.rejects(
+  operation.lorebooks.restoreCmbOriginal(restoreInput),
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "operation-kind-unsupported",
+);
+await assert.rejects(
   operation.lorebooks.createEntry({ lorebookId: LOREBOOK_ID, entry: { name: "too late" } }),
-  (error) =>
-    error instanceof PersonalExtensionCoordinationFacadeError
-    && error.code === "operation-kind-unsupported",
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "operation-kind-unsupported",
   "the same capability must reject CRUD after it narrows to vectorize",
 );
 assert.equal(trustedRequests.length, beforePostTransitionMutation);
@@ -1376,6 +1760,12 @@ assert.deepEqual(
   { vectorized: 1, total: 1, skipped: 0 },
 );
 await operation.end({ disposition: "conclusive" });
+const beforeEndedArchive = trustedRequests.length;
+await assert.rejects(
+  operation.lorebooks.archiveCmbOriginal(archiveInput),
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "operation-lost",
+);
+assert.equal(trustedRequests.length, beforeEndedArchive, "an ended operation cannot archive originals");
 assert.equal(
   trustedRequests.findLast((request) => request.url.endsWith("/coordination/operations/end"))?.body?.disposition,
   "conclusive",
@@ -1387,9 +1777,7 @@ assert.equal(await vectorOperation.transitionToVectorize(), undefined);
 assert.equal(trustedRequests.length, beforeDirectVectorNoOp);
 await assert.rejects(
   vectorOperation.lorebooks.deleteEntry({ lorebookId: LOREBOOK_ID, entryId: ENTRY_ID }),
-  (error) =>
-    error instanceof PersonalExtensionCoordinationFacadeError
-    && error.code === "operation-kind-unsupported",
+  (error) => error instanceof PersonalExtensionCoordinationFacadeError && error.code === "operation-kind-unsupported",
 );
 assert.equal(trustedRequests.length, beforeDirectVectorNoOp);
 blockNextRequest = true;
@@ -1674,8 +2062,14 @@ assert.deepEqual(
     "/api/lorebooks/coordination",
     `/api/lorebooks/${LOREBOOK_ID}/coordination`,
     `/api/lorebooks/${LOREBOOK_ID}/coordination/entry-projections`,
+    `/api/lorebooks/${LOREBOOK_ID}/coordination/cmb-memory-catalog`,
     `/api/lorebooks/${LOREBOOK_ID}/coordination/entries`,
     `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}`,
+    `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}/cmb-compression?castId=leo&importanceMode=auto`,
+    `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}/cmb-compression/apply`,
+    `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}/cmb-compression/remove`,
+    `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}/cmb-original/archive`,
+    `/api/lorebooks/${LOREBOOK_ID}/coordination/entries/${ENTRY_ID}/cmb-original/restore`,
     `/api/lorebooks/${LOREBOOK_ID}/coordination/vectorize`,
     `/api/lorebooks/${LOREBOOK_ID}/coordination/vectors`,
     `/api/lorebooks/${CREATED_LOREBOOK_ID}/coordination`,
@@ -1692,6 +2086,15 @@ assert.equal(
   true,
   "mutating requests must inherit Marinara's CSRF contract",
 );
+// Server parsing is outside the hostile page realm. Validate the recorded wire
+// requests after restoring its hooks so fixture validation cannot observe authority.
+for (const request of trustedRequests.filter(({ url }) => url.includes("/cmb-original/"))) {
+  assert.equal(
+    personalExtensionCoordinationCmbOriginalRequestSchema.safeParse(request.body).success,
+    true,
+    "archive/restore dispatch must match the closed guarded host request",
+  );
+}
 
 const injectorSource = readFileSync(
   new URL("../../packages/client/src/components/layout/PersonalExtensionInjector.tsx", import.meta.url),

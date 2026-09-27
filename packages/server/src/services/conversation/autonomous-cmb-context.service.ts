@@ -24,6 +24,7 @@ import {
 import { computePersonalExtensionHash } from "../extensions/personal-extension-hash.js";
 import { wrapContent } from "../prompt/format-engine.js";
 import { sanitizePromptLeaf } from "../prompt/prompt-escaping.js";
+import { loadCmbCompressedSourceSpans } from "../lorebook/cmb-compression-retrieval.js";
 import { formatZonedConversationDate, formatZonedConversationTime } from "./timezone.js";
 import {
   isCmbSourceMessageRestricted,
@@ -195,7 +196,7 @@ function parseCapabilities(value: unknown, source: PersonalExtensionSource): Per
     : normalized;
 }
 
-function isApprovedClientCmb(row: ExtensionRow): boolean {
+export function isApprovedClientCmb(row: ExtensionRow): boolean {
   if (row.name !== CMB_EXTENSION_NAME || row.runtime !== "client" || row.enabled !== "true") return false;
   const source = parseExtensionSource(row.source);
   const capabilities = parseCapabilities(row.capabilities, source);
@@ -210,7 +211,7 @@ function isApprovedClientCmb(row: ExtensionRow): boolean {
   return row.contentHash === actualHash && row.approvedHash === actualHash;
 }
 
-function parseCmbConfig(value: unknown): CmbConfig | null {
+export function parseCmbConfig(value: unknown): CmbConfig | null {
   if (!isRecord(value) || value.schemaVersion !== CMB_SCHEMA_VERSION || !Array.isArray(value.ensembles)) return null;
   if (value.ensembles.length === 0 || value.ensembles.length > MAX_ENSEMBLES) return null;
 
@@ -746,6 +747,18 @@ async function buildCmbRecentContextInner(
   }
   const restrictions = resolveCmbSourceRestrictions(scopedEntries, ensemble, targetCharacterIds);
   if (restrictions === null) return null;
+  const compressedSources = await loadCmbCompressedSourceSpans(db, {
+    entries: managedEntries,
+    sourceChatIds: sourceDescriptors.map(({ chat }) => chat.id),
+  });
+  if (expired() || compressedSources === null) return null;
+  restrictions.push(
+    ...compressedSources.map((span) => ({
+      chatId: span.chatId,
+      firstMessageAt: span.first === null ? null : new Date(span.first).toISOString(),
+      lastMessageAt: span.last === null ? null : new Date(span.last).toISOString(),
+    })),
+  );
 
   const characterRows = await db
     .select({ id: characters.id, data: characters.data })

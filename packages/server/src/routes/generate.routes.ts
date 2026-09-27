@@ -145,6 +145,7 @@ import {
   filterRelevantLorebooks,
   processLorebooks,
   scopeLorebookScanResultToCharacter,
+  refreshLorebookScanResultForAudience,
   type LorebookScanResult,
 } from "../services/lorebook/index.js";
 import {
@@ -653,6 +654,7 @@ import { loadPriorBeholderState } from "../services/agents/beholder-state.js";
 import { injectGameGmPromptRuntime } from "../services/generation/game-gm-prompt-runtime.js";
 import { mergeConversationCharacterMemories } from "../services/generation/conversation-memory-context.js";
 import { buildCmbRecentContext } from "../services/conversation/autonomous-cmb-context.service.js";
+import { resolveCmbCompressionEntries } from "../services/lorebook/cmb-compression-retrieval.js";
 import { injectMemoryRecallContext } from "../services/generation/memory-recall-context.js";
 import { shouldSkipAgentByMessageInterval } from "../services/generation/agent-cadence.js";
 import {
@@ -688,13 +690,14 @@ function scopeLorebookPromptMessagesForCharacter(
   const worldInfoReplacements = [
     [source.worldInfoBefore, scoped.worldInfoBefore],
     [source.worldInfoAfter, scoped.worldInfoAfter],
+    ...Object.entries(source.outlets).map(([name, content]) => [content, scoped.outlets[name] ?? ""] as const),
   ] as const;
   const scopedDepthContents = new Set(scoped.depthEntries.map((entry) => entry.content));
   const removedDepthContents = source.depthEntries
     .map((entry) => entry.content)
     .filter((content) => !scopedDepthContents.has(content));
 
-  return messages
+  const replaced = messages
     .map((message) => {
       if (message.contextKind === "history") return message;
       let content = message.content;
@@ -709,6 +712,26 @@ function scopeLorebookPromptMessagesForCharacter(
       return content === message.content ? message : { ...message, content };
     })
     .filter((message) => message.content.trim().length > 0);
+  // A merged scan can hold a private/character-specific memory that the current
+  // speaker's fresh scan admits. There may be no old block to replace in that case.
+  const addedWorldInfo = [
+    ...(!source.worldInfoBefore && scoped.worldInfoBefore ? [scoped.worldInfoBefore] : []),
+    ...(!source.worldInfoAfter && scoped.worldInfoAfter ? [scoped.worldInfoAfter] : []),
+  ];
+  if (addedWorldInfo.length) {
+    const firstHistory = replaced.findIndex(
+      (message) => message.contextKind === "history" || message.role !== "system",
+    );
+    replaced.splice(firstHistory < 0 ? replaced.length : firstHistory, 0, {
+      role: "system",
+      content: addedWorldInfo.join("\n\n"),
+    });
+  }
+  const oldDepth = new Set(source.depthEntries.map((entry) => entry.content));
+  return injectAtDepth(
+    replaced,
+    scoped.depthEntries.filter((entry) => !oldDepth.has(entry.content)),
+  );
 }
 
 const PROFESSOR_MARI_INTERNAL_CHAT_MARKER = "professor-mari";
@@ -2730,6 +2753,7 @@ export async function generateRoutes(app: FastifyInstance) {
           const lorebookResult = await processLorebooks(app.db, toLorebookScanMessages(), null, {
             chatId: input.chatId,
             characterIds: withIdentityLorebookScope(targetCharacterIds),
+            cmbAudienceCharacterIds: targetCharacterIds,
             personaId,
             activeLorebookIds: chatActiveLorebookIds,
             excludedLorebookIds: lorebookScopeExclusions.excludedLorebookIds,
@@ -2830,9 +2854,12 @@ export async function generateRoutes(app: FastifyInstance) {
             excludedLorebookIds: lorebookScopeExclusions.excludedLorebookIds,
             excludedSourceAgentIds: lorebookScopeExclusions.excludedSourceAgentIds,
           };
-          const activeEntries = (await lorebooksStore.listActiveEntries({
-            ...lorebookScopeFilters,
-          })) as LorebookEntry[];
+          const activeEntries = (await lorebooksStore.listActiveEntries(
+            {
+              ...lorebookScopeFilters,
+            },
+            true,
+          )) as LorebookEntry[];
           const hasVectorizedEntries = activeEntries.some(
             (entry) => Array.isArray(entry.embedding) && entry.embedding.length > 0,
           );
@@ -3504,6 +3531,7 @@ export async function generateRoutes(app: FastifyInstance) {
           const lorebookResult = await processLorebooks(app.db, toLorebookScanMessages(), null, {
             chatId: input.chatId,
             characterIds: withIdentityLorebookScope(promptCharacterIds),
+            cmbAudienceCharacterIds: promptCharacterIds,
             personaId,
             activeLorebookIds: chatActiveLorebookIds,
             forcedEntryIds:
@@ -4072,6 +4100,7 @@ export async function generateRoutes(app: FastifyInstance) {
               {
                 chatId: input.chatId,
                 characterIds: withIdentityLorebookScope(characterIds),
+                cmbAudienceCharacterIds: characterIds,
                 personaId,
                 activeLorebookIds: chatActiveLorebookIds,
                 forcedEntryIds:
@@ -4553,6 +4582,36 @@ export async function generateRoutes(app: FastifyInstance) {
         const customAgentsWithLorebookTriggers = resolvedAgents.filter(
           (agent) => !builtInAgentTypes.has(agent.type) && agent.settings.triggerLorebooksForAgentCalls === true,
         );
+        // Agent-owned lorebook sources use the same CMB representation as normal recall.
+        // Their shared context never requests detailed originals from compressed memories.
+        const listAgentLorebookEntries = async (sourceIds: string[]) => {
+          const candidates = await lorebooksStore.listEntriesByLorebooks(sourceIds, true);
+          const eligible = await lorebooksStore.listEligibleEntriesByIds(
+            candidates.map((entry) => String((entry as Record<string, unknown>).id)),
+            {
+              deferCmbOriginals: true,
+              unlimited: true,
+              excludedLorebookIds: lorebookScopeExclusions.excludedLorebookIds,
+              excludedSourceAgentIds: lorebookScopeExclusions.excludedSourceAgentIds,
+            },
+          );
+          return resolveCmbCompressionEntries(
+            app.db,
+            eligible.filter(
+              (entry) =>
+                (chatMeta.entryStateOverrides as Record<string, { enabled?: boolean }> | undefined)?.[entry.id]
+                  ?.enabled !== false,
+            ),
+            {
+              audienceCharacterIds: promptCharacterIds,
+              contextCharacterIds: withIdentityLorebookScope(promptCharacterIds),
+              activeCharacterTags: Array.from(
+                new Set(charInfo.flatMap((character) => (Array.isArray(character.tags) ? character.tags : []))),
+              ),
+              generationTriggers: lorebookGenerationTriggers,
+            },
+          );
+        };
         const resolveTriggeredLorebookEntriesByAgentId = createAgentLorebookTriggerResolver({
           agents: customAgentsWithLorebookTriggers.map((agent) => {
             const { sourceLorebookIds, source } = resolveKnowledgeSourceLorebookIds({
@@ -4576,8 +4635,7 @@ export async function generateRoutes(app: FastifyInstance) {
           filterSourceLorebookIds: filterChatActiveLorebookSourceIdsForPrompt,
           gameState: gameState as GameStateForScanning | null,
           generationTriggers: lorebookGenerationTriggers,
-          listEntriesByLorebookIds: async (sourceIds) =>
-            (await lorebooksStore.listEntriesByLorebooks(sourceIds)) as LorebookEntry[],
+          listEntriesByLorebookIds: listAgentLorebookEntries,
           listLorebooks: async () => (await lorebooksStore.list()) as unknown as Lorebook[],
           resolveContent: (value) => resolvePromptMacrosForLorebook(value).content,
           signal: abortController.signal,
@@ -5076,7 +5134,7 @@ export async function generateRoutes(app: FastifyInstance) {
             });
             const sourceIds = await filterChatActiveLorebookSourceIdsForPrompt(rawSourceIds, source);
             if (sourceIds.length > 0) {
-              const entries = await lorebooksStore.listEntriesByLorebooks(sourceIds);
+              const entries = await listAgentLorebookEntries(sourceIds);
               const activeEntries = entries.filter((e: any) => e.enabled !== false);
               if (activeEntries.length > 0) {
                 const formatted = activeEntries
@@ -5142,7 +5200,7 @@ export async function generateRoutes(app: FastifyInstance) {
             });
             const sourceIds = await filterChatActiveLorebookSourceIdsForPrompt(rawSourceIds, source);
             if (sourceIds.length > 0) {
-              const entries = (await lorebooksStore.listEntriesByLorebooks(sourceIds)) as LorebookEntry[];
+              const entries = await listAgentLorebookEntries(sourceIds);
               // Honor per-chat entry state overrides — a user can disable an entry for
               // this chat without touching the global lorebook, and ephemeral entries
               // carry per-chat countdown state. Mirrors the projection the standard
@@ -5443,10 +5501,13 @@ export async function generateRoutes(app: FastifyInstance) {
           toolDefs,
           baseToolExecutionContext,
           updateChatMetadataForTools,
+          setCmbPromptMemories,
         } = await resolveGenerationTools({
+          db: app.db,
           requestBody: input as Record<string, unknown>,
           nativeToolsAvailable: supportsNativeToolCalls((gameToolConnection ?? conn).provider),
           lorebookEmbeddingOptions: { embeddingSource: memoryRecallEmbeddingSource, signal: abortController.signal },
+          lorebookGenerationTriggers,
           chatId: input.chatId,
           chatMetadata: chatMeta,
           chats,
@@ -6794,6 +6855,7 @@ export async function generateRoutes(app: FastifyInstance) {
             gameAwareMessagesForGen,
             audienceCharacterIds,
           );
+          let currentPromptLorebookScan = lorebookPromptScanResult;
           if (
             usesIndividualGroupGeneration &&
             deferCharacterMacros &&
@@ -6812,12 +6874,25 @@ export async function generateRoutes(app: FastifyInstance) {
               scopedLorebookScansByCharacterId.set(targetCharId, scopedScanPromise);
             }
             const scopedLorebookScan = await scopedScanPromise;
+            currentPromptLorebookScan = scopedLorebookScan;
             gameAwareMessagesForGen = scopeLorebookPromptMessagesForCharacter(
               gameAwareMessagesForGen,
               lorebookPromptScanResult,
               scopedLorebookScan,
             );
+          } else if (lorebookPromptScanResult) {
+            const currentLorebookScan = await refreshLorebookScanResultForAudience(
+              lorebookPromptScanResult,
+              audienceCharacterIds,
+            );
+            currentPromptLorebookScan = currentLorebookScan;
+            gameAwareMessagesForGen = scopeLorebookPromptMessagesForCharacter(
+              gameAwareMessagesForGen,
+              lorebookPromptScanResult,
+              currentLorebookScan,
+            );
           }
+          setCmbPromptMemories(audienceCharacterIds, currentPromptLorebookScan?.activatedEntries ?? []);
           const targetContextBlock = targetCharId
             ? conversationContextBlocksByCharacterId.get(targetCharId)
             : undefined;

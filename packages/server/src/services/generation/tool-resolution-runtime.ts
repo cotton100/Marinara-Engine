@@ -1,5 +1,10 @@
 import { BUILT_IN_TOOLS, DEFAULT_AGENT_TOOLS, customAgentHasCapability } from "@marinara-engine/shared";
 import type { AgentContext } from "@marinara-engine/shared";
+import type { DB } from "../../db/connection.js";
+import { inArray } from "../../db/file-query.js";
+import { characters } from "../../db/schema/index.js";
+import { createCmbDetailedRecallBudget, resolveCmbCompressionEntries } from "../lorebook/cmb-compression-retrieval.js";
+import { withCmbProvenance } from "../lorebook/cmb-provenance.js";
 import type { LLMToolDefinition } from "../llm/base-provider.js";
 import type { ResolvedAgent } from "../agents/agent-pipeline.js";
 import {
@@ -62,7 +67,7 @@ type ChatsStore = {
 };
 
 type LorebooksStore = {
-  listActiveEntries(args: Record<string, unknown>): Promise<any[]>;
+  listActiveEntries(args: Record<string, unknown>, deferCmbOriginals?: boolean): Promise<any[]>;
   getById(id: string): Promise<any | null>;
   listEntries(lorebookId: string): Promise<any[]>;
   createEntry(entry: Record<string, unknown>): Promise<any>;
@@ -72,6 +77,7 @@ type LorebooksStore = {
 type AgentsStore = unknown;
 
 export type ResolveGenerationToolsArgs = {
+  db?: DB;
   requestBody: Record<string, unknown>;
   chatId: string;
   chatMetadata: Record<string, unknown>;
@@ -100,6 +106,7 @@ export type ResolveGenerationToolsArgs = {
   autoAttachToolNames?: readonly string[];
   nativeToolsAvailable?: boolean;
   lorebookEmbeddingOptions?: LorebookEmbeddingOptions;
+  lorebookGenerationTriggers?: string[];
 };
 
 export type ResolveAgentGenerationToolsArgs = ResolveGenerationToolsArgs & {
@@ -118,6 +125,7 @@ export type ResolvedGenerationTools = {
   toolDefs: LLMToolDefinition[] | undefined;
   baseToolExecutionContext: ToolExecutionContext;
   updateChatMetadataForTools: (patchOrUpdater: MetadataPatchInput) => Promise<MetadataPatch>;
+  setCmbPromptMemories(audienceIds: string[], entries: Array<{ id: string; content: string }>): void;
 };
 
 export function resolveToolLorebookCharacterIds(
@@ -740,6 +748,7 @@ async function attachSpotifyCurrentPlaybackContext(args: {
 
 async function resolveToolRuntime(
   {
+    db,
     requestBody,
     chatId,
     chatMetadata,
@@ -761,6 +770,7 @@ async function resolveToolRuntime(
     emitMetadataPatch,
     observeSpotifyPlaybackBeforePlay,
     lorebookEmbeddingOptions,
+    lorebookGenerationTriggers,
   }: ResolveAgentGenerationToolsArgs,
   options: {
     enableChatTools: boolean;
@@ -848,29 +858,94 @@ async function resolveToolRuntime(
     }
   }
 
-  const searchLorebookForTools = async (query: string, category?: string | null, requireVectors = false) => {
+  const cmbDetailBudgets = new Map<string, ReturnType<typeof createCmbDetailedRecallBudget>>();
+  const cmbSeenMemories = new Map<string, Set<string>>();
+  const audienceKey = (ids: string[]) => JSON.stringify([...new Set(ids)].sort());
+  const setCmbPromptMemories = (audienceIds: string[], entries: Array<{ id: string; content: string }>) => {
+    const key = audienceKey(audienceIds);
+    const budget = createCmbDetailedRecallBudget();
+    const seen = new Set<string>();
+    for (const entry of entries) {
+      if (!entry.content.includes("[CMB memory provenance]")) continue;
+      seen.add(entry.id);
+      const detailIndex = entry.content.indexOf("[CMB recalled original details]\n");
+      if (detailIndex >= 0) {
+        budget.count += 1;
+        budget.characters += entry.content.length - detailIndex - "[CMB recalled original details]\n".length;
+      }
+    }
+    cmbDetailBudgets.set(key, budget);
+    cmbSeenMemories.set(key, seen);
+  };
+  const searchLorebookForTools = async (
+    query: string,
+    category?: string | null,
+    requireVectors = false,
+    callingCharacterId?: string | null,
+  ) => {
     const normalizedQuery = query.trim().toLowerCase();
     if (!normalizedQuery) return [];
-    const entries = await lorebooksStore.listActiveEntries({
+    const audience = callingCharacterId
+      ? promptCharacterIds.includes(callingCharacterId)
+        ? [callingCharacterId]
+        : []
+      : promptCharacterIds;
+    const bookCharacters = resolveToolLorebookCharacterIds(promptCharacterIds, lorebookCharacterIds);
+    const scopedCharacters = [
+      ...new Set([...audience, ...bookCharacters.filter((id) => !promptCharacterIds.includes(id))]),
+    ];
+    const currentTags = async () => {
+      if (!db || !scopedCharacters.length) return [];
+      const rows = await db
+        .select({ data: characters.data })
+        .from(characters)
+        .where(inArray(characters.id, scopedCharacters));
+      return rows.flatMap((row) => {
+        const tags = parseExtra(row.data).tags;
+        return Array.isArray(tags) ? tags.filter((tag): tag is string => typeof tag === "string") : [];
+      });
+    };
+    const budgetKey = audienceKey(audience);
+    let cmbDetailBudget = cmbDetailBudgets.get(budgetKey);
+    if (!cmbDetailBudget) {
+      cmbDetailBudget = createCmbDetailedRecallBudget();
+      cmbDetailBudgets.set(budgetKey, cmbDetailBudget);
+    }
+    let seen = cmbSeenMemories.get(budgetKey);
+    if (!seen) {
+      seen = new Set<string>();
+      cmbSeenMemories.set(budgetKey, seen);
+    }
+    const scope = {
       chatId,
-      characterIds: resolveToolLorebookCharacterIds(promptCharacterIds, lorebookCharacterIds),
+      characterIds: scopedCharacters,
       personaId,
       activeLorebookIds,
       excludedLorebookIds,
       excludedSourceAgentIds,
+    };
+    const filterScoped = (entries: any[]) =>
+      entries.filter(
+        (entry: any) =>
+          (!category || entry.tag === category) &&
+          (chatMetadata.entryStateOverrides as Record<string, { enabled?: boolean }> | undefined)?.[entry.id]
+            ?.enabled !== false,
+      );
+    const scoped = filterScoped(await lorebooksStore.listActiveEntries(scope, true));
+    const eligible = await resolveCmbCompressionEntries(db, scoped, {
+      audienceCharacterIds: audience,
+      contextCharacterIds: scopedCharacters,
+      activeCharacterTags: await currentTags(),
+      generationTriggers: lorebookGenerationTriggers,
+      query,
+      detailBudget: { ...cmbDetailBudget },
     });
-    const eligible = entries.filter(
-      (entry: any) =>
-        (!category || entry.tag === category) &&
-        (chatMetadata.entryStateOverrides as Record<string, { enabled?: boolean }> | undefined)?.[entry.id]?.enabled !==
-          false,
-    );
     const vectorized = eligible.filter(
       (entry: any) => !entry.excludeFromVectorization && Array.isArray(entry.embedding) && entry.embedding.length > 0,
     );
     const toResult = (entry: any, similarity?: number) => ({
       name: entry.name,
-      content: entry.content,
+      content: withCmbProvenance(entry, entry.content),
       tag: entry.tag,
       keys: entry.keys as string[],
       ...(similarity === undefined ? {} : { similarity }),
@@ -885,6 +960,31 @@ async function resolveToolRuntime(
         )
         .map((entry: any) => [entry.id, toResult(entry)]),
     );
+    const finish = async () => {
+      if (!scoped.some((entry: any) => entry.tag === "convo-memory-bridge")) return [...results.values()].slice(0, 20);
+      // A provider embedding request may await for a while. Re-read eligibility and
+      // revalidate the derivative before returning tool-visible text.
+      const fresh = filterScoped(await lorebooksStore.listActiveEntries(scope, true))
+        .filter((entry: any) => results.has(entry.id) && !seen.has(entry.id))
+        .slice(0, 20);
+      const current = await resolveCmbCompressionEntries(db, fresh, {
+        audienceCharacterIds: audience,
+        contextCharacterIds: scopedCharacters,
+        activeCharacterTags: await currentTags(),
+        generationTriggers: lorebookGenerationTriggers,
+        query,
+        detailBudget: cmbDetailBudget,
+      });
+      const byId = new Map(current.map((entry) => [entry.id, entry]));
+      return [...results.entries()]
+        .flatMap(([id, previous]) => {
+          const entry = byId.get(id);
+          if (!entry || seen.has(id)) return [];
+          if (entry.tag === "convo-memory-bridge") seen.add(id);
+          return [toResult(entry, previous.similarity)];
+        })
+        .slice(0, 20);
+    };
     if (vectorized.length) {
       try {
         const matches = await semanticShortlistLorebookEntries(vectorized, query, {
@@ -896,7 +996,7 @@ async function resolveToolRuntime(
           for (const { entry, similarity } of matches) {
             if (similarity >= LORE_SEARCH_MIN_SIMILARITY) results.set(entry.id, toResult(entry, similarity));
           }
-          return [...results.values()].slice(0, 20);
+          return finish();
         }
         if (requireVectors)
           throw new Error(
@@ -911,7 +1011,7 @@ async function resolveToolRuntime(
         "No vectorized lore entries are available. Vectorize an enabled lorebook before using Game lore search.",
       );
     }
-    return [...results.values()].slice(0, 20);
+    return finish();
   };
 
   const updateChatMetadataForTools = async (patchOrUpdater: MetadataPatchInput): Promise<MetadataPatch> => {
@@ -976,7 +1076,8 @@ async function resolveToolRuntime(
     customTools: customToolDefs,
     spotify: spotifyCreds,
     spotifyRepeatAfterPlay: gameSpotifyMusicEnabled ? "track" : undefined,
-    searchLorebook: (query, category) => searchLorebookForTools(query, category, agentContext.chatMode === "game"),
+    searchLorebook: (query, category, caller) =>
+      searchLorebookForTools(query, category, agentContext.chatMode === "game", caller),
     chatMeta: chatMetadata,
     onUpdateMetadata: updateChatMetadataForTools,
   };
@@ -1032,7 +1133,8 @@ async function resolveToolRuntime(
         const executionContext = {
           ...baseToolExecutionContext,
           // Existing Agent tools keep their text fallback when no vectors are available.
-          searchLorebook: searchLorebookForTools,
+          searchLorebook: (query: string, category?: string | null, caller?: string | null) =>
+            searchLorebookForTools(query, category, false, caller),
           saveLorebookEntry,
           replaceChatMessageContent: replaceChatMessageContentForAgent,
         };
@@ -1103,6 +1205,7 @@ async function resolveToolRuntime(
     toolDefs,
     baseToolExecutionContext,
     updateChatMetadataForTools,
+    setCmbPromptMemories,
   };
 }
 

@@ -12,6 +12,13 @@ import {
   PERSONAL_EXTENSION_COORDINATION_SCHEMA_VERSION,
   createLorebookEntrySchema,
   createLorebookSchema,
+  personalExtensionCoordinationCmbCompressionApplyInputSchema,
+  personalExtensionCoordinationCmbCompressionRemoveInputSchema,
+  personalExtensionCoordinationCmbCompressionInspectQuerySchema,
+  personalExtensionCoordinationCmbCompressionInspectResponseSchema,
+  personalExtensionCoordinationCmbOriginalInputSchema,
+  personalExtensionCoordinationCmbOriginalResponseSchema,
+  personalExtensionCoordinationRevisionedCmbMemoryCatalogSchema,
   personalExtensionCoordinationContentHashSchema,
   personalExtensionCoordinationDirtyRequestSchema,
   personalExtensionCoordinationDirtyResponseSchema,
@@ -42,6 +49,13 @@ import {
   type PersonalExtensionCoordinationHandoffResponse,
   type CreateLorebookEntryInput,
   type CreateLorebookInput,
+  type PersonalExtensionCoordinationCmbCompressionApplyInput,
+  type PersonalExtensionCoordinationCmbCompressionRemoveInput,
+  type PersonalExtensionCoordinationCmbCompressionInspectQuery,
+  type PersonalExtensionCoordinationCmbCompressionInspectResponse,
+  type PersonalExtensionCoordinationCmbMemoryCatalog,
+  type PersonalExtensionCoordinationCmbOriginalInput,
+  type PersonalExtensionCoordinationCmbOriginalState,
   type PersonalExtensionCoordinationLeaseGrant,
   type PersonalExtensionCoordinationLeaseState,
   type PersonalExtensionCoordinationLorebook,
@@ -263,6 +277,20 @@ export type PersonalExtensionCoordinationLorebookEntryUpdateInput = Readonly<{
 
 export type PersonalExtensionCoordinationLorebookEntryDeleteInput = PersonalExtensionCoordinationLorebookEntryIdInput;
 
+type CmbCompressionInspectInput = PersonalExtensionCoordinationLorebookEntryIdInput &
+  PersonalExtensionCoordinationCmbCompressionInspectQuery;
+type CmbCompressionApplyInput = PersonalExtensionCoordinationLorebookEntryIdInput &
+  Readonly<{ compression: PersonalExtensionCoordinationCmbCompressionApplyInput }>;
+type CmbCompressionRemoveInput = PersonalExtensionCoordinationLorebookEntryIdInput &
+  Readonly<{ compression: PersonalExtensionCoordinationCmbCompressionRemoveInput }>;
+type CmbOriginalInput = PersonalExtensionCoordinationLorebookEntryIdInput &
+  PersonalExtensionCoordinationCmbOriginalInput;
+type CmbOriginalResult = {
+  entryId: string;
+  lorebookId: string;
+  archive: PersonalExtensionCoordinationCmbOriginalState;
+};
+
 export type PersonalExtensionCoordinationLorebookVectorizeInput = Readonly<{
   lorebookId: string;
   connectionId: PersonalExtensionCoordinationLorebookVectorizeRequest["connectionId"];
@@ -294,6 +322,10 @@ export interface PersonalExtensionCoordinationOperationCapability {
       input: PersonalExtensionCoordinationLorebookEntryUpdateInput,
     ): Promise<PersonalExtensionCoordinationLorebookEntry>;
     deleteEntry(input: PersonalExtensionCoordinationLorebookEntryDeleteInput): Promise<void>;
+    applyCmbCompression(input: CmbCompressionApplyInput): Promise<PersonalExtensionCoordinationLorebookEntry>;
+    archiveCmbOriginal(input: CmbOriginalInput): Promise<CmbOriginalResult>;
+    restoreCmbOriginal(input: CmbOriginalInput): Promise<CmbOriginalResult>;
+    removeCmbCompression(input: CmbCompressionRemoveInput): Promise<PersonalExtensionCoordinationLorebookEntry>;
     vectorizeMissing(
       input: PersonalExtensionCoordinationLorebookVectorizeInput,
     ): Promise<Omit<PersonalExtensionCoordinationLorebookVectorizeResponse, "resourceRevision">>;
@@ -340,6 +372,12 @@ export interface PersonalExtensionCoordinationFacade {
     getEntry(
       input: PersonalExtensionCoordinationLorebookEntryIdInput,
     ): Promise<PersonalExtensionCoordinationLorebookEntry>;
+    inspectCmbCompression(
+      input: CmbCompressionInspectInput,
+    ): Promise<PersonalExtensionCoordinationCmbCompressionInspectResponse>;
+    listCmbMemoryCatalog(
+      input: PersonalExtensionCoordinationLorebookIdInput,
+    ): Promise<PersonalExtensionCoordinationCmbMemoryCatalog>;
   }>;
   beginOperation(
     input: PersonalExtensionCoordinationOperationInput,
@@ -1329,6 +1367,78 @@ async function listLorebookEntryProjections(
   return response.items;
 }
 
+async function listCmbMemoryCatalog(
+  facade: PersonalExtensionCoordinationFacade,
+  input: PersonalExtensionCoordinationLorebookIdInput,
+) {
+  const privateState = privateStateFor(facade);
+  const parsed = fixedInput<{ lorebookId: unknown; signal?: unknown }>(input, ["lorebookId", "signal"], ["lorebookId"]);
+  const lorebookId = closedIdentifier(parsed.lorebookId);
+  const response = await lorebookRequest(
+    privateState,
+    `/${encodedIdentifier(lorebookId)}/coordination/cmb-memory-catalog`,
+    "GET",
+    personalExtensionCoordinationRevisionedCmbMemoryCatalogSchema,
+    { signal: readSignal(parsed.signal) },
+  );
+  for (let index = 0; index < response.items.length; index += 1) {
+    if (response.items[index]!.lorebookId !== lorebookId) throw genericUnavailable();
+  }
+  for (let index = 0; index < response.policyEntries.length; index += 1) {
+    if (response.policyEntries[index]!.lorebookId !== lorebookId) throw genericUnavailable();
+  }
+  rememberLorebookRevision(privateState, lorebookId, response.resourceRevision);
+  return {
+    projection: response.projection,
+    items: response.items,
+    policyEntries: response.policyEntries,
+    invalidEntries: response.invalidEntries,
+  };
+}
+
+async function mutateCmbOriginal(
+  capability: PersonalExtensionCoordinationOperationCapability,
+  action: "archive" | "restore",
+  input: CmbOriginalInput,
+): Promise<CmbOriginalResult> {
+  const { operation, privateState, authority } = operationStateFor(capability);
+  requireOperationKind(operation, "mutation");
+  const parsed = fixedInput<{
+    lorebookId: unknown;
+    entryId: unknown;
+    expectedArchiveSha256: unknown;
+    signal?: unknown;
+  }>(
+    input,
+    ["lorebookId", "entryId", "expectedArchiveSha256", "signal"],
+    ["lorebookId", "entryId", "expectedArchiveSha256"],
+  );
+  const lorebookId = closedIdentifier(parsed.lorebookId);
+  const entryId = closedIdentifier(parsed.entryId);
+  let mutation: PersonalExtensionCoordinationCmbOriginalInput;
+  try {
+    mutation = personalExtensionCoordinationCmbOriginalInputSchema.parse({
+      expectedArchiveSha256: parsed.expectedArchiveSha256,
+    });
+  } catch {
+    fail("invalid-request");
+  }
+  const body = operationAuthorityBody(authority, operation.operationHandle);
+  body.extensionId = privateState.extensionId;
+  body.expectedResourceRevision = cachedLorebookRevision(privateState, lorebookId);
+  body.expectedArchiveSha256 = mutation.expectedArchiveSha256;
+  const response = await lorebookRequest(
+    privateState,
+    `/${encodedIdentifier(lorebookId)}/coordination/entries/${encodedIdentifier(entryId)}/cmb-original/${action}`,
+    "POST",
+    personalExtensionCoordinationCmbOriginalResponseSchema,
+    { body, signal: readSignal(parsed.signal), timeoutMs: DEFAULT_MUTATION_TIMEOUT_MS },
+  );
+  if (response.entryId !== entryId || response.lorebookId !== lorebookId) throw genericUnavailable();
+  rememberLorebookRevision(privateState, lorebookId, response.resourceRevision);
+  return { entryId, lorebookId, archive: response.archive };
+}
+
 async function getLorebookEntry(
   facade: PersonalExtensionCoordinationFacade,
   input: PersonalExtensionCoordinationLorebookEntryIdInput,
@@ -1348,6 +1458,84 @@ async function getLorebookEntry(
     "GET",
     personalExtensionCoordinationRevisionedLorebookEntryResponseSchema,
     { signal },
+  );
+  if (response.value.id !== entryId || response.value.lorebookId !== lorebookId) throw genericUnavailable();
+  rememberLorebookRevision(privateState, lorebookId, response.resourceRevision);
+  return response.value;
+}
+
+async function inspectCmbCompression(facade: PersonalExtensionCoordinationFacade, input: CmbCompressionInspectInput) {
+  const privateState = privateStateFor(facade);
+  const parsed = fixedInput<{
+    lorebookId: unknown;
+    entryId: unknown;
+    castId: unknown;
+    importanceMode: unknown;
+    signal?: unknown;
+  }>(
+    input,
+    ["lorebookId", "entryId", "castId", "importanceMode", "signal"],
+    ["lorebookId", "entryId", "castId", "importanceMode"],
+  );
+  const lorebookId = closedIdentifier(parsed.lorebookId);
+  const entryId = closedIdentifier(parsed.entryId);
+  const signal = readSignal(parsed.signal);
+  let query: PersonalExtensionCoordinationCmbCompressionInspectQuery;
+  try {
+    query = personalExtensionCoordinationCmbCompressionInspectQuerySchema.parse({
+      castId: parsed.castId,
+      importanceMode: parsed.importanceMode,
+    });
+  } catch {
+    fail("invalid-request");
+  }
+  const response = await lorebookRequest(
+    privateState,
+    `/${encodedIdentifier(lorebookId)}/coordination/entries/${encodedIdentifier(entryId)}/cmb-compression?castId=${pristineEncodeURIComponent(query.castId)}&importanceMode=${pristineEncodeURIComponent(query.importanceMode)}`,
+    "GET",
+    personalExtensionCoordinationCmbCompressionInspectResponseSchema,
+    { signal },
+  );
+  rememberLorebookRevision(privateState, lorebookId, response.resourceRevision);
+  return response;
+}
+
+async function mutateCmbCompression(
+  capability: PersonalExtensionCoordinationOperationCapability,
+  action: "apply" | "remove",
+  input: CmbCompressionApplyInput | CmbCompressionRemoveInput,
+) {
+  const { operation, privateState, authority } = operationStateFor(capability);
+  requireOperationKind(operation, "mutation");
+  const parsed = fixedInput<{ lorebookId: unknown; entryId: unknown; compression: unknown; signal?: unknown }>(
+    input,
+    ["lorebookId", "entryId", "compression", "signal"],
+    ["lorebookId", "entryId", "compression"],
+  );
+  const lorebookId = closedIdentifier(parsed.lorebookId);
+  const entryId = closedIdentifier(parsed.entryId);
+  const signal = readSignal(parsed.signal);
+  let compression: Record<string, unknown>;
+  try {
+    compression = (
+      action === "apply"
+        ? personalExtensionCoordinationCmbCompressionApplyInputSchema
+        : personalExtensionCoordinationCmbCompressionRemoveInputSchema
+    ).parse(parsed.compression);
+  } catch {
+    fail("invalid-request");
+  }
+  const body = operationAuthorityBody(authority, operation.operationHandle);
+  body.extensionId = privateState.extensionId;
+  body.expectedResourceRevision = cachedLorebookRevision(privateState, lorebookId);
+  const keys = objectKeys(compression);
+  for (let index = 0; index < keys.length; index += 1) body[keys[index]!] = compression[keys[index]!];
+  const response = await lorebookRequest(
+    privateState,
+    `/${encodedIdentifier(lorebookId)}/coordination/entries/${encodedIdentifier(entryId)}/cmb-compression/${action}`,
+    "POST",
+    personalExtensionCoordinationRevisionedLorebookEntryResponseSchema,
+    { body, signal, timeoutMs: DEFAULT_MUTATION_TIMEOUT_MS },
   );
   if (response.value.id !== entryId || response.value.lorebookId !== lorebookId) throw genericUnavailable();
   rememberLorebookRevision(privateState, lorebookId, response.resourceRevision);
@@ -1847,6 +2035,11 @@ function createOperationCapability(
       return response.value;
     },
 
+    applyCmbCompression: (input: CmbCompressionApplyInput) => mutateCmbCompression(capability, "apply", input),
+    archiveCmbOriginal: (input: CmbOriginalInput) => mutateCmbOriginal(capability, "archive", input),
+    restoreCmbOriginal: (input: CmbOriginalInput) => mutateCmbOriginal(capability, "restore", input),
+    removeCmbCompression: (input: CmbCompressionRemoveInput) => mutateCmbCompression(capability, "remove", input),
+
     async deleteEntry(input: PersonalExtensionCoordinationLorebookEntryDeleteInput) {
       const { operation, privateState, authority } = operationStateFor(capability);
       requireOperationKind(operation, "mutation");
@@ -2105,6 +2298,8 @@ export function issuePersonalExtensionCoordinationFacade(options: {
     listEntryProjections: (input: PersonalExtensionCoordinationLorebookIdInput) =>
       listLorebookEntryProjections(facade, input),
     getEntry: (input: PersonalExtensionCoordinationLorebookEntryIdInput) => getLorebookEntry(facade, input),
+    inspectCmbCompression: (input: CmbCompressionInspectInput) => inspectCmbCompression(facade, input),
+    listCmbMemoryCatalog: (input: PersonalExtensionCoordinationLorebookIdInput) => listCmbMemoryCatalog(facade, input),
   };
   const events = {
     subscribe: (

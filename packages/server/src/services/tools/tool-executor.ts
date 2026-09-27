@@ -116,6 +116,7 @@ export function createCustomToolArgumentsValidator(parametersSchema: Record<stri
 export type LorebookSearchFn = (
   query: string,
   category?: string | null,
+  callingCharacterId?: string | null,
 ) => Promise<Array<{ name: string; content: string; tag: string; keys: string[] }>>;
 
 /** Lorebook writer function injected from the route layer. */
@@ -328,7 +329,7 @@ async function executeBuiltInTool(
     case "trigger_event":
       return triggerEvent(args);
     case "search_lorebook":
-      return searchLorebook(args, context?.searchLorebook);
+      return searchLorebook(args, context?.searchLorebook, context?.callingCharacterId);
     case "web_search":
       return webSearch(args);
     case "save_lorebook_entry":
@@ -784,6 +785,7 @@ function triggerEvent(args: Record<string, unknown>): Record<string, unknown> {
 async function searchLorebook(
   args: Record<string, unknown>,
   searchFn?: LorebookSearchFn,
+  callingCharacterId?: string | null,
 ): Promise<Record<string, unknown>> {
   const query = String(args.query ?? "");
   const category = args.category ? String(args.category) : null;
@@ -797,7 +799,7 @@ async function searchLorebook(
     };
   }
 
-  const results = await searchFn(query, category);
+  const results = await searchFn(query, category, callingCharacterId);
   return {
     query,
     category,

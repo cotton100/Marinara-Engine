@@ -10,6 +10,7 @@ import { messages, memoryChunks } from "../db/schema/index.js";
 import { newId, now } from "../utils/id-generator.js";
 import { localEmbed } from "./local-embedder.js";
 import { logger } from "../lib/logger.js";
+import { cmbCompressedSourceOverlaps, loadCmbCompressedSourceSpans } from "./lorebook/cmb-compression-retrieval.js";
 const isLite = process.env.MARINARA_LITE === "true" || process.env.MARINARA_LITE === "1";
 let warnedUnavailableEmbeddingSource = false;
 
@@ -527,11 +528,16 @@ export async function recallMemories(
 
   if (chunks.length === 0) return [];
 
+  // CMB detail expansion belongs to its permission-aware lore selection, not this raw back door.
+  const compressedSources = await loadCmbCompressedSourceSpans(db, { sourceChatIds: matchingChatIds });
+  if (compressedSources === null) return [];
+
   let dimensionMismatchLogged = false;
   let sourceMismatchLogged = false;
 
   // Score each chunk by cosine similarity
   const scored = chunks
+    .filter((chunk) => !cmbCompressedSourceOverlaps(compressedSources, chunk))
     .map((chunk): RecalledMemory | null => {
       if (chunk.embeddingSpaceId !== embeddingSpaceId) {
         if (!sourceMismatchLogged) {

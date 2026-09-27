@@ -26,6 +26,7 @@ import { tmpdir } from "os";
 import { pipeline } from "stream/promises";
 import { StringDecoder } from "string_decoder";
 import { randomBytes, randomUUID } from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createInflateRaw, inflateRawSync } from "zlib";
 import AdmZip from "adm-zip";
 import { FILE_BACKED_TABLES, STORAGE_WRITER_LEASE_FILENAME } from "../db/file-backed-store.js";
@@ -324,9 +325,25 @@ async function hardenPrivateBackupTree(rootPath: string): Promise<void> {
   }
 }
 
+const noodleBackupPauseContext = new AsyncLocalStorage<boolean>();
 function withOptionalNoodleAutoPostPaused<T>(operation: () => Promise<T>): Promise<T> {
+  if (noodleBackupPauseContext.getStore()) return operation();
   const service = getCapabilityService<{ pause<TValue>(run: () => Promise<TValue>): Promise<TValue> }>("noodle:backup");
-  return service ? service.pause(operation) : operation();
+  const paused = () => noodleBackupPauseContext.run(true, operation);
+  return service ? service.pause(paused) : paused();
+}
+
+/** Keep raw table references and their immutable original files in one backup image. */
+function withFullBackupSnapshot<T>(app: FastifyInstance, operation: () => Promise<T>): Promise<T> {
+  // Pause package writers before taking the DB lane: they may need it to drain.
+  return withOptionalNoodleAutoPostPaused(() =>
+    app.db._fileStore.runExclusiveTransactions(async () => {
+      // A transaction supplies the forced-flush context while the exclusive lane
+      // keeps archive/restore and other writers out until file copying finishes.
+      await app.db.transaction(async (tx) => tx._fileStore.flush());
+      return operation();
+    }),
+  );
 }
 const PROFILE_IMPORT_MEMORY_WARNING_BYTES = 512 * 1024 * 1024;
 const PROFILE_EXPORT_JSON_TOO_LARGE_CODE = "PROFILE_EXPORT_JSON_TOO_LARGE";
@@ -3473,75 +3490,77 @@ async function writeFullBackupArchive(
   workingDir: string,
   beforeWrite?: (archiveBytes: number) => Promise<void>,
 ) {
-  const dataDir = getDataDir();
-  const omittedEntries = new Set<string>();
-  const filesystemSources: StoredZipEntrySource[] = [];
-  for (const dirName of BACKUP_DIRS) {
-    const sourceDir = resolveBackupDir(dataDir, dirName);
-    filesystemSources.push(
-      ...(await collectDirectoryZipSources(sourceDir, `${backupName}/${dirName}`, {
-        skipUnreadableFiles: true,
-        onSkippedEntry: (entryName) => omittedEntries.add(entryName),
-      })),
+  return withFullBackupSnapshot(app, async () => {
+    const dataDir = getDataDir();
+    const omittedEntries = new Set<string>();
+    const filesystemSources: StoredZipEntrySource[] = [];
+    for (const dirName of BACKUP_DIRS) {
+      const sourceDir = resolveBackupDir(dataDir, dirName);
+      filesystemSources.push(
+        ...(await collectDirectoryZipSources(sourceDir, `${backupName}/${dirName}`, {
+          skipUnreadableFiles: true,
+          onSkippedEntry: (entryName) => omittedEntries.add(entryName),
+        })),
+      );
+    }
+
+    // Capture the manifest after filesystem source sizes so a later change makes
+    // the writer omit that source instead of creating a manifest-size mismatch.
+    const sources = await withOptionalNoodleAutoPostPaused(() =>
+      buildProfileArchiveSources(app, backupName, workingDir, false, true, (path) =>
+        omittedEntries.add(profileArchiveEntryPath(backupName, path)),
+      ),
     );
-  }
+    sources.push(...filesystemSources);
 
-  // Capture the manifest after filesystem source sizes so a later change makes
-  // the writer omit that source instead of creating a manifest-size mismatch.
-  const sources = await withOptionalNoodleAutoPostPaused(() =>
-    buildProfileArchiveSources(app, backupName, workingDir, false, true, (path) =>
-      omittedEntries.add(profileArchiveEntryPath(backupName, path)),
-    ),
-  );
-  sources.push(...filesystemSources);
-
-  const keyPath = resolvePersistedEncryptionKeyPath(dataDir);
-  if (existsSync(keyPath)) {
-    try {
-      const keyStat = await stat(keyPath);
-      sources.push({
-        entryName: `${backupName}/${ENCRYPTION_KEY_FILENAME}`,
-        filePath: keyPath,
-        size: keyStat.size,
-        mtime: keyStat.mtime,
-        tolerateSourceChanges: true,
-      });
-    } catch (error) {
-      const logError = error instanceof Error ? error : new Error(String(error));
-      logger.warn(logError, "[backup] Omitting unreadable encryption key from this backup");
-      omittedEntries.add(`${backupName}/${ENCRYPTION_KEY_FILENAME}`);
+    const keyPath = resolvePersistedEncryptionKeyPath(dataDir);
+    if (existsSync(keyPath)) {
+      try {
+        const keyStat = await stat(keyPath);
+        sources.push({
+          entryName: `${backupName}/${ENCRYPTION_KEY_FILENAME}`,
+          filePath: keyPath,
+          size: keyStat.size,
+          mtime: keyStat.mtime,
+          tolerateSourceChanges: true,
+        });
+      } catch (error) {
+        const logError = error instanceof Error ? error : new Error(String(error));
+        logger.warn(logError, "[backup] Omitting unreadable encryption key from this backup");
+        omittedEntries.add(`${backupName}/${ENCRYPTION_KEY_FILENAME}`);
+      }
     }
-  }
 
-  // Keep this deferred note last so it sees every omission discovered while earlier sources are written.
-  sources.push({
-    entryName: `${backupName}/RESTORE.txt`,
-    buildData: () => Buffer.from(buildBackupRestoreNotes([...omittedEntries]), "utf8"),
-  });
-  if (beforeWrite) {
-    // ponytail: reserve ZIP64 records and every possible omission line; use a shared writer
-    // estimator if the ZIP layout or deferred entries beyond RESTORE.txt change.
-    let archiveBytes =
-      ZIP64_EOCD_MIN_SIZE +
-      ZIP64_EOCD_LOCATOR_SIZE +
-      ZIP_EOCD_MIN_SIZE +
-      Buffer.byteLength(buildBackupRestoreNotes([""]), "utf8");
-    for (const source of sources) {
-      const payloadBytes =
-        "filePath" in source ? source.size : "data" in source ? source.data.length : source.buildData().length;
-      const headerBytes = 30 + 20 + 46 + 28 + 24 + 2 * Buffer.byteLength(source.entryName, "utf8");
-      const omissionLineBytes = 3 + Buffer.byteLength(JSON.stringify(source.entryName), "utf8");
-      archiveBytes += payloadBytes + headerBytes + omissionLineBytes;
+    // Keep this deferred note last so it sees every omission discovered while earlier sources are written.
+    sources.push({
+      entryName: `${backupName}/RESTORE.txt`,
+      buildData: () => Buffer.from(buildBackupRestoreNotes([...omittedEntries]), "utf8"),
+    });
+    if (beforeWrite) {
+      // ponytail: reserve ZIP64 records and every possible omission line; use a shared writer
+      // estimator if the ZIP layout or deferred entries beyond RESTORE.txt change.
+      let archiveBytes =
+        ZIP64_EOCD_MIN_SIZE +
+        ZIP64_EOCD_LOCATOR_SIZE +
+        ZIP_EOCD_MIN_SIZE +
+        Buffer.byteLength(buildBackupRestoreNotes([""]), "utf8");
+      for (const source of sources) {
+        const payloadBytes =
+          "filePath" in source ? source.size : "data" in source ? source.data.length : source.buildData().length;
+        const headerBytes = 30 + 20 + 46 + 28 + 24 + 2 * Buffer.byteLength(source.entryName, "utf8");
+        const omissionLineBytes = 3 + Buffer.byteLength(JSON.stringify(source.entryName), "utf8");
+        archiveBytes += payloadBytes + headerBytes + omissionLineBytes;
+      }
+      await beforeWrite(archiveBytes);
     }
-    await beforeWrite(archiveBytes);
-  }
-  await writeStoredZipArchive(outputPath, sources, {
-    skipFailedFileEntries: true,
-    entryLimitBytes: Number.MAX_SAFE_INTEGER,
-    unlimitedArchiveSize: true,
-    onOmittedEntry: (entryName) => omittedEntries.add(entryName),
+    await writeStoredZipArchive(outputPath, sources, {
+      skipFailedFileEntries: true,
+      entryLimitBytes: Number.MAX_SAFE_INTEGER,
+      unlimitedArchiveSize: true,
+      onOmittedEntry: (entryName) => omittedEntries.add(entryName),
+    });
+    return { omittedEntries: [...omittedEntries] };
   });
-  return { omittedEntries: [...omittedEntries] };
 }
 
 async function writeAutomaticBackup(app: FastifyInstance, retentionCount: number) {
@@ -3827,35 +3846,36 @@ export async function backupRoutes(app: FastifyInstance) {
   app.post("/", async (req, reply) => {
     if (!requirePrivilegedAccess(req, reply, { feature: "Backup creation" })) return;
     try {
-      await flushDB();
-      const dataDir = getDataDir();
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
-      const backupName = `marinara-backup-${timestamp}`;
-      const backupsRoot = join(dataDir, "backups");
-      const backupDir = join(backupsRoot, backupName);
+      return await withFullBackupSnapshot(app, async () => {
+        const dataDir = getDataDir();
+        const timestamp = new Date().toISOString().replace(/[:.]/g, "-").replace("T", "_").slice(0, 19);
+        const backupName = `marinara-backup-${timestamp}`;
+        const backupsRoot = join(dataDir, "backups");
+        const backupDir = join(backupsRoot, backupName);
 
-      await mkdir(backupDir, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
-      await writeNativeProfileZip(app, join(backupDir, "marinara-profile.zip"), true);
-      await writeFile(join(backupDir, "RESTORE.txt"), buildBackupRestoreNotes(), {
-        encoding: "utf8",
-        mode: PRIVATE_FILE_MODE,
-      });
+        await mkdir(backupDir, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+        await writeNativeProfileZip(app, join(backupDir, "marinara-profile.zip"), true);
+        await writeFile(join(backupDir, "RESTORE.txt"), buildBackupRestoreNotes(), {
+          encoding: "utf8",
+          mode: PRIVATE_FILE_MODE,
+        });
 
-      await copyPersistedEncryptionKey(dataDir, backupDir);
+        await copyPersistedEncryptionKey(dataDir, backupDir);
 
-      // Copy data directories.
-      for (const dirName of BACKUP_DIRS) {
-        const src = resolveBackupDir(dataDir, dirName);
-        if (existsSync(src)) {
-          await cp(src, join(backupDir, dirName), { recursive: true });
+        // Copy data directories.
+        for (const dirName of BACKUP_DIRS) {
+          const src = resolveBackupDir(dataDir, dirName);
+          if (existsSync(src)) {
+            await cp(src, join(backupDir, dirName), { recursive: true });
+          }
         }
-      }
 
-      await hardenPrivateBackupTree(backupDir);
+        await hardenPrivateBackupTree(backupDir);
 
-      return reply.send({
-        success: true,
-        backupName,
+        return reply.send({
+          success: true,
+          backupName,
+        });
       });
     } catch (err) {
       return sendBackupRouteError(reply, err, "Backup creation");

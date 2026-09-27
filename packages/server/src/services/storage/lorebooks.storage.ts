@@ -32,7 +32,20 @@ import {
   personalExtensionCoordinationLorebookEntrySchema,
   personalExtensionCoordinationLorebookEntryProjectionSchema,
   personalExtensionCoordinationLorebookSchema,
+  personalExtensionCoordinationCmbCompressionRecordSchema,
+  personalExtensionCoordinationCmbMemoryCatalogSchema,
+  personalExtensionCoordinationCmbMemoryCatalogItemSchema,
+  type PersonalExtensionCoordinationCmbMemoryCatalog,
+  type PersonalExtensionCoordinationCmbOriginalInput,
+  type PersonalExtensionCoordinationCmbCompressionApplyInput,
+  type PersonalExtensionCoordinationCmbCompressionRemoveInput,
 } from "@marinara-engine/shared";
+import {
+  inspectCmbCompression,
+  cmbCatalogBridgeSchema,
+  setCmbCompressionRecord,
+  validateCmbCompressionEvidence,
+} from "../lorebook/cmb-compression.js";
 import { normalizeTimestampOverrides, type TimestampOverrides } from "../import/import-timestamps.js";
 import { toPaginatedList } from "../../utils/list-pagination.js";
 import { createChatsStorage } from "./chats.storage.js";
@@ -180,6 +193,7 @@ const coordinationLorebookView = <T>(value: T): T => projectOntoContract(value, 
 const coordinationEntryView = <T>(value: T): T => projectOntoContract(value, COORDINATION_ENTRY_KEYS);
 
 function coordinationEmbeddingState(value: unknown): "missing" | "ready" | "invalid" {
+  if (value instanceof Float64Array) return value.length > 0 && value.every(Number.isFinite) ? "ready" : "invalid";
   let parsed = value;
   if (typeof parsed === "string") {
     try {
@@ -204,6 +218,85 @@ function coordinationEntryProjectionRow(row: Record<string, unknown>) {
     { ...value, embeddingState: coordinationEmbeddingState(row.embedding) },
     COORDINATION_ENTRY_PROJECTION_KEYS,
   );
+}
+
+/** UI catalog: no original bodies, vectors, evidence quotes or historical summaries. */
+async function readCmbMemoryCatalog(
+  db: DB,
+  lorebookId: string,
+): Promise<PersonalExtensionCoordinationCmbMemoryCatalog> {
+  const rows = await db
+    .select({
+      id: lorebookEntries.id,
+      lorebookId: lorebookEntries.lorebookId,
+      name: lorebookEntries.name,
+      enabled: lorebookEntries.enabled,
+      folderId: lorebookEntries.folderId,
+      embedding: lorebookEntries.embedding,
+      dynamicState: lorebookEntries.dynamicState,
+    })
+    .from(lorebookEntries)
+    .where(and(eq(lorebookEntries.lorebookId, lorebookId), eq(lorebookEntries.tag, "convo-memory-bridge")))
+    .orderBy(lorebookEntries.order);
+  const items: PersonalExtensionCoordinationCmbMemoryCatalog["items"] = [];
+  let invalidEntries = 0;
+  for (const row of rows) {
+    try {
+      const dynamic = JSON.parse(row.dynamicState || "{}");
+      const bridge = cmbCatalogBridgeSchema.parse(dynamic.convoMemoryBridge);
+      const byCast = dynamic.convoMemoryBridgeCompression?.byCast ?? {};
+      const compressionApplications: PersonalExtensionCoordinationCmbMemoryCatalog["items"][number]["compressionApplications"] =
+        [];
+      if (!byCast || typeof byCast !== "object" || Array.isArray(byCast)) throw new Error("invalid-compression");
+      for (const [castId, value] of Object.entries(byCast)) {
+        const { revision, active, importanceMode, summary, appliedAt, sourceChatId, clock, stageDays } =
+          personalExtensionCoordinationCmbCompressionRecordSchema.parse(value);
+        compressionApplications.push({
+          castId,
+          revision,
+          active,
+          importanceMode,
+          summary,
+          appliedAt,
+          sourceChatId,
+          clock,
+          stageDays,
+        });
+      }
+      items.push(
+        personalExtensionCoordinationCmbMemoryCatalogItemSchema.parse({
+          entryId: row.id,
+          lorebookId,
+          memoryId: bridge.memoryId,
+          ensembleId: bridge.ensembleId,
+          name: row.name,
+          enabled: row.enabled === "true",
+          folderId: row.folderId ?? null,
+          unknownToCastIds: bridge.unknownToCastIds,
+          rosterBindings: bridge.rosterBindings,
+          source: bridge.source,
+          sourceStatus: bridge.sourceStatus ?? null,
+          ambiguousProvenance: bridge.ambiguousProvenance ?? false,
+          embeddingState: coordinationEmbeddingState(row.embedding),
+          archive: db._fileStore.getCmbOriginalState(row.id),
+          compressionApplications,
+        }),
+      );
+    } catch {
+      invalidEntries += 1;
+    }
+  }
+  const policyRows = await db
+    .select()
+    .from(lorebookEntries)
+    .where(and(eq(lorebookEntries.lorebookId, lorebookId), eq(lorebookEntries.tag, "convo-memory-bridge-policy")))
+    .orderBy(lorebookEntries.order);
+  return personalExtensionCoordinationCmbMemoryCatalogSchema.parse({
+    projection: "cmb-memory-catalog-v1",
+    items,
+    policyEntries: policyRows.map((row) => coordinationEntryProjectionRow(row as Record<string, unknown>)),
+    invalidEntries,
+  });
 }
 
 function parseLorebookRow(row: Record<string, unknown>) {
@@ -292,6 +385,25 @@ function parseEntryRow(row: Record<string, unknown>) {
           : null,
     embeddingSpaceId: (row.embeddingSpaceId as string | null | undefined) ?? null,
   };
+}
+
+async function parseRecallRows(db: DB, rows: Record<string, unknown>[], deferred: boolean) {
+  if (!deferred) return rows.map(parseEntryRow);
+  const ordinaryIds = rows.filter((row) => row.tag !== "convo-memory-bridge").map((row) => String(row.id));
+  const bodies = ordinaryIds.length
+    ? await db
+        .select({ id: lorebookEntries.id, content: lorebookEntries.content })
+        .from(lorebookEntries)
+        .where(inArray(lorebookEntries.id, ordinaryIds))
+    : [];
+  const byId = new Map(bodies.map((row) => [row.id, row.content]));
+  return rows.map((row) =>
+    parseEntryRow(
+      row.tag === "convo-memory-bridge"
+        ? { ...row, content: "", cmbOriginalDeferred: true }
+        : { ...row, content: byId.get(String(row.id)) ?? "" },
+    ),
+  );
 }
 
 function lorebookEntryVectorFingerprint(entry: Record<string, unknown>) {
@@ -731,10 +843,22 @@ export function createLorebooksStorage(db: DB) {
     lorebookId: string,
     id: string,
     input: UpdateLorebookEntryInput,
+    allowCompressionChange = false,
   ) => {
     const rows = await tx.select().from(lorebookEntries).where(eq(lorebookEntries.id, id));
     const current = rows[0];
     if (!current || current.lorebookId !== lorebookId) return null;
+    if (input.dynamicState !== undefined && !allowCompressionChange) {
+      const previous = parseEntryRow(current as Record<string, unknown>).dynamicState as Record<string, unknown>;
+      const key = "convoMemoryBridgeCompression";
+      const supplied = input.dynamicState[key];
+      if (supplied !== undefined && JSON.stringify(supplied) !== JSON.stringify(previous[key])) {
+        throw new PersonalExtensionCoordinationKernelError("coordination-validation-failed");
+      }
+      // Generic source/visibility edits must not silently erase an applied hold.
+      if (previous[key] !== undefined)
+        input = { ...input, dynamicState: { ...input.dynamicState, [key]: previous[key] } };
+    }
     const updates: Record<string, unknown> = { updatedAt: now() };
     // Must cover EXACTLY the fields buildLorebookEntryEmbeddingText embeds
     // (name, description, keys, secondary keys, content) — description was
@@ -891,6 +1015,225 @@ export function createLorebooksStorage(db: DB) {
         }
         return { value: coordinationEntryView(parseEntryRow(row as Record<string, unknown>)), resourceRevision };
       });
+    },
+
+    async listCmbMemoryCatalog(lorebookId: string) {
+      return readCmbMemoryCatalog(db, lorebookId);
+    },
+
+    async listCmbMemoryCatalogFenced(context: PersonalExtensionLeaseAuthority, lorebookId: string) {
+      return getPersonalExtensionCoordinationService(db).runFencedResourceRead(context, async (readDb, registry) => {
+        const resourceRevision = registeredLorebookRevision(registry, lorebookId);
+        return { ...(await readCmbMemoryCatalog(readDb, lorebookId)), resourceRevision };
+      });
+    },
+
+    async mutateCmbOriginalFenced(
+      context: PersonalExtensionFencedMutationContext,
+      lorebookId: string,
+      entryId: string,
+      expectedResourceRevision: number,
+      input: PersonalExtensionCoordinationCmbOriginalInput,
+      action: "archive" | "restore",
+    ) {
+      const committed = await getPersonalExtensionCoordinationService(db).runFencedResourceMutation(
+        context,
+        [{ kind: "lorebook", resourceId: lorebookId, expectedRevision: expectedResourceRevision }],
+        async (tx) => {
+          const row = (
+            await tx
+              .select()
+              .from(lorebookEntries)
+              .where(
+                and(
+                  eq(lorebookEntries.id, entryId),
+                  eq(lorebookEntries.lorebookId, lorebookId),
+                  eq(lorebookEntries.tag, "convo-memory-bridge"),
+                ),
+              )
+          )[0];
+          if (!row || row.lorebookId !== lorebookId || row.tag !== "convo-memory-bridge")
+            throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
+          const entry = parseEntryRow(row as Record<string, unknown>) as unknown as LorebookEntry;
+          if (!cmbCatalogBridgeSchema.safeParse(entry.dynamicState?.convoMemoryBridge).success)
+            throw new PersonalExtensionCoordinationKernelError("coordination-validation-failed");
+          const archive = tx._fileStore.getCmbOriginalState(entryId);
+          if (
+            archive.sha256 !== input.expectedArchiveSha256 ||
+            archive.state !== (action === "archive" ? "inline" : "archived")
+          )
+            throw new PersonalExtensionCoordinationKernelError("resource-revision-conflict");
+          if (action === "archive") {
+            const namespace = entry.dynamicState?.convoMemoryBridgeCompression as
+              | { byCast?: Record<string, unknown> }
+              | undefined;
+            let ready = false;
+            for (const [castId, value] of Object.entries(namespace?.byCast ?? {})) {
+              const record = personalExtensionCoordinationCmbCompressionRecordSchema.safeParse(value);
+              if (!record.success || !record.data.active) continue;
+              const inspection = await inspectCmbCompression(
+                tx,
+                entry,
+                castId,
+                record.data.importanceMode,
+                context.extensionId,
+                true,
+              );
+              if (inspection.state === "active" && inspection.eligibility.status === "ready") {
+                ready = true;
+                break;
+              }
+            }
+            if (!ready) throw new PersonalExtensionCoordinationKernelError("coordination-validation-failed");
+          }
+          const next =
+            action === "archive"
+              ? await tx._fileStore.archiveCmbOriginal(entryId)
+              : await tx._fileStore.restoreCmbOriginal(entryId);
+          return { entryId, lorebookId, archive: next };
+        },
+        { operationKind: "mutation" },
+      );
+      return { ...committed.result, resourceRevision: committed.resourceRevisions[0]!.resourceRevision };
+    },
+
+    async inspectCmbCompressionFenced(
+      context: PersonalExtensionLeaseAuthority,
+      lorebookId: string,
+      entryId: string,
+      castId: string,
+      importanceMode: "auto" | "detail" | "core",
+    ) {
+      return getPersonalExtensionCoordinationService(db).runFencedResourceRead(context, async (readDb, registry) => {
+        const resourceRevision = registeredLorebookRevision(registry, lorebookId);
+        const row = (await readDb.select().from(lorebookEntries).where(eq(lorebookEntries.id, entryId)))[0];
+        if (!row || row.lorebookId !== lorebookId)
+          throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
+        const result = await inspectCmbCompression(
+          readDb,
+          parseEntryRow(row as Record<string, unknown>) as unknown as LorebookEntry,
+          castId,
+          importanceMode,
+          context.extensionId,
+        );
+        const { basisFingerprint, eligibility, current, state, reason } = result;
+        return { resourceRevision, basisFingerprint, eligibility, current, state, reason };
+      });
+    },
+
+    async applyCmbCompressionFenced(
+      context: PersonalExtensionFencedMutationContext,
+      lorebookId: string,
+      entryId: string,
+      expectedResourceRevision: number,
+      input: PersonalExtensionCoordinationCmbCompressionApplyInput,
+    ) {
+      const committed = await getPersonalExtensionCoordinationService(db).runFencedResourceMutation(
+        context,
+        [{ kind: "lorebook", resourceId: lorebookId, expectedRevision: expectedResourceRevision }],
+        async (tx) => {
+          const row = (await tx.select().from(lorebookEntries).where(eq(lorebookEntries.id, entryId)))[0];
+          if (!row || row.lorebookId !== lorebookId)
+            throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
+          const entry = parseEntryRow(row as Record<string, unknown>) as unknown as LorebookEntry;
+          const inspection = await inspectCmbCompression(
+            tx,
+            entry,
+            input.castId,
+            input.importanceMode,
+            context.extensionId,
+            true,
+          );
+          if (
+            inspection.eligibility.status !== "ready" ||
+            !inspection.basisFingerprint ||
+            !inspection.sourceChatId ||
+            !inspection.clock ||
+            !inspection.stageDays ||
+            inspection.basisFingerprint !== input.expectedBasisFingerprint ||
+            (inspection.current?.revision ?? 0) !== input.expectedCompressionRevision
+          )
+            throw new PersonalExtensionCoordinationKernelError("resource-revision-conflict");
+          if (!validateCmbCompressionEvidence(entry, input))
+            throw new PersonalExtensionCoordinationKernelError("coordination-validation-failed");
+          const record = personalExtensionCoordinationCmbCompressionRecordSchema.parse({
+            revision: input.expectedCompressionRevision + 1,
+            active: true,
+            basisFingerprint: inspection.basisFingerprint,
+            importanceMode: input.importanceMode,
+            summary: input.summary,
+            importanceReason: input.importanceReason,
+            retention: input.retention,
+            evidence: input.evidence,
+            facts: input.facts,
+            appliedAt: now(),
+            sourceChatId: inspection.sourceChatId,
+            clock: inspection.clock,
+            stageDays: inspection.stageDays,
+          });
+          const value = await updateLorebookEntryInTransaction(
+            tx,
+            lorebookId,
+            entryId,
+            { dynamicState: setCmbCompressionRecord(entry, input.castId, record) },
+            true,
+          );
+          if (!value) throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
+          return value;
+        },
+        { operationKind: "mutation" },
+      );
+      return {
+        value: coordinationEntryView(committed.result),
+        resourceRevision: committed.resourceRevisions[0]!.resourceRevision,
+      };
+    },
+
+    async removeCmbCompressionFenced(
+      context: PersonalExtensionFencedMutationContext,
+      lorebookId: string,
+      entryId: string,
+      expectedResourceRevision: number,
+      input: PersonalExtensionCoordinationCmbCompressionRemoveInput,
+    ) {
+      const committed = await getPersonalExtensionCoordinationService(db).runFencedResourceMutation(
+        context,
+        [{ kind: "lorebook", resourceId: lorebookId, expectedRevision: expectedResourceRevision }],
+        async (tx) => {
+          const row = (await tx.select().from(lorebookEntries).where(eq(lorebookEntries.id, entryId)))[0];
+          if (!row || row.lorebookId !== lorebookId)
+            throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
+          const entry = parseEntryRow(row as Record<string, unknown>) as unknown as LorebookEntry;
+          const namespace = entry.dynamicState?.convoMemoryBridgeCompression as
+            | { byCast?: Record<string, unknown> }
+            | undefined;
+          const parsed = personalExtensionCoordinationCmbCompressionRecordSchema.safeParse(
+            namespace?.byCast?.[input.castId],
+          );
+          if (!parsed.success || !parsed.data.active || parsed.data.revision !== input.expectedCompressionRevision)
+            throw new PersonalExtensionCoordinationKernelError("resource-revision-conflict");
+          // A stale basis may always be explicitly released; no source rewrite or new memory ID.
+          const record = personalExtensionCoordinationCmbCompressionRecordSchema.parse({
+            ...parsed.data,
+            active: false,
+            revision: parsed.data.revision + 1,
+          });
+          const value = await updateLorebookEntryInTransaction(
+            tx,
+            lorebookId,
+            entryId,
+            { dynamicState: setCmbCompressionRecord(entry, input.castId, record) },
+            true,
+          );
+          if (!value) throw new PersonalExtensionCoordinationKernelError("coordination-unavailable");
+          return value;
+        },
+        { operationKind: "mutation" },
+      );
+      return {
+        value: coordinationEntryView(committed.result),
+        resourceRevision: committed.resourceRevisions[0]!.resourceRevision,
+      };
     },
 
     async createFenced(context: PersonalExtensionFencedMutationContext, input: CreateLorebookInput) {
@@ -1277,14 +1620,14 @@ export function createLorebooksStorage(db: DB) {
     },
 
     /** Get all entries across multiple lorebooks (for prompt injection). */
-    async listEntriesByLorebooks(lorebookIds: string[]) {
+    async listEntriesByLorebooks(lorebookIds: string[], deferCmbOriginals = false) {
       if (lorebookIds.length === 0) return [];
       const rows = await db
-        .select()
+        .select({ ...lorebookEntries, content: deferCmbOriginals ? "" : lorebookEntries.content })
         .from(lorebookEntries)
         .where(inArray(lorebookEntries.lorebookId, lorebookIds))
         .orderBy(lorebookEntries.order);
-      return rows.map((r) => parseEntryRow(r as Record<string, unknown>));
+      return parseRecallRows(db, rows as Record<string, unknown>[], deferCmbOriginals);
     },
 
     /**
@@ -1293,14 +1636,19 @@ export function createLorebooksStorage(db: DB) {
      */
     async listEligibleEntriesByIds(
       entryIds: string[],
-      filters?: { excludedLorebookIds?: string[]; excludedSourceAgentIds?: string[]; unlimited?: boolean },
+      filters?: {
+        excludedLorebookIds?: string[];
+        excludedSourceAgentIds?: string[];
+        unlimited?: boolean;
+        deferCmbOriginals?: boolean;
+      },
     ): Promise<LorebookEntry[]> {
       const ids = uniqueStrings(entryIds);
       const requestedIds = filters?.unlimited ? ids : ids.slice(0, LIMITS.MAX_LOREBOOK_ENTRIES);
       if (requestedIds.length === 0) return [];
 
       const entryRows = await db
-        .select()
+        .select({ ...lorebookEntries, content: filters?.deferCmbOriginals ? "" : lorebookEntries.content })
         .from(lorebookEntries)
         .where(and(inArray(lorebookEntries.id, requestedIds), eq(lorebookEntries.enabled, "true")));
       if (entryRows.length === 0) return [];
@@ -1343,9 +1691,11 @@ export function createLorebooksStorage(db: DB) {
         })),
       );
       const requestedOrder = new Map(requestedIds.map((id, index) => [id, index]));
-      const parsedEntries = entryRows.map((row) => parseEntryRow(row as Record<string, unknown>)) as Array<
-        ReturnType<typeof parseEntryRow> & { id: string; lorebookId: string; folderId: string | null }
-      >;
+      const parsedEntries = (await parseRecallRows(
+        db,
+        entryRows as Record<string, unknown>[],
+        filters?.deferCmbOriginals === true,
+      )) as Array<ReturnType<typeof parseEntryRow> & { id: string; lorebookId: string; folderId: string | null }>;
       return parsedEntries
         .filter(
           (entry) =>
@@ -1373,14 +1723,17 @@ export function createLorebooksStorage(db: DB) {
      * each entry's previous individual setting. Entries with a NULL `folderId`
      * (root-level entries) are unaffected.
      */
-    async listActiveEntries(filters?: {
-      activeLorebookIds?: string[];
-      characterIds?: string[];
-      personaId?: string | null;
-      chatId?: string;
-      excludedLorebookIds?: string[];
-      excludedSourceAgentIds?: string[];
-    }) {
+    async listActiveEntries(
+      filters?: {
+        activeLorebookIds?: string[];
+        characterIds?: string[];
+        personaId?: string | null;
+        chatId?: string;
+        excludedLorebookIds?: string[];
+        excludedSourceAgentIds?: string[];
+      },
+      deferCmbOriginals = false,
+    ) {
       const enabledBookRows = await db.select().from(lorebooks).where(eq(lorebooks.enabled, "true"));
       const enabledBooks = (await hydrateLorebookRows(db, enabledBookRows)) as unknown as Array<{
         id: string;
@@ -1441,12 +1794,11 @@ export function createLorebooksStorage(db: DB) {
       );
 
       const rows = await db
-        .select()
+        .select({ ...lorebookEntries, content: deferCmbOriginals ? "" : lorebookEntries.content })
         .from(lorebookEntries)
         .where(and(inArray(lorebookEntries.lorebookId, bookIds), eq(lorebookEntries.enabled, "true")))
         .orderBy(lorebookEntries.order);
-      const parsed = rows.map((r) => {
-        const entry = parseEntryRow(r as Record<string, unknown>);
+      const parsed = (await parseRecallRows(db, rows as Record<string, unknown>[], deferCmbOriginals)).map((entry) => {
         const lorebookId = String((entry as Record<string, unknown>).lorebookId ?? "");
         return excludedVectorBookIds.has(lorebookId) ? { ...entry, excludeFromVectorization: true } : entry;
       });

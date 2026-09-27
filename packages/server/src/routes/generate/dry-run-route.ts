@@ -1192,6 +1192,7 @@ export async function registerDryRunRoute(app: FastifyInstance) {
             const lorebookResult = await processLorebooks(app.db, scanMessages, null, {
               chatId,
               characterIds: withIdentityLorebookScope(promptCharacterIds),
+              cmbAudienceCharacterIds: promptCharacterIds,
               personaId,
               activeLorebookIds,
               forcedEntryIds: ownerSpatialLorebookEntryIds,
@@ -1599,6 +1600,7 @@ export async function registerDryRunRoute(app: FastifyInstance) {
       const lorebookResult = await processLorebooks(app.db, scanMessages, null, {
         chatId,
         characterIds: withIdentityLorebookScope(promptCharacterIds),
+        cmbAudienceCharacterIds: promptCharacterIds,
         personaId,
         forcedEntryIds: ownerSpatialLorebookEntryIds,
         activeLorebookIds,

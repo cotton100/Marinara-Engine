@@ -63,6 +63,17 @@ export interface CapabilityLorebookEntrySelection {
   excludedSourceAgentIds?: string[];
 }
 
+export interface CapabilityConversationCallContextInput {
+  chatId: string;
+  audienceCharacterIds: string[];
+  query: string;
+}
+
+export interface CapabilityConversationCallContext {
+  lorebookEntries: Array<{ id: string; name: string; content: string }>;
+  recentMessages: Array<{ role: string; characterId: string | null; content: string; createdAt: string }>;
+}
+
 // Inputs for the resource write surface. Thin, storage-agnostic shapes the server impl maps to storage.
 /** Fields accepted when a package creates the player persona. */
 export interface CapabilityPersonaCreateInput {
@@ -113,6 +124,10 @@ export interface CapabilityResourceHost {
   listPersonas(personaIds?: string[]): Promise<CapabilityPersonaRecord[]>;
   listLorebooks(lorebookIds?: string[]): Promise<CapabilityLorebookRecord[]>;
   listEligibleLorebookEntries(selection: CapabilityLorebookEntrySelection): Promise<CapabilityLorebookEntryRecord[]>;
+  /** Calls must feature-detect this host-owned permission/compression boundary; no raw fallback. */
+  resolveConversationCallContext?(
+    input: CapabilityConversationCallContextInput,
+  ): Promise<CapabilityConversationCallContext>;
   // Write surface, used by a package's setup to find-or-create the player persona and its lorebook.
   // OPTIONAL on purpose: the engine's host implements all six, but requiring them would make adding them
   // a breaking change for any other implementation of this published interface. A package feature-detects

@@ -8,6 +8,7 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   closeSync,
@@ -35,6 +36,15 @@ import { getFileStorageDir, getMaxResidentChatUnits } from "../config/runtime-co
 import * as schema from "./schema/index.js";
 import { inArray, isFileCondition, isFileOrdering, type FileCondition, type FileOrdering } from "./file-query.js";
 import { migrateLegacyNoodleAccountRow } from "./noodle-platform-migration.js";
+import {
+  CmbOriginalStorageError,
+  cmbOriginalPath,
+  createCmbOriginalPayload,
+  parseCmbOriginalReference,
+  readCmbOriginal,
+  type CmbOriginalReference,
+  type CmbOriginalState,
+} from "./cmb-original-store.js";
 import { migrateLegacyNoodlePostAccessRow } from "./noodle-access-migration.js";
 import { migrateRetiredChatModeRow, RETIRED_CHAT_MODE_TABLES } from "./retired-chat-mode-migration.js";
 import {
@@ -80,6 +90,7 @@ type RowContext = {
   rows: Record<string, Row>;
   baseTable: string;
   joined: boolean;
+  readOriginal: (reference: CmbOriginalReference) => string;
 };
 
 type JoinSpec = {
@@ -200,6 +211,11 @@ export type FileNativeStoreController = {
   flushStrict: () => Promise<void>;
   flushPathsStrict: (filePaths: readonly string[], directoryPaths: readonly string[]) => Promise<void>;
   runExclusiveTransactions: <T>(operation: () => Promise<T>) => Promise<T>;
+  /** Metadata-only. Missing entries or invalid references throw. */
+  getCmbOriginalState: (entryId: string) => CmbOriginalState;
+  /** Explicit, server-only transitions; require the caller's active DB transaction. */
+  archiveCmbOriginal: (entryId: string) => Promise<CmbOriginalState>;
+  restoreCmbOriginal: (entryId: string) => Promise<CmbOriginalState>;
   isStrictDurabilitySupported: () => boolean;
   close: () => Promise<void>;
   rootDir: string;
@@ -290,6 +306,8 @@ export type FileNativeStoreTestHooks = {
    */
   afterWritableTurn?: () => Promise<void> | void;
   afterTableRead?: (table: string) => Promise<void> | void;
+  /** Counts actual cold payload reads without exposing their contents. */
+  afterCmbOriginalRead?: (sha256: string) => void;
   fileOperations?: {
     writeFile?: (path: string, content: string) => Promise<void>;
     copyFile?: (from: string, to: string) => Promise<void>;
@@ -343,7 +361,7 @@ type InsertValuesBuilder = Executable<void> & {
 // Exported so regressions can pin behavior against the CURRENT version
 // without chasing literals on every bump. Must equal root storage-format.json
 // (the launcher-format-guard regression pins the pairing).
-export const STORAGE_VERSION = 6;
+export const STORAGE_VERSION = 7;
 export const STORAGE_WRITER_LEASE_FILENAME = ".writer-lease";
 export const STORAGE_WRITER_OWNER_FILENAME = "owner.json";
 export const STORAGE_WRITER_LIVENESS_FILENAME = "live.sock";
@@ -2013,11 +2031,20 @@ function normalizeRow(meta: TableMeta, row: Row) {
     if (vectorColumns?.has(column.key)) {
       normalized[column.key] = packVectorValue(normalized[column.key]);
     }
+    if (
+      meta.name === "lorebook_entries" &&
+      column.key === "content" &&
+      normalized.content &&
+      typeof normalized.content === "object"
+    ) {
+      normalized.content = parseCmbOriginalReference(normalized.content);
+    }
   }
   return normalized;
 }
 
 function prepareInsertRow(meta: TableMeta, row: Row) {
+  assertPublicCmbContent(meta, "content", row.content);
   const normalized = normalizeRow(meta, row);
   for (const key of Object.keys(row)) {
     if (!meta.byKey.has(key) && !meta.byDbName.has(key)) {
@@ -2025,6 +2052,12 @@ function prepareInsertRow(meta: TableMeta, row: Row) {
     }
   }
   return normalized;
+}
+
+function assertPublicCmbContent(meta: TableMeta, key: string, value: unknown) {
+  if (meta.name === "lorebook_entries" && key === "content" && value && typeof value === "object" && !isColumn(value)) {
+    throw new CmbOriginalStorageError("CMB original references cannot be supplied as public content");
+  }
 }
 
 function normalizeConflictTargets(target: unknown) {
@@ -2150,7 +2183,10 @@ function valueForColumn(ctx: RowContext, column: Column) {
   if (!meta) return undefined;
   if (!column.table) return undefined;
   const tableName = tableNameOf(column.table);
-  return ctx.rows[tableName]?.[meta.key];
+  const value = ctx.rows[tableName]?.[meta.key];
+  return tableName === "lorebook_entries" && meta.key === "content" && value && typeof value === "object"
+    ? ctx.readOriginal(parseCmbOriginalReference(value))
+    : value;
 }
 
 function resolveValue(value: unknown, ctx: RowContext): unknown {
@@ -2289,11 +2325,9 @@ function projectRow(ctx: RowContext, projection?: Projection) {
     // string form. Projected selects keep the packed Float64Array — the fast
     // path memory recall reads (#5592 Phase 1).
     if (ctx.joined) {
-      return Object.fromEntries(
-        Object.entries(ctx.rows).map(([table, row]) => [table, unpackVectorColumns(table, cloneRow(row))]),
-      );
+      return Object.fromEntries(Object.entries(ctx.rows).map(([table, row]) => [table, publicRow(ctx, table, row)]));
     }
-    return unpackVectorColumns(ctx.baseTable, cloneRow(ctx.rows[ctx.baseTable] ?? {}));
+    return publicRow(ctx, ctx.baseTable, ctx.rows[ctx.baseTable] ?? {});
   }
 
   const output: Row = {};
@@ -2301,6 +2335,14 @@ function projectRow(ctx: RowContext, projection?: Projection) {
     output[key] = resolveValue(value, ctx);
   }
   return output;
+}
+
+function publicRow(ctx: RowContext, table: string, row: Row): Row {
+  const copy = unpackVectorColumns(table, cloneRow(row));
+  if (table === "lorebook_entries" && copy.content && typeof copy.content === "object") {
+    copy.content = ctx.readOriginal(parseCmbOriginalReference(copy.content));
+  }
+  return copy;
 }
 
 function executable<T>(operation: () => T | Promise<T>): Executable<T> {
@@ -2477,6 +2519,8 @@ class FileTableStore {
   private writerLease: ActiveStorageWriterLease | null = null;
   private writesClosed = false;
   private closePromise: Promise<void> | null = null;
+  private readonly readOriginal = (reference: CmbOriginalReference): string =>
+    readCmbOriginal(this.rootDir, reference, this.testHooks?.afterCmbOriginalRead);
 
   constructor(
     private readonly rootDir: string,
@@ -3366,7 +3410,7 @@ class FileTableStore {
    */
   *matchingRows(meta: TableMeta, condition: Condition | undefined): IterableIterator<Row> {
     this.ensureQueryScopeLoaded(meta, condition);
-    const ctx: RowContext = { rows: {}, baseTable: meta.name, joined: false };
+    const ctx: RowContext = { rows: {}, baseTable: meta.name, joined: false, readOriginal: this.readOriginal };
     for (const row of this.rows(meta.name)) {
       ctx.rows[meta.name] = row;
       if (evaluateCondition(condition, ctx)) yield row;
@@ -3435,6 +3479,7 @@ class FileTableStore {
                   const candidate = cloneRow(existing);
                   for (const [key, value] of Object.entries(onConflict.set)) {
                     const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
+                    assertPublicCmbContent(meta, column?.key ?? key, value);
                     candidate[column?.key ?? key] = resolveValue(value, ctx);
                   }
                   assertUniqueRow(meta, nextRows, candidate, duplicateIndex);
@@ -3504,6 +3549,7 @@ class FileTableStore {
                 const candidate = cloneRow(row);
                 for (const [key, value] of Object.entries(patch)) {
                   const column = meta.byKey.get(key) ?? meta.byDbName.get(key);
+                  assertPublicCmbContent(meta, column?.key ?? key, value);
                   candidate[column?.key ?? key] = resolveValue(value, ctx);
                 }
                 changedIndexes.push(index);
@@ -3554,6 +3600,82 @@ class FileTableStore {
 
   isStrictDurabilitySupported() {
     return !isWindows || typeof this.testHooks?.fileOperations?.flushDirectory === "function";
+  }
+
+  private cmbOriginalRow(entryId: string): Row {
+    const row = this.rows("lorebook_entries").find((entry) => entry.id === entryId);
+    if (!row) throw new CmbOriginalStorageError("CMB original entry does not exist");
+    return row;
+  }
+
+  getCmbOriginalState(entryId: string): CmbOriginalState {
+    const content: unknown = this.cmbOriginalRow(entryId).content;
+    if (typeof content === "string") return { state: "inline", characters: content.length, sha256: null };
+    const reference = parseCmbOriginalReference(content);
+    return { state: "archived", characters: reference.characters, sha256: reference.sha256 };
+  }
+
+  private requireCmbOriginalTransaction() {
+    this.assertWritable();
+    const context = this.txContext.getStore();
+    if (!context || context !== this.activeTransactionContext) {
+      throw new CmbOriginalStorageError("CMB original changes require an active DB transaction");
+    }
+  }
+
+  private replaceCmbOriginalContent(row: Row, content: string | CmbOriginalReference) {
+    this.requireCmbOriginalTransaction();
+    const rows = this.rows("lorebook_entries");
+    const index = rows.indexOf(row);
+    // An awaited blob write must not overwrite an edit within the same transaction.
+    if (index < 0) throw new CmbOriginalStorageError("CMB original changed during archiving");
+    this.recordTxMutation("lorebook_entries");
+    const next = rows.slice();
+    next[index] = { ...row, content };
+    this.tables.set("lorebook_entries", next);
+    this.markDirty("lorebook_entries", this.shardKeysForRows("lorebook_entries", [row]));
+  }
+
+  async archiveCmbOriginal(entryId: string): Promise<CmbOriginalState> {
+    this.requireCmbOriginalTransaction();
+    const row = this.cmbOriginalRow(entryId);
+    if (typeof row.content !== "string") {
+      this.readOriginal(parseCmbOriginalReference(row.content));
+      return this.getCmbOriginalState(entryId);
+    }
+    const { reference, payload } = createCmbOriginalPayload(row.content);
+    // The format gate must reach disk before ANY reference-bearing shard can.
+    // This also leaves a format-7 .bak on upgraded stores; an old manifest must
+    // never approve a v6 downgrade after the first cold-reference write.
+    await this.flushStrict();
+    this.requireCmbOriginalTransaction();
+    const directory = join(this.rootDir, "cmb-originals");
+    mkdirSync(directory, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
+    if (!lstatSync(directory).isDirectory()) throw new CmbOriginalStorageError("Invalid CMB original directory");
+    await flushDirectory(this.rootDir, "strict", this.testHooks);
+    const path = cmbOriginalPath(this.rootDir, reference);
+    if (existsSync(path)) {
+      // Never overwrite an immutable file, including a damaged one.
+      this.readOriginal(reference);
+      await this.flushPathsStrict([path], [directory]);
+    } else {
+      await atomicWriteFile(path, payload, { refreshBackup: false, durability: "strict", testHooks: this.testHooks });
+      this.readOriginal(reference);
+    }
+    // No blob cache: only this small immutable descriptor enters resident rows.
+    // Rollback leaves a harmless retained original file and restores the old row.
+    this.replaceCmbOriginalContent(row, reference);
+    return this.getCmbOriginalState(entryId);
+  }
+
+  async restoreCmbOriginal(entryId: string): Promise<CmbOriginalState> {
+    this.requireCmbOriginalTransaction();
+    const row = this.cmbOriginalRow(entryId);
+    if (typeof row.content !== "string") {
+      const content = this.readOriginal(parseCmbOriginalReference(row.content));
+      this.replaceCmbOriginalContent(row, content);
+    }
+    return this.getCmbOriginalState(entryId);
   }
 
   async flushStrict() {
@@ -3989,6 +4111,7 @@ class FileTableStore {
       rows: { [meta.name]: row },
       baseTable: meta.name,
       joined: false,
+      readOriginal: this.readOriginal,
     };
   }
 
@@ -5727,6 +5850,7 @@ class SelectQuery implements SelectQueryBuilder<any> {
               rows: { ...ctx.rows, [join.table.name]: row },
               baseTable: ctx.baseTable,
               joined: true,
+              readOriginal: ctx.readOriginal,
             };
             if (evaluateCondition(join.condition, candidate)) {
               joinedContexts.push(candidate);
@@ -5779,6 +5903,9 @@ export async function createFileNativeDB(testHooks?: FileNativeStoreTestHooks): 
     flushStrict: () => store.flushStrict(),
     flushPathsStrict: (filePaths, directoryPaths) => store.flushPathsStrict(filePaths, directoryPaths),
     runExclusiveTransactions: (operation) => store.runExclusiveTransactions(operation),
+    getCmbOriginalState: (entryId) => store.getCmbOriginalState(entryId),
+    archiveCmbOriginal: (entryId) => store.archiveCmbOriginal(entryId),
+    restoreCmbOriginal: (entryId) => store.restoreCmbOriginal(entryId),
     isStrictDurabilitySupported: () => store.isStrictDurabilitySupported(),
     close: () => store.close(),
     getQuarantinedTables: () => store.getQuarantinedTables(),

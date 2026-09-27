@@ -397,6 +397,7 @@ export async function ensureLorebookScan(ctx: MarkerContext): Promise<LorebookSc
       {
         chatId: ctx.chatId,
         characterIds: ctx.lorebookCharacterIds ?? ctx.characterIds,
+        cmbAudienceCharacterIds: ctx.characterIds,
         personaId: ctx.personaId ?? null,
         activeLorebookIds: ctx.activeLorebookIds,
         forcedEntryIds: ctx.forcedLorebookEntryIds,

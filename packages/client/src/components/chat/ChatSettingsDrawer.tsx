@@ -123,6 +123,7 @@ import { HapticConnectionPanel } from "./HapticConnectionPanel";
 import { HAPTIC_SENSITIVITY_OPTIONS } from "./haptic-sensitivity-options";
 import { ChatModeIcon } from "./ChatModeIcon";
 import { SettingsSwitch } from "../panels/settings/SettingControls";
+import { CmbConvoRoutesSection } from "./CmbConvoRoutesSection";
 import { ChoiceSelectionModal } from "../presets/ChoiceSelectionModal";
 import { SecretPlotPanel } from "../agents/SecretPlotPanel";
 import { SummariesEditorModal } from "./SummariesEditorModal";
@@ -7163,6 +7164,12 @@ export function ChatSettingsDrawer({
                   </p>
                 )}
 
+                <CmbConvoRoutesSection
+                  chatId={chat.id}
+                  nativeLinkedChatId={chat.connectedChatId ?? null}
+                  chatName={(id) => (allChats ?? []).find((c: Chat) => c.id === id)?.name}
+                />
+
                 {renderPackageContextToggles()}
 
                 <DiscordMirrorControls
@@ -7219,7 +7226,7 @@ export function ChatSettingsDrawer({
           )}
 
           {/* Notes from Conversation — durable notes saved by the connected conversation's character */}
-          {!isConversation && chat.connectedChatId && (
+          {!isConversation && (chat.connectedChatId || metadata.cmbConvoRoutes) && (
             <div style={{ order: CHAT_SETTINGS_ORDER.connectedNotes }}>
               <ConversationNotesSection chatId={chat.id} />
             </div>

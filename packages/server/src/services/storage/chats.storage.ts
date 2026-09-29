@@ -10,6 +10,7 @@ import {
   lt,
   or,
   inArray,
+  notInArray,
   isNull,
   isNotNull,
   jsonFlagsNotTrue,
@@ -65,12 +66,28 @@ import { logger } from "../../lib/logger.js";
 import { galleryFileHasReferences, unlinkGalleryFileIfUnreferenced } from "../image/gallery-file-lifecycle.js";
 
 import { createAppSettingsStorage } from "./app-settings.storage.js";
+import { isCmbConvoRoutesOnceOpted, parseChatMetadataRecord } from "../conversation/cmb-convo-routes-policy.js";
 
 const GALLERY_DIR = join(DATA_DIR, "gallery");
 const GAME_SCENE_VIDEOS_DIR = join(DATA_DIR, "game-scene-videos");
 
-/** Total character budget for durable conversation notes per roleplay chat. Oldest pruned on insert. */
+/**
+ * Total character budget for durable conversation notes per roleplay chat. Oldest pruned on insert,
+ * except in an RP that has once used CMB Convo routes: there a note that does not fit is refused.
+ */
 export const CONVERSATION_NOTES_BUDGET_CHARS = 4000;
+
+/** A note for a once-opted RP would exceed the budget; existing notes are never pushed out. */
+export class ConversationNoteBudgetError extends Error {
+  readonly code = "CONVERSATION_NOTE_BUDGET";
+  constructor(
+    readonly usedCharacters: number,
+    readonly noteCharacters: number,
+  ) {
+    super("Conversation notes budget is full for this roleplay");
+    this.name = "ConversationNoteBudgetError";
+  }
+}
 
 export type MetadataPatch = Record<string, unknown>;
 export type MetadataUpdater = (current: MetadataPatch) => MetadataPatch | Promise<MetadataPatch>;
@@ -3253,17 +3270,38 @@ export function createChatsStorage(db: DB) {
 
     /** Create a queued influence from a conversation → its connected roleplay. */
     async createInfluence(sourceChatId: string, targetChatId: string, content: string, anchorMessageId?: string) {
-      const id = newId();
-      await db.insert(oocInfluences).values({
-        id,
-        sourceChatId,
-        targetChatId,
-        content,
-        anchorMessageId: anchorMessageId ?? null,
-        consumed: "false",
-        createdAt: now(),
+      // Re-running the same command for the same source message never queues it twice, even when
+      // two runs race: transactions are serialized, so the check and the insert are one step.
+      return db.transaction(async (tx) => {
+        if (anchorMessageId) {
+          const existing = (
+            await tx
+              .select({ id: oocInfluences.id })
+              .from(oocInfluences)
+              .where(
+                and(
+                  eq(oocInfluences.targetChatId, targetChatId),
+                  eq(oocInfluences.sourceChatId, sourceChatId),
+                  eq(oocInfluences.anchorMessageId, anchorMessageId),
+                  eq(oocInfluences.content, content),
+                ),
+              )
+              .limit(1)
+          )[0];
+          if (existing) return existing.id;
+        }
+        const id = newId();
+        await tx.insert(oocInfluences).values({
+          id,
+          sourceChatId,
+          targetChatId,
+          content,
+          anchorMessageId: anchorMessageId ?? null,
+          consumed: "false",
+          createdAt: now(),
+        });
+        return id;
       });
-      return id;
     },
 
     /** Get all unconsumed influences targeting a chat. */
@@ -3272,6 +3310,16 @@ export function createChatsStorage(db: DB) {
         .select()
         .from(oocInfluences)
         .where(and(eq(oocInfluences.targetChatId, targetChatId), eq(oocInfluences.consumed, "false")))
+        .orderBy(oocInfluences.createdAt);
+    },
+
+    /** Specific influences for a target, consumed or not (used to reproduce a regenerated reply). */
+    async listInfluencesByIds(targetChatId: string, ids: string[]) {
+      if (!ids.length) return [];
+      return db
+        .select()
+        .from(oocInfluences)
+        .where(and(eq(oocInfluences.targetChatId, targetChatId), inArray(oocInfluences.id, ids)))
         .orderBy(oocInfluences.createdAt);
     },
 
@@ -3287,48 +3335,173 @@ export function createChatsStorage(db: DB) {
       await db.update(oocInfluences).set({ consumed: "true" }).where(condition);
     },
 
-    /** Delete all influences associated with a chat (as source or target). */
+    /**
+     * Record on a saved Roleplay reply which influences were in its input and, for the first reply
+     * of that generation, mark them consumed — in one transaction. A failure leaves the reply
+     * without a record and every influence pending, so the next input reproduces all of them,
+     * never a half-consumed set (CMB Convo routes).
+     */
+    async recordConsumedInfluences(
+      messageId: string,
+      targetChatId: string,
+      ids: string[],
+      markConsumed: boolean,
+      swipeIndex?: number,
+    ) {
+      const unique = [...new Set(ids.filter((id) => typeof id === "string" && id.length > 0))];
+      if (!unique.length) return;
+      const withRecord = (extra: Record<string, unknown>) => {
+        const recorded = Array.isArray(extra.cmbConsumedInfluenceIds)
+          ? extra.cmbConsumedInfluenceIds.filter((id): id is string => typeof id === "string")
+          : [];
+        return JSON.stringify({ ...extra, cmbConsumedInfluenceIds: [...new Set([...recorded, ...unique])].slice(-64) });
+      };
+      await withPatchQueue(messageExtraPatchQueues, messageId, () =>
+        db.transaction(async (tx) => {
+          const msg = (await tx.select().from(messages).where(eq(messages.id, messageId)).limit(1))[0];
+          if (!msg) throw new Error(`Cannot record influences: message ${messageId} is missing`);
+          // The record belongs to the swipe the reply was saved on; the message row mirrors the
+          // active swipe, which another device may have changed meanwhile.
+          const swipes = await tx.select().from(messageSwipes).where(eq(messageSwipes.messageId, messageId));
+          const targetIndex = swipeIndex ?? msg.activeSwipeIndex;
+          const targetSwipe = swipes.find((swipe) => swipe.index === targetIndex);
+          if (!targetSwipe || targetIndex === msg.activeSwipeIndex) {
+            await tx
+              .update(messages)
+              .set({ extra: withRecord(parseExtraRecord(msg.extra)) })
+              .where(eq(messages.id, messageId));
+          }
+          if (targetSwipe) {
+            await tx
+              .update(messageSwipes)
+              .set({ extra: withRecord(parseExtraRecord(targetSwipe.extra)) })
+              .where(and(eq(messageSwipes.messageId, messageId), eq(messageSwipes.id, targetSwipe.id)));
+          }
+          if (markConsumed) {
+            await tx
+              .update(oocInfluences)
+              .set({ consumed: "true" })
+              .where(and(eq(oocInfluences.targetChatId, targetChatId), inArray(oocInfluences.id, unique)));
+          }
+        }),
+      );
+    },
+
+    /**
+     * Delete all influences associated with a chat (as source or target), except those aimed at an
+     * RP that has once used CMB Convo routes: unlinking stops injection there but keeps the record.
+     */
     async deleteInfluencesForChat(chatId: string) {
-      await db.delete(oocInfluences).where(eq(oocInfluences.sourceChatId, chatId));
-      await db.delete(oocInfluences).where(eq(oocInfluences.targetChatId, chatId));
+      const preserved = await this.onceOptedTargets(chatId, oocInfluences);
+      await db
+        .delete(oocInfluences)
+        .where(
+          preserved.length
+            ? and(eq(oocInfluences.sourceChatId, chatId), notInArray(oocInfluences.targetChatId, preserved))
+            : eq(oocInfluences.sourceChatId, chatId),
+        );
+      if (!preserved.includes(chatId)) await db.delete(oocInfluences).where(eq(oocInfluences.targetChatId, chatId));
+    },
+
+    /** Targets of a chat's influence/note rows that belong to a once-opted RP. */
+    async onceOptedTargets(chatId: string, table: typeof oocInfluences | typeof conversationNotes) {
+      const rows = (await db
+        .select({ targetChatId: table.targetChatId })
+        .from(table)
+        .where(or(eq(table.sourceChatId, chatId), eq(table.targetChatId, chatId)))) as Array<{
+        targetChatId: string;
+      }>;
+      const targets = [...new Set(rows.map((row) => row.targetChatId))];
+      if (!targets.length) return [];
+      const targetChats = (await db
+        .select({ id: chats.id, metadata: chats.metadata })
+        .from(chats)
+        .where(inArray(chats.id, targets))) as Array<{ id: string; metadata: string }>;
+      return targetChats
+        .filter((chat) => isCmbConvoRoutesOnceOpted(parseChatMetadataRecord(chat.metadata)))
+        .map((chat) => chat.id);
     },
 
     // ── Conversation Notes ──
 
     /** Create a durable note from a conversation → its connected roleplay, then prune oldest past the char budget. */
     async createNote(sourceChatId: string, targetChatId: string, content: string, anchorMessageId?: string) {
-      const id = newId();
-      await db.insert(conversationNotes).values({
-        id,
-        sourceChatId,
-        targetChatId,
-        content,
-        anchorMessageId: anchorMessageId ?? null,
-        createdAt: now(),
-      });
-
-      const all = await db
-        .select()
-        .from(conversationNotes)
-        .where(eq(conversationNotes.targetChatId, targetChatId))
-        .orderBy(desc(conversationNotes.createdAt), desc(conversationNotes.id));
-
-      const toDelete: string[] = [];
-      let total = 0;
-      for (let i = 0; i < all.length; i++) {
-        total += all[i]!.content.length;
-        // Always keep the newest note even if it alone exceeds the budget.
-        if (i > 0 && total > CONVERSATION_NOTES_BUDGET_CHARS) {
-          toDelete.push(all[i]!.id);
+      // The duplicate check, the budget check and the insert are one serialized step, so two runs
+      // of the same command (or two concurrent writers) can neither duplicate nor overshoot.
+      return db.transaction(async (tx) => {
+        if (anchorMessageId) {
+          const existing = (
+            await tx
+              .select({ id: conversationNotes.id })
+              .from(conversationNotes)
+              .where(
+                and(
+                  eq(conversationNotes.targetChatId, targetChatId),
+                  eq(conversationNotes.sourceChatId, sourceChatId),
+                  eq(conversationNotes.anchorMessageId, anchorMessageId),
+                  eq(conversationNotes.content, content),
+                ),
+              )
+              .limit(1)
+          )[0];
+          if (existing) return existing.id;
         }
-      }
-      if (toDelete.length > 0) {
-        await db
-          .delete(conversationNotes)
-          .where(and(eq(conversationNotes.targetChatId, targetChatId), inArray(conversationNotes.id, toDelete)));
-      }
+        const target = (
+          await tx.select({ metadata: chats.metadata }).from(chats).where(eq(chats.id, targetChatId)).limit(1)
+        )[0] as { metadata: string } | undefined;
+        if (target && isCmbConvoRoutesOnceOpted(parseChatMetadataRecord(target.metadata))) {
+          // A once-opted RP refuses past the budget and never prunes.
+          const current = await tx
+            .select({ content: conversationNotes.content })
+            .from(conversationNotes)
+            .where(eq(conversationNotes.targetChatId, targetChatId));
+          const used = current.reduce((total, note) => total + note.content.length, 0);
+          if (used + content.length > CONVERSATION_NOTES_BUDGET_CHARS)
+            throw new ConversationNoteBudgetError(used, content.length);
+          const id = newId();
+          await tx.insert(conversationNotes).values({
+            id,
+            sourceChatId,
+            targetChatId,
+            content,
+            anchorMessageId: anchorMessageId ?? null,
+            createdAt: now(),
+          });
+          return id;
+        }
+        const id = newId();
+        await tx.insert(conversationNotes).values({
+          id,
+          sourceChatId,
+          targetChatId,
+          content,
+          anchorMessageId: anchorMessageId ?? null,
+          createdAt: now(),
+        });
 
-      return id;
+        const all = await tx
+          .select()
+          .from(conversationNotes)
+          .where(eq(conversationNotes.targetChatId, targetChatId))
+          .orderBy(desc(conversationNotes.createdAt), desc(conversationNotes.id));
+
+        const toDelete: string[] = [];
+        let total = 0;
+        for (let i = 0; i < all.length; i++) {
+          total += all[i]!.content.length;
+          // Always keep the newest note even if it alone exceeds the budget.
+          if (i > 0 && total > CONVERSATION_NOTES_BUDGET_CHARS) {
+            toDelete.push(all[i]!.id);
+          }
+        }
+        if (toDelete.length > 0) {
+          await tx
+            .delete(conversationNotes)
+            .where(and(eq(conversationNotes.targetChatId, targetChatId), inArray(conversationNotes.id, toDelete)));
+        }
+
+        return id;
+      });
     },
 
     /** List all durable notes targeting a chat, oldest first (for stable prompt ordering).
@@ -3354,10 +3527,18 @@ export function createChatsStorage(db: DB) {
       await db.delete(conversationNotes).where(eq(conversationNotes.targetChatId, targetChatId));
     },
 
-    /** Delete all notes associated with a chat (as source or target). */
+    /** Delete all notes associated with a chat (as source or target), keeping those of once-opted RPs. */
     async deleteNotesForChat(chatId: string) {
-      await db.delete(conversationNotes).where(eq(conversationNotes.sourceChatId, chatId));
-      await db.delete(conversationNotes).where(eq(conversationNotes.targetChatId, chatId));
+      const preserved = await this.onceOptedTargets(chatId, conversationNotes);
+      await db
+        .delete(conversationNotes)
+        .where(
+          preserved.length
+            ? and(eq(conversationNotes.sourceChatId, chatId), notInArray(conversationNotes.targetChatId, preserved))
+            : eq(conversationNotes.sourceChatId, chatId),
+        );
+      if (!preserved.includes(chatId))
+        await db.delete(conversationNotes).where(eq(conversationNotes.targetChatId, chatId));
     },
   };
 }

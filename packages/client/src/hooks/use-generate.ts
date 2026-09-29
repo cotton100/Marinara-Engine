@@ -41,6 +41,7 @@ import {
 } from "../lib/tts-autoplay";
 import { startSceneWithPromptPreferences } from "../lib/scene-generation";
 import { translate } from "../localization/i18n";
+import { cmbConvoRouteReasonKey } from "../lib/cmb-convo-routes-reasons";
 import { waitForPendingChatMetadataSaves } from "../lib/chat-metadata-save-barrier";
 import { agentKeys } from "./use-agents";
 import { advancedMemoryKeys, ADVANCED_MEMORY_SETTINGS_EVENT } from "./use-advanced-memory";
@@ -3126,6 +3127,18 @@ export function useGenerate() {
                 }
                 qc.invalidateQueries({ queryKey: lorebookKeys.active(oocData.chatId) });
               }
+              break;
+            }
+
+            case "cmb_route_held": {
+              // A CMB room message was deliberately not sent anywhere; tell the user why.
+              const held = event.data as { command?: string; reason?: string };
+              const reason = typeof held?.reason === "string" ? held.reason : "unknown";
+              toast.warning(
+                translate("ui.chat.cmbconvoroutes.heldToast", {
+                  reason: translate(cmbConvoRouteReasonKey(reason), { reason }),
+                }),
+              );
               break;
             }
 

@@ -33,6 +33,9 @@ type CharacterMemory = {
   createdAt: string;
 };
 
+/** An active CMB Convo route from this conversation to its ensemble RP (see cmb-convo-routes.ts). */
+export type ConversationCmbRoute = { rpChatId: string; memberCharacterIds: string[] };
+
 export async function handleConversationSideEffectCommand(args: {
   command: CharacterCommand;
   characterId: string | null;
@@ -40,6 +43,9 @@ export async function handleConversationSideEffectCommand(args: {
   messageId?: string | null;
   chars: CharactersStore;
   chats: ChatsStore;
+  /** Re-reads the route at write time; never used when a native link exists. */
+  resolveCmbRoute?: () => Promise<ConversationCmbRoute | { held: string } | null>;
+  onHeld?: (hold: { command: "influence" | "note"; reason: string }) => void;
 }): Promise<boolean> {
   if (args.command.type === "memory") {
     await handleMemoryCommand(args.command as MemoryCommand, args);
@@ -103,16 +109,48 @@ async function handleMemoryCommand(
   );
 }
 
+/**
+ * The native 1:1 link keeps its original meaning. Only a conversation without one may use the CMB
+ * route, and only for a confirmed ensemble member; failures never fall back to another room.
+ * `resolveCmbRoute` is passed only when the generation started on the CMB path (no native link at
+ * start), so a link that appeared since is a route change and holds — it never redirects the write.
+ */
+async function resolveConnectedTarget(
+  kind: "influence" | "note",
+  args: Parameters<typeof handleConversationSideEffectCommand>[0],
+): Promise<string | null> {
+  const freshChat = await args.chats.getById(args.chatId);
+  const connectedId = typeof freshChat?.connectedChatId === "string" ? freshChat.connectedChatId : null;
+  if (!args.resolveCmbRoute) {
+    if (connectedId) return connectedId;
+    logger.warn("[commands] %s command used but no connected chat", kind === "influence" ? "Influence" : "Note");
+    return null;
+  }
+  const route = connectedId ? { held: "routes-changed" as const } : await args.resolveCmbRoute();
+  if (!route) {
+    logger.warn("[commands] %s command used but no connected chat", kind === "influence" ? "Influence" : "Note");
+    return null;
+  }
+  if ("held" in route) {
+    logger.warn("[commands] CMB %s held for chat %s: %s", kind, args.chatId, route.held);
+    args.onHeld?.({ command: kind, reason: route.held });
+    return null;
+  }
+  if (!args.characterId || !route.memberCharacterIds.includes(args.characterId)) {
+    const reason = args.characterId ? "speaker-not-member" : "speaker-unknown";
+    logger.warn("[commands] CMB %s held for chat %s: %s", kind, args.chatId, reason);
+    args.onHeld?.({ command: kind, reason });
+    return null;
+  }
+  return route.rpChatId;
+}
+
 async function handleInfluenceCommand(
   command: InfluenceCommand,
   args: Parameters<typeof handleConversationSideEffectCommand>[0],
 ): Promise<void> {
-  const freshChat = await args.chats.getById(args.chatId);
-  const connectedId = typeof freshChat?.connectedChatId === "string" ? freshChat.connectedChatId : null;
-  if (!connectedId) {
-    logger.warn("[commands] Influence command used but no connected chat");
-    return;
-  }
+  const connectedId = await resolveConnectedTarget("influence", args);
+  if (!connectedId) return;
 
   const influenceContent = stripConversationPromptTimestamps(command.content);
   if (!influenceContent) return;
@@ -129,17 +167,21 @@ async function handleNoteCommand(
   command: NoteCommand,
   args: Parameters<typeof handleConversationSideEffectCommand>[0],
 ): Promise<void> {
-  const freshChat = await args.chats.getById(args.chatId);
-  const connectedId = typeof freshChat?.connectedChatId === "string" ? freshChat.connectedChatId : null;
-  if (!connectedId) {
-    logger.warn("[commands] Note command used but no connected chat");
-    return;
-  }
+  const connectedId = await resolveConnectedTarget("note", args);
+  if (!connectedId) return;
 
   const noteContent = stripConversationPromptTimestamps(command.content);
   if (!noteContent) return;
 
-  await args.chats.createNote(args.chatId, connectedId, noteContent, args.messageId ?? undefined);
+  try {
+    await args.chats.createNote(args.chatId, connectedId, noteContent, args.messageId ?? undefined);
+  } catch (error) {
+    if ((error as { code?: unknown })?.code !== "CONVERSATION_NOTE_BUDGET") throw error;
+    // The RP keeps its existing notes; the new one is refused with a visible reason.
+    logger.warn("[commands] Conversation note refused for chat %s: notes budget is full", connectedId);
+    args.onHeld?.({ command: "note", reason: "notes-budget-full" });
+    return;
+  }
   logger.info(
     "[commands] Conversation note saved for connected chat %s (contentLength=%d)",
     connectedId,

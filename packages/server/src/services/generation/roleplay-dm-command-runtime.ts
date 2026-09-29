@@ -60,6 +60,11 @@ function messageTimestampMsOf(message: unknown): number | undefined {
   return Number.isFinite(timestampMs) ? timestampMs : undefined;
 }
 
+/** `null` = CMB routes do not apply (legacy behavior); otherwise the checked destination or a hold. */
+export type RoleplayCmbDmRoute = (
+  command: DirectMessageCommand,
+) => Promise<{ chatId: string } | { held: string } | null>;
+
 export async function handleRoleplayDmCommand(args: {
   command: CharacterCommand;
   chatId: string;
@@ -68,6 +73,9 @@ export async function handleRoleplayDmCommand(args: {
   allChatMessages: MessageRow[];
   chats: ChatsStore;
   sendAssistantAction: (data: Record<string, unknown>) => void;
+  /** CMB routes: each character's DM goes to that character's own registered conversation. */
+  cmbDmRoute?: RoleplayCmbDmRoute;
+  onCmbHeld?: (hold: { reason: string; characterName: string; message: string }) => void;
 }): Promise<boolean> {
   if (args.command.type !== "dm") return false;
   const command = args.command as DirectMessageCommand;
@@ -137,13 +145,22 @@ async function runRoleplayDmCommand(
     return userMsg;
   };
 
-  const freshChat = await args.chats.getById(args.chatId);
+  const cmbTarget = args.cmbDmRoute ? await args.cmbDmRoute(command) : null;
+  if (cmbTarget && "held" in cmbTarget) {
+    // Never reroute to the native link or create a new DM when the CMB route cannot deliver.
+    logger.warn('[commands] Roleplay DM from "%s" held for chat %s: %s', targetName, args.chatId, cmbTarget.held);
+    args.onCmbHeld?.({ reason: cmbTarget.held, characterName: targetName, message: messageText });
+    return;
+  }
+
+  const freshChat = cmbTarget ? null : await args.chats.getById(args.chatId);
   const connectedId = typeof freshChat?.connectedChatId === "string" ? freshChat.connectedChatId : null;
   const connectedChat = connectedId ? await args.chats.getById(connectedId) : null;
-  const linkedConversationId = connectedChat?.mode === "conversation" ? connectedChat.id : null;
+  const linkedConversationId = cmbTarget?.chatId ?? (connectedChat?.mode === "conversation" ? connectedChat.id : null);
 
   if (linkedConversationId) {
-    const sourceUserDmMessage = await ensureSourceUserMessage(linkedConversationId, false);
+    // A CMB DM room belongs to one character, so mirror the user's line once per room.
+    const sourceUserDmMessage = await ensureSourceUserMessage(linkedConversationId, Boolean(cmbTarget));
     const dmMessage = await args.chats.createMessage({
       chatId: linkedConversationId,
       role: "assistant",

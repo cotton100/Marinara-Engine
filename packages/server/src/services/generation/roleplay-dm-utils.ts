@@ -1,7 +1,7 @@
 import type { DirectMessageCommand } from "../conversation/character-commands.js";
 import { stripConversationPromptTimestamps } from "../conversation/transcript-sanitize.js";
 
-function normalizeDmTargetName(value: string): string {
+export function normalizeDmTargetName(value: string): string {
   return value
     .toLowerCase()
     .normalize("NFKD")

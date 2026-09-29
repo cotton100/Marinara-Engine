@@ -531,9 +531,26 @@ import {
 import { applySpotifyAgentPlaybackFallbacks } from "../services/generation/spotify-agent-runtime.js";
 import {
   formatUnresolvedRoleplayDmFallback,
+  normalizeDmTargetName,
   replaceRoleplayDmCommandText,
   resolveRoleplayDmTarget,
 } from "../services/generation/roleplay-dm-utils.js";
+import {
+  isCmbConvoRoutesOnceOpted,
+  resolveCmbConversationRoute,
+  resolveCmbRoleplayRoutes,
+  resolveCmbRoleplaySourceChatIds,
+  type CmbConversationRoute,
+  type CmbRoleplayRoutes,
+} from "../services/conversation/cmb-convo-routes.js";
+import {
+  buildManagedRoleplayOocInstruction,
+  extractRoleplayOocMessages,
+  planCmbDirectMessage,
+  planManagedRoleplayOoc,
+  type RoleplayOocMessage,
+} from "../services/generation/roleplay-ooc-runtime.js";
+import { sanitizePromptLeaf } from "../services/prompt/prompt-escaping.js";
 import { cardPromptText } from "../services/prompt/card-text.js";
 import {
   getHiddenCompletionTokens,
@@ -1504,6 +1521,57 @@ export async function generateRoutes(app: FastifyInstance) {
       // Get chat messages
       const allChatMessages = await chats.listMessages(input.chatId);
       const chatMode = requestChatMode;
+      // CMB Convo routes are fixed at generation start and re-validated right before any post.
+      const cmbRoleplayOnceOpted = chatMode === "roleplay" && isCmbConvoRoutesOnceOpted(chatMeta);
+      const cmbRoleplayRoutesAtStart: CmbRoleplayRoutes | null = cmbRoleplayOnceOpted
+        ? await resolveCmbRoleplayRoutes(app.db, input.chatId)
+        : null;
+      const cmbRoleplayActiveRoutes =
+        cmbRoleplayRoutesAtStart?.state === "active" && !input.impersonate ? cmbRoleplayRoutesAtStart : null;
+      const cmbConversationRouteAtStart: CmbConversationRoute | null =
+        chatMode === "conversation" && !chat.connectedChatId
+          ? await resolveCmbConversationRoute(app.db, input.chatId)
+          : null;
+      const cmbReplayInfluenceIds = (() => {
+        if (!cmbRoleplayOnceOpted || !input.regenerateMessageId) return [];
+        const target = allChatMessages.find((message) => message.id === input.regenerateMessageId);
+        const ids = (parseExtra(target?.extra) as Record<string, unknown>).cmbConsumedInfluenceIds;
+        return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string").slice(0, 64) : [];
+      })();
+      let cmbInjectedInfluenceIds: string[] = [];
+      let cmbInfluencesConsumed = false;
+      let cmbInfluenceRecordFailed = false;
+      // A once-opted RP consumes injected influences only when its reply is persisted; failed or
+      // cancelled generations leave them pending. Every reply of the generation (each speaker in
+      // individual mode) records them so a swipe of any of them can reproduce them; the consumption
+      // itself happens once, in the same transaction as the first record. Once any record failed,
+      // nothing is consumed any more: every reply that saw them is reproducible or they come back.
+      const consumeCmbInfluences = async (
+        savedMsg: { id?: unknown; role?: unknown; extra?: unknown } | null,
+        savedSwipeIndex?: number | null,
+      ) => {
+        if (!cmbRoleplayOnceOpted || !cmbInjectedInfluenceIds.length) return;
+        if (typeof savedMsg?.id !== "string" || savedMsg.role !== "assistant") return;
+        try {
+          await chats.recordConsumedInfluences(
+            savedMsg.id,
+            input.chatId,
+            cmbInjectedInfluenceIds,
+            !cmbInfluencesConsumed && !cmbInfluenceRecordFailed,
+            typeof savedSwipeIndex === "number" ? savedSwipeIndex : undefined,
+          );
+          cmbInfluencesConsumed = true;
+        } catch (error) {
+          cmbInfluenceRecordFailed = true;
+          // The reply is already saved; the influences stay pending and reproducible next turn.
+          logger.error(
+            error,
+            "[generate] Could not record CMB influences for reply %s of chat %s",
+            savedMsg.id,
+            input.chatId,
+          );
+        }
+      };
       const advancedMemorySettings = normalizeAdvancedMemorySettings(chatMeta.advancedMemory);
       const advancedMemoryEnabled = chatMode === "roleplay" && advancedMemorySettings.enabled;
       // Resolve historical time before user start markers: later resets must not hide an older swipe target.
@@ -2395,7 +2463,7 @@ export async function generateRoutes(app: FastifyInstance) {
         messageId: string;
         swipeIndex: number;
       }> = [];
-      const collectedOocMessages: string[] = [];
+      const collectedOocMessages: RoleplayOocMessage[] = [];
       // Embed the Mari relevance-ranking query once per turn, not once per
       // follow-up iteration (the query is invariant across the turn's passes).
       const mariQueryEmbeddingCache = new Map<string, number[] | null>();
@@ -3400,7 +3468,8 @@ export async function generateRoutes(app: FastifyInstance) {
 
           const { connectedChatBlock, systemPromptAppend: connectedChatSystemPrompt } =
             await resolveConversationConnectedChatContext({
-              connectedChatId: chat.connectedChatId,
+              // A registered room without a native link reaches its RP only through the CMB route.
+              connectedChatId: chat.connectedChatId ?? cmbConversationRouteAtStart?.rpChatId ?? null,
               conversationCommandsEnabled,
               chatMeta,
               personaName,
@@ -3409,10 +3478,12 @@ export async function generateRoutes(app: FastifyInstance) {
               gameStateStore,
               wrapFormat,
               omitRoleplayTranscript:
-                cmbRecentContextResult !== null &&
-                (cmbRecentContextResult.scope === "unavailable" ||
-                  (cmbRecentContextResult.scope === "managed" &&
-                    cmbRecentContextResult.rpChatId === chat.connectedChatId)),
+                // The CMB route carries commands, never the RP's unfiltered transcript.
+                (!chat.connectedChatId && cmbConversationRouteAtStart !== null) ||
+                (cmbRecentContextResult !== null &&
+                  (cmbRecentContextResult.scope === "unavailable" ||
+                    (cmbRecentContextResult.scope === "managed" &&
+                      cmbRecentContextResult.rpChatId === chat.connectedChatId))),
             });
           if (connectedChatSystemPrompt) {
             conversationSystemPrompt += "\n\n" + connectedChatSystemPrompt;
@@ -3606,14 +3677,35 @@ export async function generateRoutes(app: FastifyInstance) {
 
         // Skip OOC injection entirely for scene chats — scenes are self-contained
         const isSceneChat = chatMeta.sceneStatus === "active";
-        await injectConnectedConversationPromptBlocks({
+        const connectedInjection = await injectConnectedConversationPromptBlocks({
           chatMode,
           connectedChatId: chat.connectedChatId,
           isSceneChat,
           chatId: input.chatId,
           chats,
           finalMessages,
+          cmb:
+            cmbRoleplayOnceOpted && cmbRoleplayRoutesAtStart
+              ? {
+                  allowedSourceChatIds: await resolveCmbRoleplaySourceChatIds(
+                    app.db,
+                    input.chatId,
+                    cmbRoleplayRoutesAtStart,
+                  ),
+                  replayInfluenceIds: cmbReplayInfluenceIds,
+                  oocInstruction: cmbRoleplayActiveRoutes
+                    ? buildManagedRoleplayOocInstruction(cmbRoleplayActiveRoutes, (value) =>
+                        sanitizePromptLeaf(value, wrapFormat),
+                      )
+                    : null,
+                }
+              : null,
         });
+        // Consumed only after a Roleplay reply is actually saved (see consumeCmbInfluences). Kept for
+        // the whole request so every reply built from this input records them.
+        cmbInjectedInfluenceIds = [
+          ...new Set([...cmbInjectedInfluenceIds, ...connectedInjection.injectedInfluenceIds]),
+        ];
 
         const noodlePromptContext = getCapabilityService<{
           build(input: {
@@ -6729,7 +6821,7 @@ export async function generateRoutes(app: FastifyInstance) {
           response: string;
           commands: CharacterCommand[];
           commandCharacterIds: (string | null)[] | null;
-          oocMessages: string[];
+          oocMessages: RoleplayOocMessage[];
           characterId: string | null;
         } | null> => {
           generationProviderOrigin = { model: conn.model, provider: conn.provider };
@@ -8143,21 +8235,19 @@ export async function generateRoutes(app: FastifyInstance) {
           }
 
           // ── Extract <ooc> tags from roleplay responses and post to connected conversation ──
-          let oocMessages: string[] = [];
-          if (chatMode === "roleplay" && !input.impersonate && chat.connectedChatId) {
-            const OOC_RE = /<ooc>([\s\S]*?)<\/ooc>/gi;
-            for (const match of fullResponse.matchAll(OOC_RE)) {
-              const text = match[1]!.trim();
-              if (text) oocMessages.push(text);
-            }
+          let oocMessages: RoleplayOocMessage[] = [];
+          if (chatMode === "roleplay" && !input.impersonate && (chat.connectedChatId || cmbRoleplayActiveRoutes)) {
+            const extracted = extractRoleplayOocMessages(fullResponse, {
+              // Room/speaker attributes are only understood on the CMB-managed path.
+              managed: Boolean(cmbRoleplayActiveRoutes),
+              speakerCharacterId: speaksOnlyTargetCharacter ? targetCharId : null,
+            });
+            oocMessages = extracted.messages;
             if (oocMessages.length > 0) {
-              fullResponse = fullResponse
-                .replace(OOC_RE, "")
-                .replace(/\n{3,}/g, "\n\n")
-                .trim();
+              fullResponse = extracted.response;
               contentReplaced = true;
               logger.info(
-                `[generate] Extracted ${oocMessages.length} OOC message(s) for conversation ${chat.connectedChatId}`,
+                `[generate] Extracted ${oocMessages.length} OOC message(s) for conversation ${chat.connectedChatId ?? "CMB routes"}`,
               );
             }
           }
@@ -9340,6 +9430,7 @@ export async function generateRoutes(app: FastifyInstance) {
               });
             }
             collectedOocMessages.push(...genResult.oocMessages);
+            await consumeCmbInfluences(genResult.savedMsg, genResult.savedSwipeIndex);
 
             // Add this character's response to the running context for the next character
             const inTurnMessage = {
@@ -9451,6 +9542,7 @@ export async function generateRoutes(app: FastifyInstance) {
               });
             }
             collectedOocMessages.push(...genResult.oocMessages);
+            await consumeCmbInfluences(genResult.savedMsg, genResult.savedSwipeIndex);
             const characterName = genResult.characterId
               ? (charInfo.find((character) => character.id === genResult.characterId)?.name ?? "Character")
               : "Character";
@@ -12223,6 +12315,25 @@ export async function generateRoutes(app: FastifyInstance) {
                   messageId,
                   chars,
                   chats,
+                  resolveCmbRoute: cmbConversationRouteAtStart
+                    ? async () => {
+                        // Re-validate right before writing: OFF, a room change or a new RP holds.
+                        const current = await resolveCmbConversationRoute(app.db, input.chatId);
+                        if (
+                          !current ||
+                          current.rpChatId !== cmbConversationRouteAtStart.rpChatId ||
+                          current.revision !== cmbConversationRouteAtStart.revision
+                        )
+                          return { held: "routes-changed" };
+                        return current;
+                      }
+                    : undefined,
+                  onHeld: (hold) => {
+                    sendSseEvent(reply, {
+                      type: "cmb_route_held",
+                      data: { chatId: input.chatId, messageId, ...hold },
+                    });
+                  },
                 });
 
                 await handleConversationMusicCommand({
@@ -12259,6 +12370,23 @@ export async function generateRoutes(app: FastifyInstance) {
                   chats,
                   sendAssistantAction: (data) => {
                     sendSseEvent(reply, { type: "assistant_action", data });
+                  },
+                  cmbDmRoute: cmbRoleplayActiveRoutes
+                    ? async (dm) =>
+                        planCmbDirectMessage({
+                          routesAtStart: cmbRoleplayActiveRoutes,
+                          routesNow: await resolveCmbRoleplayRoutes(app.db, input.chatId),
+                          requestedName: dm.character,
+                          resolvedCharacterId: dm.resolvedCharacterId,
+                          roleplayCharacters: charInfo,
+                          normalizeName: normalizeDmTargetName,
+                        })
+                    : undefined,
+                  onCmbHeld: (hold) => {
+                    sendSseEvent(reply, {
+                      type: "cmb_route_held",
+                      data: { chatId: input.chatId, messageId, command: "dm", reason: hold.reason },
+                    });
                   },
                 });
 
@@ -12462,15 +12590,63 @@ export async function generateRoutes(app: FastifyInstance) {
 
       await persistChatMacroVariables();
 
-      // ── Post OOC messages to connected conversation (Roleplay → Conversation) ──
-      if (collectedOocMessages.length > 0 && chat.connectedChatId && !abortController.signal.aborted) {
+      // ── Post OOC messages through CMB routes (Roleplay → registered Conversation) ──
+      if (collectedOocMessages.length > 0 && cmbRoleplayActiveRoutes && !abortController.signal.aborted) {
         try {
-          for (const oocText of collectedOocMessages) {
+          const deliveries = planManagedRoleplayOoc({
+            messages: collectedOocMessages,
+            routesAtStart: cmbRoleplayActiveRoutes,
+            routesNow: await resolveCmbRoleplayRoutes(app.db, input.chatId),
+            activeCharacterIds: characterIds,
+          });
+          const postedByChat = new Map<string, number>();
+          const held: Array<{ command: "ooc"; reason: string; text: string }> = [];
+          for (const delivery of deliveries) {
+            if (delivery.action === "hold") {
+              held.push({ command: "ooc", reason: delivery.reason, text: delivery.text.slice(0, 1000) });
+              continue;
+            }
+            await chats.createMessage({
+              chatId: delivery.chatId,
+              role: "assistant",
+              characterId: delivery.characterId,
+              content: delivery.text,
+            });
+            postedByChat.set(delivery.chatId, (postedByChat.get(delivery.chatId) ?? 0) + 1);
+          }
+          for (const [targetChatId, count] of postedByChat) {
+            sendSseEvent(reply, { type: "ooc_posted", data: { chatId: targetChatId, count } });
+          }
+          if (held.length) {
+            // Not delivered anywhere else; the reason stays on the reply for a manual retry.
+            logger.warn("[generate] Held %d CMB OOC message(s) for chat %s", held.length, input.chatId);
+            if (typeof lastSavedMsg?.id === "string")
+              await chats.updateMessageExtra(lastSavedMsg.id, { cmbRouteHeld: held.slice(0, 10) });
+            for (const hold of held)
+              sendSseEvent(reply, {
+                type: "cmb_route_held",
+                data: { chatId: input.chatId, command: "ooc", reason: hold.reason },
+              });
+          }
+        } catch (oocErr) {
+          logger.error(oocErr, "[generate] Failed to post CMB OOC messages");
+        }
+      }
+
+      // ── Post OOC messages to connected conversation (Roleplay → Conversation) ──
+      if (
+        collectedOocMessages.length > 0 &&
+        !cmbRoleplayActiveRoutes &&
+        chat.connectedChatId &&
+        !abortController.signal.aborted
+      ) {
+        try {
+          for (const oocMessage of collectedOocMessages) {
             await chats.createMessage({
               chatId: chat.connectedChatId as string,
               role: "assistant",
               characterId: lastSavedMsg?.characterId ?? characterIds[0] ?? null,
-              content: oocText,
+              content: oocMessage.text,
             });
           }
           logger.info(

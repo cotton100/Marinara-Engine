@@ -92,6 +92,16 @@ import {
   resolveChatSummaryTemperatureOptions,
 } from "../services/chat-summary/connection-resolution.js";
 import { generateMissingConversationSummaries } from "../services/conversation/auto-summary.service.js";
+import {
+  CMB_CONVO_ROUTES_KEY,
+  parseChatMetadataRecord,
+  readCmbConvoRoutesPolicy,
+} from "../services/conversation/cmb-convo-routes-policy.js";
+import {
+  cmbDefaultOocCandidates,
+  inspectCmbRoleplayTopology,
+  resolveCmbRoleplayRoutes,
+} from "../services/conversation/cmb-convo-routes.js";
 import { clearChatActivity, recordUserReaction } from "../services/conversation/autonomous.service.js";
 import { rebuildMemoryChunks } from "../services/memory-recall.js";
 import { createAdvancedMemoryService } from "../services/advanced-memory.js";
@@ -1242,6 +1252,8 @@ export async function chatsRoutes(app: FastifyInstance) {
     const chat = await storage.getById(req.params.id);
     if (!chat) return reply.status(404).send({ error: "Chat not found" });
     const incoming = req.body as Record<string, unknown>;
+    // CMB Convo routes change message destinations; only the dedicated validated route may write them.
+    if (incoming && typeof incoming === "object") delete incoming[CMB_CONVO_ROUTES_KEY];
     // Validate Discord webhook URL if provided
     if (typeof incoming.discordWebhookUrl === "string" && incoming.discordWebhookUrl.trim()) {
       const url = incoming.discordWebhookUrl.trim();
@@ -1838,6 +1850,117 @@ export async function chatsRoutes(app: FastifyInstance) {
     await storage.deleteInfluencesForChat(req.params.id);
     await storage.deleteNotesForChat(req.params.id);
     return { disconnected: true };
+  });
+
+  // ── CMB Convo routes (one ensemble RP ↔ its registered DMs and full-roster groups) ──
+  const describeCmbConvoRoutes = async (chatId: string) => {
+    const [topology, routes] = await Promise.all([
+      inspectCmbRoleplayTopology(app.db, chatId),
+      resolveCmbRoleplayRoutes(app.db, chatId),
+    ]);
+    const policy = "policy" in routes ? routes.policy : null;
+    const view = topology.ok ? topology.topology : null;
+    return {
+      state: routes.state,
+      stateReason: "reason" in routes ? routes.reason : null,
+      available: topology.ok,
+      availabilityReason: topology.ok ? null : topology.reason,
+      ensemble: view ? { id: view.ensembleId, name: view.ensembleName } : null,
+      policy: policy
+        ? { enabled: policy.enabled, defaultOocChatId: policy.defaultOocChatId, revision: policy.revision }
+        : null,
+      defaultOocReason: routes.state === "active" ? routes.defaultOocReason : null,
+      members: (view?.members ?? []).map((member) => ({
+        characterId: member.characterId,
+        name: member.name,
+        dm: member.dm ? { chatId: member.dm.chatId, name: member.dm.name } : null,
+        dmReason: member.dmReason,
+      })),
+      groups: (view?.groups ?? []).map((room) => ({ chatId: room.chatId, name: room.name, label: room.label })),
+      excluded: view?.excluded ?? [],
+      nativePartner: view?.nativePartner ? { chatId: view.nativePartner.chatId, name: view.nativePartner.name } : null,
+      defaultOocCandidates: view
+        ? cmbDefaultOocCandidates(view).map((room) => ({ chatId: room.chatId, name: room.name, kind: room.kind }))
+        : [],
+    };
+  };
+
+  app.get<{ Params: { id: string } }>("/:id/cmb-routes", async (req, reply) => {
+    const chat = await storage.getById(req.params.id);
+    if (!chat) return reply.status(404).send({ error: "Chat not found" });
+    if (chat.mode !== "roleplay")
+      return reply.status(400).send({ error: "CMB Convo routes belong to a Roleplay chat" });
+    return describeCmbConvoRoutes(chat.id);
+  });
+
+  const cmbConvoRoutesUpdateSchema = z
+    .object({
+      enabled: z.boolean(),
+      defaultOocChatId: z
+        .string()
+        .min(1)
+        .max(256)
+        .refine((value) => value.trim() === value)
+        .nullable(),
+      expectedRevision: z.number().int().min(0),
+    })
+    .strict();
+
+  app.put<{ Params: { id: string } }>("/:id/cmb-routes", async (req, reply) => {
+    const parsed = cmbConvoRoutesUpdateSchema.safeParse(req.body);
+    if (!parsed.success) return reply.status(400).send({ error: "Invalid CMB Convo routes update" });
+    const input = parsed.data;
+    const chat = await storage.getById(req.params.id);
+    if (!chat) return reply.status(404).send({ error: "Chat not found" });
+    if (chat.mode !== "roleplay")
+      return reply.status(400).send({ error: "CMB Convo routes belong to a Roleplay chat" });
+    const topology = await inspectCmbRoleplayTopology(app.db, chat.id);
+    const existing = readCmbConvoRoutesPolicy(parseChatMetadataRecord(chat.metadata));
+    const existingPolicy = existing === "invalid" ? null : existing;
+    if (input.enabled && !topology.ok)
+      return reply.status(409).send({ error: "This Roleplay is not a registered CMB room", reason: topology.reason });
+    const ensembleId = topology.ok ? topology.topology.ensembleId : existingPolicy?.ensembleId;
+    if (!ensembleId)
+      return reply.status(409).send({ error: "This Roleplay is not a registered CMB room", reason: "not-registered" });
+    // The policy key marks a Roleplay that has used the routes (notes are kept, never pruned). An
+    // OFF write on a Roleplay that never had one would create that mark without ever turning them on.
+    if (!input.enabled && existing === null)
+      return reply.status(400).send({ error: "Turn the routes on before setting a default room" });
+    // While ON, a default room must be a validated candidate. Turning the routes OFF never depends
+    // on the default room, so a room that became invalid can always be switched off and corrected.
+    if (
+      input.enabled &&
+      input.defaultOocChatId !== null &&
+      !(
+        topology.ok && cmbDefaultOocCandidates(topology.topology).some((room) => room.chatId === input.defaultOocChatId)
+      )
+    )
+      return reply.status(400).send({ error: "The default OOC room is not an available registered conversation" });
+    class RevisionConflict extends Error {}
+    try {
+      await storage.patchMetadata(chat.id, (current) => {
+        const policy = readCmbConvoRoutesPolicy(current);
+        const revision = policy && policy !== "invalid" ? policy.revision : 0;
+        if (revision !== input.expectedRevision) throw new RevisionConflict();
+        return {
+          [CMB_CONVO_ROUTES_KEY]: {
+            schemaVersion: 1,
+            enabled: input.enabled,
+            ensembleId,
+            defaultOocChatId: input.defaultOocChatId,
+            revision: revision + 1,
+            updatedAt: new Date().toISOString(),
+          },
+        };
+      });
+    } catch (error) {
+      if (error instanceof RevisionConflict)
+        return reply
+          .status(409)
+          .send({ error: "CMB Convo routes changed elsewhere; reload and try again", reason: "revision-conflict" });
+      throw error;
+    }
+    return describeCmbConvoRoutes(chat.id);
   });
 
   // List pending OOC influences for a chat
@@ -4251,6 +4374,8 @@ export async function chatsRoutes(app: FastifyInstance) {
     }
     delete settingsToKeep.gameNarrationIndex;
     delete settingsToKeep.gameNarrationMessageId;
+    // A branch is not the ensemble's registered RP; never carry its CMB Convo routes along.
+    delete settingsToKeep[CMB_CONVO_ROUTES_KEY];
     const sourceCutoffIndex = upToMessageId ? msgs.findIndex((msg) => msg.id === upToMessageId) : msgs.length - 1;
     const sourceMessagesToCopy = msgs.slice(0, sourceCutoffIndex + 1);
     const copiedSourceMessageIds = new Set(sourceMessagesToCopy.map((msg) => msg.id));

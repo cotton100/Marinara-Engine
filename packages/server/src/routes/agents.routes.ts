@@ -23,6 +23,8 @@ import {
   normalizeAgentPhaseForType,
   type CustomAgentCapability,
 } from "@marinara-engine/shared";
+import { logger } from "../lib/logger.js";
+import { customHeaderValues, redactSecrets } from "../lib/redact-secrets.js";
 import { requirePrivilegedAccess } from "../middleware/privileged-gate.js";
 import { BEHOLDER_STATE_RATE_LIMIT } from "../middleware/rate-limit.js";
 import {
@@ -743,13 +745,26 @@ export async function agentsRoutes(app: FastifyInstance) {
       `Excerpt to rewrite:\n<<<EXCERPT\n${escapePromptFrameDelimiter(input.selectedText, "EXCERPT>>>")}\nEXCERPT>>>\n\n` +
       `Instruction: ${input.instruction}`;
 
-    const result = await provider.chatComplete(
-      [
-        { role: "system", content: AGENT_SUITE_REWRITE_SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-      { model: conn.model, temperature: 0.3 },
-    );
+    let result;
+    try {
+      result = await provider.chatComplete(
+        [
+          { role: "system", content: AGENT_SUITE_REWRITE_SYSTEM_PROMPT },
+          { role: "user", content: userContent },
+        ],
+        { model: conn.model, temperature: 0.3 },
+      );
+    } catch (error) {
+      // Provider failures carry `status`, not `statusCode`, so the generic handler would hide them
+      // behind a bare 500. Providers sanitise and truncate their error text but an upstream may
+      // echo the credential back, so it is redacted before it is logged or returned.
+      const detail = redactSecrets(error instanceof Error && error.message ? error.message : "unknown error", [
+        conn.apiKey,
+        ...customHeaderValues(conn.defaultParameters),
+      ]).slice(0, 400);
+      logger.warn("[agents] Suite rewrite model call failed on connection %s: %s", conn.id, detail);
+      throw Object.assign(new Error(`Rewrite model call failed: ${detail}`), { statusCode: 502 });
+    }
 
     const rewrittenText = stripWrappingCodeFence((result.content ?? "").trim());
     if (!rewrittenText) {

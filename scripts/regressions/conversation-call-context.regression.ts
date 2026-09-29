@@ -245,6 +245,59 @@ try {
   assert.ok((await context(["character-a"])).recentMessages.some((message) => message.content === "TODAY_44"));
   checks++;
 
+  // CMB sync marks a vanished source chunk as `missing` with no occurrences. That normal state must
+  // not erase today's history from every call; only a restricted one holds its own ensemble rooms.
+  await db.insert(chats).values({
+    id: "outside",
+    name: "outside",
+    mode: "conversation",
+    characterIds: JSON.stringify(["character-a", "character-b"]),
+    metadata: JSON.stringify({ crossChatAwareness: false }),
+    createdAt: fixture.stamp,
+    updatedAt: fixture.stamp,
+  });
+  await db
+    .insert(messages)
+    .values({ id: "outside-today", chatId: "outside", role: "user", content: "OUTSIDE_TODAY", createdAt: stamp(1) });
+  const markMissing = async (entry: Awaited<ReturnType<typeof fixture.createMemory>>) => {
+    const dynamic = structuredClone(entry.dynamicState) as Record<string, any>;
+    dynamic.convoMemoryBridge.source.occurrences = [];
+    dynamic.convoMemoryBridge.sourceStatus = "missing";
+    await fixture.writeDynamic(entry.id, dynamic);
+  };
+  const outside = () =>
+    resources.resolveConversationCallContext!({
+      chatId: "outside",
+      audienceCharacterIds: ["character-a", "character-b"],
+      query: "harbor",
+    });
+  await markMissing(await fixture.createMemory({ id: "lost-open", native: true, appliedTo: [] }));
+  assert.ok(
+    (await context()).recentMessages.some((message) => message.content === "TODAY_31"),
+    "an unrestricted missing-source memory does not hold its ensemble's calls",
+  );
+  assert.deepEqual(
+    (await outside()).recentMessages.map((message) => message.content),
+    ["OUTSIDE_TODAY"],
+  );
+  await markMissing(await fixture.createMemory({ id: "lost-private", native: true, appliedTo: [], unknownTo: ["b"] }));
+  assert.deepEqual(
+    (await context()).recentMessages,
+    [],
+    "a restricted memory with an unknown source still holds its own ensemble rooms",
+  );
+  assert.ok(
+    (await context(["character-a"])).recentMessages.some((message) => message.content === "TODAY_31"),
+    "the restriction applies only to audiences it restricts",
+  );
+  assert.deepEqual(
+    (await outside()).recentMessages.map((message) => message.content),
+    ["OUTSIDE_TODAY"],
+    "a chat outside every ensemble is never held by another room's lost source",
+  );
+  await db.delete(lorebookEntries).where(eq(lorebookEntries.id, "lost-private"));
+  checks++;
+
   for (let index = 0; index < 35; index++)
     await db.insert(lorebookEntries).values({
       id: `normal-${index}`,

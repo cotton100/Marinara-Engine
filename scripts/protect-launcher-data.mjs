@@ -418,6 +418,35 @@ export async function unshardLauncherStorage({
     });
   }
 
+  // Storage format 7 keeps an archived Convo Memory Bridge original as a file
+  // reference object in lorebook_entries.content. Rewriting the manifest to
+  // format 2 would let a pre-7 build read that object as the memory's text, so
+  // refuse while any such reference remains — still before any write.
+  let archivedOriginals = 0;
+  for (const plan of plans) {
+    if (plan.table !== "lorebook_entries") continue;
+    let rows = plan.rows ?? [];
+    if (plan.mode === "monolith-kept") {
+      for (const path of [plan.monolithPath, `${plan.monolithPath}.bak`]) {
+        try {
+          const parsed = JSON.parse(await readFile(path, "utf8"));
+          rows = Array.isArray(parsed) ? parsed : [];
+          break;
+        } catch {
+          /* missing or unreadable here -> try the .bak, else nothing to inspect */
+        }
+      }
+    }
+    archivedOriginals += rows.filter((row) => row?.content !== null && typeof row?.content === "object").length;
+  }
+  if (archivedOriginals > 0) {
+    throw new Error(
+      `${archivedOriginals} memory original(s) are archived as file references (storage format 7), which older ` +
+        `versions would show as broken text. Restore those archived originals in the current version first, ` +
+        `then re-run unshard. Nothing has been changed.`,
+    );
+  }
+
   // Every read succeeded — now write. The sentinel stays on disk until the
   // whole conversion lands, so an interrupted run resumes under the
   // shards-stay-authoritative rule above instead of aborting or trusting a

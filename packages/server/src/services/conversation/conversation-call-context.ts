@@ -14,7 +14,11 @@ import {
   messages,
   personalExtensionCoordination,
 } from "../../db/schema/index.js";
-import { loadCmbCompressedSourceSpans, resolveCmbCompressionEntries } from "../lorebook/cmb-compression-retrieval.js";
+import {
+  hasActiveCmbCompression,
+  loadCmbCompressedSourceSpans,
+  resolveCmbCompressionEntries,
+} from "../lorebook/cmb-compression-retrieval.js";
 import { lorebookEntryPassesContextFilters } from "../lorebook/keyword-scanner.js";
 import { resolveLorebookScopeExclusions } from "../lorebook/game-lorebook-scope.js";
 import { createLorebooksStorage } from "../storage/lorebooks.storage.js";
@@ -48,7 +52,7 @@ function ids(value: unknown): string[] | null {
 }
 
 /** Configuration authentication and shape validation use the existing CMB host validators. */
-async function loadCmbConfig(db: DB) {
+export async function loadCmbConfig(db: DB) {
   const extensions = await db
     .select()
     .from(installedExtensions)
@@ -96,18 +100,35 @@ async function sourceRestrictions(db: DB, chatId: string, audience: string[], el
   if (entries.length > 2048) return null;
   let metadataChars = 0;
   const relevant = [];
+  // A lost native source has no locator, so its covered room is only known through its ensemble.
+  const missing = [];
   for (const entry of entries) {
     metadataChars += entry.dynamicState.length;
     if (metadataChars > 4 * 1024 * 1024) return null;
     const bridge = record(record(json(entry.dynamicState))?.convoMemoryBridge);
     const source = record(bridge?.source);
     if (source?.kind === "manual") continue;
-    if (source?.kind !== "native-memory-chunk" || !Array.isArray(source.occurrences) || !source.occurrences.length)
-      return null;
+    if (source?.kind !== "native-memory-chunk" || !Array.isArray(source.occurrences)) return null;
+    if (!source.occurrences.length) {
+      // CMB sync records a vanished source chunk as `missing` with no occurrences.
+      if (bridge?.sourceStatus !== "missing") return null;
+      // Visible to this whole audience: there is nothing to hide, wherever its source was.
+      if (
+        eligibleIds.has(entry.id) &&
+        !hasActiveCmbCompression(entry.dynamicState) &&
+        Array.isArray(bridge.unknownToCastIds) &&
+        bridge.unknownToCastIds.length === 0
+      )
+        continue;
+      missing.push(entry);
+      continue;
+    }
     if (source.occurrences.some((occurrence) => record(occurrence)?.chatId === chatId)) relevant.push(entry);
   }
-  if (relevant.length === 0) return [];
-  const spans = await loadCmbCompressedSourceSpans(db, { entries: relevant, sourceChatIds: [chatId] });
+  if (relevant.length === 0 && missing.length === 0) return [];
+  const spans = relevant.length
+    ? await loadCmbCompressedSourceSpans(db, { entries: relevant, sourceChatIds: [chatId] })
+    : [];
   if (spans === null) return null;
   const restrictions: CmbSourceRestriction[] = spans.map((span) => ({
     chatId: span.chatId,
@@ -116,8 +137,17 @@ async function sourceRestrictions(db: DB, chatId: string, audience: string[], el
   }));
   const config = await loadCmbConfig(db);
   if (!config) return null;
+  // Unknown ownership cannot be treated as permission to expose raw source messages.
+  const owned = (entry: { lorebookId: string }) =>
+    config.ensembles.some((ensemble) => ensemble.lorebookId === entry.lorebookId);
+  if (!relevant.every(owned) || !missing.every(owned)) return null;
   for (const ensemble of config.ensembles) {
-    const scoped = relevant.filter((entry) => entry.lorebookId === ensemble.lorebookId);
+    const rooms = [ensemble.rpChatId, ...ensemble.groupConvoChatIds, ...ensemble.members.map((m) => m.dmChatId)];
+    const scoped = [
+      ...relevant.filter((entry) => entry.lorebookId === ensemble.lorebookId),
+      // A lost source can only have covered this ensemble's own rooms; other chats are unaffected.
+      ...(rooms.includes(chatId) ? missing.filter((entry) => entry.lorebookId === ensemble.lorebookId) : []),
+    ];
     if (!scoped.length) continue;
     const resolved = resolveCmbSourceRestrictions(
       scoped.map((entry) => (eligibleIds.has(entry.id) ? entry : { ...entry, enabled: "false" })),
@@ -127,9 +157,6 @@ async function sourceRestrictions(db: DB, chatId: string, audience: string[], el
     if (resolved === null) return null;
     restrictions.push(...resolved);
   }
-  // Unknown ownership cannot be treated as permission to expose raw source messages.
-  if (relevant.some((entry) => !config.ensembles.some((ensemble) => ensemble.lorebookId === entry.lorebookId)))
-    return null;
   return restrictions;
 }
 

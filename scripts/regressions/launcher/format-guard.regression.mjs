@@ -675,6 +675,46 @@ function shardedStorageFixture() {
   }
 }
 
+// ── unshard: archived CMB originals (format 7) block the downgrade before any write ──
+// A pre-7 build would read the file-reference object as the memory's text.
+
+{
+  const dir = shardedStorageFixture();
+  mkdirSync(join(dir, "tables", "lorebook_entries"), { recursive: true });
+  const entry = (id, content) => ({ id, lorebookId: "book", name: id, content, createdAt: "2026-08-08T10:00:00.000Z" });
+  const referenceShapedText = JSON.stringify({ cmbOriginal: 1, sha256: "a".repeat(64), characters: 1, bytes: 3 });
+  writeFileSync(
+    join(dir, "tables", "lorebook_entries", "book.json"),
+    JSON.stringify([
+      entry("plain", referenceShapedText),
+      entry("archived", { cmbOriginal: 1, sha256: "b".repeat(64), characters: 4, bytes: 6 }),
+    ]),
+  );
+  try {
+    await assert.rejects(
+      unshardLauncherStorage({ env: { FILE_STORAGE_DIR: dir }, probeServer: false }),
+      /1 memory original\(s\) are archived/i,
+      "an archived original must be restored before older builds can read the data",
+    );
+    assert.ok(existsSync(join(dir, "tables", "lorebook_entries", "book.json")), "the refused run changed nothing");
+    assert.equal(existsSync(join(dir, "tables", "lorebook_entries.json")), false, "no monolith is written");
+    const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"));
+    assert.equal(manifest.version, 3, "the refused run left the manifest alone");
+    assert.equal(existsSync(join(dir, "tables", ".unshard-in-progress")), false, "no sentinel is left behind");
+
+    // Text that merely looks like a reference is ordinary content and converts normally.
+    writeFileSync(
+      join(dir, "tables", "lorebook_entries", "book.json"),
+      JSON.stringify([entry("plain", referenceShapedText)]),
+    );
+    await unshardLauncherStorage({ env: { FILE_STORAGE_DIR: dir }, probeServer: false });
+    const monolith = JSON.parse(readFileSync(join(dir, "tables", "lorebook_entries.json"), "utf8"));
+    assert.equal(monolith[0].content, referenceShapedText, "string content is carried over unchanged");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // ── Storage-dir mirror: server alias + custom env-file are honored ──
 // getFileStorageDir reads FILE_STORAGE_DIR ?? MARINARA_FILE_STORAGE_DIR, and
 // the env file itself can live wherever MARINARA_ENV_FILE points. A mirror

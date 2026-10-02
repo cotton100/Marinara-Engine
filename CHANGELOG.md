@@ -4,6 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- Anthropic connections keep enabled native tools, including custom webhooks, when a manually entered model is not in the built-in catalog. Optional tuning parameters remain suppressed for unknown models, while tool calls and their results are handled normally without changing the selected model.
+
 - Calls keep today's conversation excerpt when an unrelated CMB memory has lost its source chunk. Only a restricted memory with an unknown source still holds the calls of its own ensemble rooms.
 - Agent Suite rewrite (also used by personal extensions for AI-assisted edits) now answers a failed model call with 502 and the provider's sanitised reason, instead of a bare 500 that hid whether the API key, quota, or endpoint was at fault. A credential the provider echoes back is redacted before the reason is returned or logged.
 - The `unshard` downgrade command now refuses storage that still contains archived CMB originals, instead of letting an older version read their file references as broken memory text. Restore those originals in the current version first; nothing is changed when it refuses.

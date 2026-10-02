@@ -387,8 +387,11 @@ export class AnthropicProvider extends BaseLLMProvider {
   }
 
   async chatComplete(messages: ChatMessage[], options: ChatOptions): Promise<ChatCompletionResult> {
-    if (this.shouldSuppressModelParameters(options) || !options.tools?.length)
-      return super.chatComplete(messages, options);
+    if (!options.tools?.length) return super.chatComplete(messages, options);
+
+    // An unknown model suppresses optional tuning, not the user's enabled tools.
+    // Keep tool_use parsing and tool_result replay on the native-tools path.
+    const suppressModelParameters = this.shouldSuppressModelParameters(options);
 
     const configuredMaxTokens = this.applyMaxTokensCap(options.maxTokens ?? 4096);
     const contextFit = this.fitMessagesToContext(messages, { ...options, maxTokens: configuredMaxTokens });
@@ -428,24 +431,30 @@ export class AnthropicProvider extends BaseLLMProvider {
       messages: applyCacheControlToPayloadMessage(formattedMessages, cacheControlMessageIndex, cacheControl),
       tools: formatAnthropicTools(options.tools),
       stream: useStream,
-      ...(this.shouldSendParameter(options, "temperature") && options.temperature !== undefined
+      ...(!suppressModelParameters &&
+      this.shouldSendParameter(options, "temperature") &&
+      options.temperature !== undefined
         ? { temperature: clampAnthropicTemperature(options.temperature) }
         : {}),
-      ...(this.shouldSendParameter(options, "topK") && options.topK ? { top_k: options.topK } : {}),
-      ...(options.stop?.length ? { stop_sequences: options.stop } : {}),
+      ...(!suppressModelParameters && this.shouldSendParameter(options, "topK") && options.topK
+        ? { top_k: options.topK }
+        : {}),
+      ...(!suppressModelParameters && options.stop?.length ? { stop_sequences: options.stop } : {}),
     };
 
     const modelLower = options.model.toLowerCase();
     const isAdaptiveOnly = isClaudeAdaptiveOnlyNoSamplingModel(options.model);
     const shouldDisableThinking =
+      !suppressModelParameters &&
       this.shouldSendParameter(options, "reasoningEffort") &&
       options.reasoningEffort === "none" &&
       supportsAnthropicThinkingDisable(options.model);
-    if (isAdaptiveOnly) stripAnthropicSamplingParameters(body);
+    if (isAdaptiveOnly && !suppressModelParameters) stripAnthropicSamplingParameters(body);
 
     if (shouldDisableThinking) {
       body.thinking = { type: "disabled" };
     } else if (
+      !suppressModelParameters &&
       this.shouldSendParameter(options, "reasoningEffort") &&
       (options.enableThinking || (isAdaptiveOnly && options.captureReasoning))
     ) {
@@ -466,7 +475,7 @@ export class AnthropicProvider extends BaseLLMProvider {
     }
 
     this.applyCustomParameters(body, options);
-    if (isAdaptiveOnly) {
+    if (isAdaptiveOnly && !suppressModelParameters) {
       stripAnthropicSamplingParameters(body);
       if (
         !shouldDisableThinking &&

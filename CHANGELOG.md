@@ -4,6 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- Individual CMB Roleplay recent context includes at most one permitted saved memory from the responder's own DM, without reading private DM transcripts or bypassing compressed/disabled memories. Current-room CMB fragments no longer compete with external memories in ordinary scans; native history/recall and explicit selections remain available. CMB source/date metadata stays on every selected memory, with common guidance emitted once per budgeted scan. New native memory chunks preserve explicit Conversation speaker labels instead of prepending a conflicting or duplicate turn owner.
+
 - Unavailable default CMB Conversation rooms use localized display text in Roleplay settings.
 
 - Character card history is loaded only when accessed and released from memory after a clean storage flush or idle tick. Original history files, restore, imports and backups are preserved. Opening or changing history still loads the full history table, so this reduces idle memory rather than that operation's peak; `MARINARA_EAGER_STORAGE` retains the previous always-resident behavior.

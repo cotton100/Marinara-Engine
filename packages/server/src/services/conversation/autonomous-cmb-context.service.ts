@@ -24,7 +24,9 @@ import {
 import { computePersonalExtensionHash } from "../extensions/personal-extension-hash.js";
 import { wrapContent } from "../prompt/format-engine.js";
 import { sanitizePromptLeaf } from "../prompt/prompt-escaping.js";
-import { loadCmbCompressedSourceSpans } from "../lorebook/cmb-compression-retrieval.js";
+import { loadCmbCompressedSourceSpans, resolveCmbCompressionEntries } from "../lorebook/cmb-compression-retrieval.js";
+import { withCmbProvenance } from "../lorebook/cmb-provenance.js";
+import { createLorebooksStorage } from "../storage/lorebooks.storage.js";
 import { formatZonedConversationDate, formatZonedConversationTime } from "./timezone.js";
 import {
   isCmbSourceMessageRestricted,
@@ -747,6 +749,82 @@ async function buildCmbRecentContextInner(
   }
   const restrictions = resolveCmbSourceRestrictions(scopedEntries, ensemble, targetCharacterIds);
   if (restrictions === null) return null;
+  // An Individual RP reader gets at most one saved memory from their own DM.
+  // Never read a private DM transcript or promote another member's raw history.
+  let ownDmMemory = "";
+  if (targetRole === "rp" && individualRpTarget && targetCharacterIds.length === 1) {
+    const ownDmId = ensemble.members.find((member) => member.characterId === targetCharacterIds[0])?.dmChatId;
+    if (!ownDmId) return null;
+    const [dm] = await db.select().from(chats).where(eq(chats.id, ownDmId)).limit(2);
+    if (expired()) return null;
+    const dmState = dm ? parseChatState(dm) : null;
+    if (
+      !dm ||
+      dm.mode !== "conversation" ||
+      !dmState ||
+      !sameStringSet(dmState.activeCharacterIds, targetCharacterIds) ||
+      dmState.metadata.crossChatAwareness !== false ||
+      dmState.metadata.sceneStatus != null
+    )
+      return null;
+    const latest = scopedEntries
+      .filter((entry) => entry.enabled === "true")
+      .map((entry) => {
+        let dynamic: unknown;
+        try {
+          dynamic = JSON.parse(entry.dynamicState);
+        } catch {
+          return null;
+        }
+        const bridge = isRecord(dynamic) && isRecord(dynamic.convoMemoryBridge) ? dynamic.convoMemoryBridge : null;
+        const source = bridge && isRecord(bridge.source) ? bridge.source : null;
+        if (
+          !ownDmId ||
+          bridge?.schemaVersion !== 1 ||
+          bridge.sourceStatus === "missing" ||
+          bridge.ambiguousProvenance === true ||
+          source?.kind !== "native-memory-chunk" ||
+          !canonicalIsoTimestamp(source.firstMessageAt) ||
+          !canonicalIsoTimestamp(source.lastMessageAt) ||
+          source.firstMessageAt > source.lastMessageAt ||
+          !Array.isArray(source.occurrences) ||
+          source.occurrences.length === 0 ||
+          source.occurrences.length > 8 ||
+          !source.occurrences.every((value) => isRecord(value) && value.chatRole === "dm" && value.chatId === ownDmId)
+        )
+          return null;
+        return { id: entry.id, at: source.lastMessageAt, source: JSON.stringify(source) };
+      })
+      .filter((value): value is { id: string; at: string; source: string } => value !== null)
+      .sort((a, b) => b.at.localeCompare(a.at) || a.id.localeCompare(b.id))[0];
+    if (latest) {
+      const candidates = await createLorebooksStorage(db).listEligibleEntriesByIds([latest.id], {
+        deferCmbOriginals: true,
+      });
+      if (expired()) return null;
+      const resolved = await resolveCmbCompressionEntries(
+        db,
+        candidates.filter((entry) => {
+          const bridge = entry.dynamicState?.convoMemoryBridge;
+          return isRecord(bridge) && JSON.stringify(bridge.source) === latest.source;
+        }),
+        { audienceCharacterIds: targetCharacterIds },
+      );
+      if (expired()) return null;
+      const memory = resolved[0];
+      if (memory && memory.content.trim()) {
+        const annotated = withCmbProvenance(memory, memory.content);
+        // No silent clipping of a saved memory, nor unbounded prompt growth.
+        if (annotated.length <= 6000)
+          ownDmMemory = wrapContent(
+            "Latest saved memory from your own linked DM. This is not a complete transcript.\n\n" +
+              sanitizePromptLeaf(annotated, wrapFormat),
+            "CMB Recent DM Memory",
+            wrapFormat,
+          );
+      }
+    }
+  }
   const compressedSources = await loadCmbCompressedSourceSpans(db, {
     entries: managedEntries,
     sourceChatIds: sourceDescriptors.map(({ chat }) => chat.id),
@@ -827,16 +905,18 @@ async function buildCmbRecentContextInner(
     if (expired() || sourceMessages === null) return null;
     pendingMessages.push(...sourceMessages);
   }
-  if (pendingMessages.length === 0) return null;
+  if (pendingMessages.length === 0) return ownDmMemory || null;
 
   pendingMessages.sort(
     (left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
   );
   const selected = pendingMessages.slice(-MAX_OUTPUT_MESSAGES);
-  let rendered = renderPendingContext(selected, characterNames, timeZone, wrapFormat);
+  const render = () =>
+    [ownDmMemory, renderPendingContext(selected, characterNames, timeZone, wrapFormat)].filter(Boolean).join("\n\n");
+  let rendered = render();
   while (rendered.length > MAX_CONTEXT_CHARS && selected.length > 1) {
     selected.shift();
-    rendered = renderPendingContext(selected, characterNames, timeZone, wrapFormat);
+    rendered = render();
   }
   return rendered.length > 0 && rendered.length <= MAX_CONTEXT_CHARS ? rendered : null;
 }

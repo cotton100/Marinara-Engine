@@ -27,7 +27,7 @@ import {
   updateTimingStatesForScan,
 } from "./keyword-scanner.js";
 import { applyTokenBudget, processActivatedEntries } from "./prompt-injector.js";
-import { withCmbProvenance } from "./cmb-provenance.js";
+import { isCmbMemoryOnlyFromChat, withCmbProvenance } from "./cmb-provenance.js";
 import { resolveCmbCompressionEntries } from "./cmb-compression-retrieval.js";
 
 export interface LorebookScanResult {
@@ -149,15 +149,18 @@ export async function scopeLorebookScanResultToCharacter(
     generationTriggers,
   });
   const selectedById = new Map(selectedEntries.map((entry) => [entry.id, entry]));
+  let cmbGuidanceIncluded = false;
   const currentResult = {
     ...result,
     activatedEntries: result.activatedEntries.flatMap((activation) => {
       const entry = selectedById.get(activation.id);
       if (!entry) return [];
       if (entry.tag !== "convo-memory-bridge") return [activation];
-      const content = withCmbProvenance(entry, entry.content);
+      const content = withCmbProvenance(entry, entry.content, !cmbGuidanceIncluded);
       // Re-scoping must not silently exceed the budget already accepted upstream.
-      return estimateTextTokens(content) <= estimateTextTokens(activation.content) ? [{ ...activation, content }] : [];
+      if (estimateTextTokens(content) > estimateTextTokens(activation.content)) return [];
+      if (entry.content.trim()) cmbGuidanceIncluded = true;
+      return [{ ...activation, content }];
     }),
   };
 
@@ -567,6 +570,7 @@ type BudgetedLorebookEntrySelection =
 function resolveLorebookResolutionPass(
   candidates: ActivatedEntry[],
   resolveContent?: LorebookFinalContentResolver,
+  cmbGuidanceIncluded = false,
 ): LorebookResolutionPass {
   const entries: ActivatedEntry[] = [];
   const resolutions: LorebookContentResolution[] = [];
@@ -579,9 +583,10 @@ function resolveLorebookResolutionPass(
       rawContent: candidate.rawContent ?? candidate.entry.content,
       entry: {
         ...candidate.entry,
-        content: withCmbProvenance(candidate.entry, resolved.content),
+        content: withCmbProvenance(candidate.entry, resolved.content, !cmbGuidanceIncluded),
       },
     });
+    if (candidate.entry.tag === "convo-memory-bridge" && resolved.content.trim()) cmbGuidanceIncluded = true;
   }
 
   return { entries, resolutions };
@@ -802,9 +807,12 @@ function selectBudgetedLorebookEntryBatch(
   let resolutionPasses = 0;
   let resolvedEntryCount = 0;
   let lastSkippedBudgetEntries: LorebookBudgetSkipCandidate[] = [];
+  const cmbGuidanceIncluded = baseState.selected.some(
+    (candidate) => candidate.entry.tag === "convo-memory-bridge" && candidate.entry.content.trim(),
+  );
 
   for (let passIndex = 0; passIndex < maxPasses; passIndex++) {
-    const pass = resolveLorebookResolutionPass(pool, resolveContent);
+    const pass = resolveLorebookResolutionPass(pool, resolveContent, cmbGuidanceIncluded);
     resolutionPasses += 1;
     resolvedEntryCount += pass.resolutions.length;
     const nextState = cloneLorebookBudgetSelectionState(baseState);
@@ -837,7 +845,7 @@ function selectBudgetedLorebookEntryBatch(
     pool = selectedFromCandidates;
   }
 
-  const pass = resolveLorebookResolutionPass(pool, resolveContent);
+  const pass = resolveLorebookResolutionPass(pool, resolveContent, cmbGuidanceIncluded);
   resolutionPasses += 1;
   resolvedEntryCount += pass.resolutions.length;
   const nextState = cloneLorebookBudgetSelectionState(baseState);
@@ -1176,6 +1184,10 @@ export async function processLorebooks(
     relevantLorebooksById,
   );
   hasCmbCandidates = allEntries.some((entry) => entry.tag === "convo-memory-bridge");
+  // Filter before semantic top-K/budgeting so local chunks cannot crowd out linked-room memories.
+  allEntries = allEntries.filter(
+    (entry) => forcedIds.includes(entry.id) || !isCmbMemoryOnlyFromChat(entry, options?.chatId),
+  );
 
   // Apply per-chat entry state overrides — an entry that was disabled by ephemeral
   // countdown in *this* chat should be excluded, and ephemeral values should

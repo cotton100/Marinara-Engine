@@ -13,7 +13,11 @@ function timestamp(value: unknown): string | null {
 }
 
 /** Prompt-only annotation: never write this back to the entry or its embedding. */
-export function withCmbProvenance(entry: Pick<LorebookEntry, "tag" | "dynamicState">, content: string): string {
+export function withCmbProvenance(
+  entry: Pick<LorebookEntry, "tag" | "dynamicState">,
+  content: string,
+  includeGuidance = true,
+): string {
   if (entry.tag !== "convo-memory-bridge" || !content.trim()) return content;
   const bridge = record(record(entry.dynamicState)?.convoMemoryBridge);
   const source = bridge?.schemaVersion === 1 ? record(bridge.source) : null;
@@ -77,8 +81,34 @@ export function withCmbProvenance(entry: Pick<LorebookEntry, "tag" | "dynamicSta
   return [
     "[CMB memory provenance]",
     ...details,
-    "Record times are not in-world event dates. This is a retrieved fragment, not a complete or necessarily latest history. Do not infer missing dates or events.",
+    ...(includeGuidance
+      ? [
+          "Record times are not in-world event dates. This is a retrieved fragment, not a complete or necessarily latest history. Do not infer missing dates or events.",
+        ]
+      : []),
     "",
     content,
   ].join("\n");
+}
+
+/** CMB transfers between rooms; the current room retains its native history/recall path. */
+export function isCmbMemoryOnlyFromChat(entry: Pick<LorebookEntry, "tag" | "dynamicState">, chatId?: string): boolean {
+  if (!chatId || entry.tag !== "convo-memory-bridge") return false;
+  const bridge = record(record(entry.dynamicState)?.convoMemoryBridge);
+  const source = bridge?.schemaVersion === 1 ? record(bridge.source) : null;
+  return (
+    bridge?.sourceStatus !== "missing" &&
+    bridge?.ambiguousProvenance !== true &&
+    source?.kind === "native-memory-chunk" &&
+    timestamp(source.firstMessageAt) !== null &&
+    timestamp(source.lastMessageAt) !== null &&
+    String(source.firstMessageAt) <= String(source.lastMessageAt) &&
+    Array.isArray(source.occurrences) &&
+    source.occurrences.length > 0 &&
+    source.occurrences.length <= 32 &&
+    source.occurrences.every((value) => {
+      const occurrence = record(value);
+      return occurrence?.chatId === chatId && ["rp", "group", "dm"].includes(String(occurrence.chatRole));
+    })
+  );
 }

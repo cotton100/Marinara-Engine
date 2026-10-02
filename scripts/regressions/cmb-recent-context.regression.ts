@@ -404,6 +404,89 @@ try {
     }
   });
 
+  await check("Individual RP pins only a permitted saved own-DM memory, never a DM transcript", async () => {
+    try {
+      await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, rpId));
+      await managedRow();
+      const [saved] = await db.select().from(lorebookEntries).where(eq(lorebookEntries.id, "managed-entry"));
+      const dynamic = JSON.parse(saved!.dynamicState);
+      dynamic.convoMemoryBridge.source.occurrences[0] = {
+        chatId: members[0]!.dmChatId,
+        chatRole: "dm",
+        chunkId: "chunk",
+        locatorFingerprint: "locator",
+      };
+      const body = "SAVED-OWN-DM";
+      await db
+        .update(lorebookEntries)
+        .set({ content: body, dynamicState: JSON.stringify(dynamic) })
+        .where(eq(lorebookEntries.id, "managed-entry"));
+      const a = await build(rpId, [cast[0]!]);
+      assert.match(a.block!, /SAVED-OWN-DM/u);
+      assert.match(a.block!, /<cmb_recent_dm_memory>/u);
+      assert.match(a.block!, /2026-09-24T00:03:00.000Z/u);
+      assert.doesNotMatch(a.block!, /PRIVATE-DM-A|PRIVATE-DM-B/u);
+      assert.doesNotMatch((await build(rpId, [cast[1]!])).block!, /SAVED-OWN-DM|PRIVATE-DM/u);
+      await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, rpId));
+      assert.doesNotMatch((await build()).block!, /SAVED-OWN-DM|PRIVATE-DM/u);
+      await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, rpId));
+      for (const patch of [
+        { enabled: "false" },
+        { enabled: "true", characterFilterIds: JSON.stringify([cast[1]]) },
+        {
+          characterFilterIds: JSON.stringify(cast),
+          dynamicState: JSON.stringify({
+            ...dynamic,
+            convoMemoryBridge: { ...dynamic.convoMemoryBridge, unknownToCastIds: ["a"] },
+          }),
+        },
+        { dynamicState: JSON.stringify({ ...dynamic, convoMemoryBridgeCompression: { schemaVersion: 2 } }) },
+        { dynamicState: JSON.stringify(dynamic), content: "LARGE".repeat(1400) },
+      ]) {
+        await db.update(lorebookEntries).set(patch).where(eq(lorebookEntries.id, "managed-entry"));
+        assert.doesNotMatch((await build(rpId, [cast[0]!])).block ?? "", /SAVED-OWN-DM|LARGE|PRIVATE-DM/u);
+      }
+      await db
+        .update(lorebookEntries)
+        .set({ content: body, dynamicState: JSON.stringify(dynamic) })
+        .where(eq(lorebookEntries.id, "managed-entry"));
+      await db
+        .update(chats)
+        .set({
+          metadata: JSON.stringify({
+            groupChatMode: "individual",
+            entryStateOverrides: { "managed-entry": { enabled: false } },
+          }),
+        })
+        .where(eq(chats.id, rpId));
+      assert.doesNotMatch((await build(rpId, [cast[0]!])).block!, /SAVED-OWN-DM/u);
+      await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, rpId));
+      await db
+        .update(chats)
+        .set({ characterIds: JSON.stringify(cast) })
+        .where(eq(chats.id, members[0]!.dmChatId));
+      assert.equal((await build(rpId, [cast[0]!])).block, null, "a group mislabeled as the own DM stays closed");
+      await db
+        .update(chats)
+        .set({ characterIds: JSON.stringify([cast[0]]) })
+        .where(eq(chats.id, members[0]!.dmChatId));
+      await setMessages(groups[0]!, [{ content: "x".repeat(1000) }]);
+      await setMessages(groups[1]!, [{ content: "y".repeat(1000) }]);
+      const final = await build(rpId, [cast[0]!]);
+      assert.match(final.block!, /SAVED-OWN-DM/u);
+      assert.ok(final.block!.length <= 12000);
+      const [stored] = await db.select().from(lorebookEntries).where(eq(lorebookEntries.id, "managed-entry"));
+      assert.equal(stored!.content, body, "the prompt read never rewrites the original");
+    } finally {
+      await clearManaged();
+      await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, rpId));
+      await db
+        .update(chats)
+        .set({ characterIds: JSON.stringify([cast[0]]) })
+        .where(eq(chats.id, members[0]!.dmChatId));
+    }
+  });
+
   await check("a message hidden from any audience member stays private", async () => {
     await setMessages(groups[0]!, [
       { content: "VISIBLE-TO-ALL" },

@@ -11,6 +11,7 @@ import { newId, now } from "../utils/id-generator.js";
 import { localEmbed } from "./local-embedder.js";
 import { logger } from "../lib/logger.js";
 import { cmbCompressedSourceOverlaps, loadCmbCompressedSourceSpans } from "./lorebook/cmb-compression-retrieval.js";
+import { normalizeSpeakerName, parseGroupedSpeakerSegments } from "@marinara-engine/shared";
 const isLite = process.env.MARINARA_LITE === "true" || process.env.MARINARA_LITE === "1";
 let warnedUnavailableEmbeddingSource = false;
 
@@ -27,6 +28,25 @@ const SIMILARITY_THRESHOLD = 0.25;
 const DEFAULT_TOP_K = 8;
 export const DEFAULT_LOCAL_MEMORY_EMBEDDING_SPACE_ID = "local:Xenova/all-MiniLM-L6-v2:plain-v1";
 const memoryMutationTails = new Map<string, Promise<void>>();
+
+/** Preserve the same explicit speaker labels the Conversation UI uses. */
+export function formatMemoryTranscriptLine(
+  message: { role: string; characterId: string | null; content: string },
+  nameMap: { userName: string; characterNames: Record<string, string> },
+): string {
+  if (message.role === "assistant") {
+    const knownNames = new Set(Object.values(nameMap.characterNames).map(normalizeSpeakerName));
+    const segments = parseGroupedSpeakerSegments(message.content, knownNames);
+    if (segments?.[0]?.speaker) return message.content;
+  }
+  const name =
+    message.role === "user"
+      ? nameMap.userName
+      : message.role === "narrator" || message.role === "system"
+        ? "Narrator"
+        : ((message.characterId && nameMap.characterNames[message.characterId]) ?? "Character");
+  return `${name}: ${message.content}`;
+}
 
 async function serializeMemoryMutation<T>(chatId: string, task: () => Promise<T>): Promise<T> {
   const previous = memoryMutationTails.get(chatId) ?? Promise.resolve();
@@ -370,15 +390,7 @@ async function chunkAndEmbedMessagesUnlocked(
   const completeCount = Math.floor(unchunked.length / CHUNK_SIZE) * CHUNK_SIZE;
   for (let i = 0; i < completeCount; i += CHUNK_SIZE) {
     const group = unchunked.slice(i, i + CHUNK_SIZE);
-    const lines = group.map((m) => {
-      const name =
-        m.role === "user"
-          ? nameMap.userName
-          : m.role === "narrator" || m.role === "system"
-            ? "Narrator"
-            : ((m.characterId && nameMap.characterNames[m.characterId]) ?? "Character");
-      return `${name}: ${m.content}`;
-    });
+    const lines = group.map((m) => formatMemoryTranscriptLine(m, nameMap));
     chunksToCreate.push({
       content: lines.join("\n\n"),
       messageCount: group.length,

@@ -142,6 +142,22 @@ async function managedRow(
   });
 }
 
+async function setOwnDmMemory(content: string): Promise<void> {
+  await managedRow();
+  const [saved] = await db.select().from(lorebookEntries).where(eq(lorebookEntries.id, "managed-entry"));
+  const dynamic = JSON.parse(saved!.dynamicState);
+  dynamic.convoMemoryBridge.source.occurrences[0] = {
+    chatId: members[0]!.dmChatId,
+    chatRole: "dm",
+    chunkId: "chunk",
+    locatorFingerprint: "locator",
+  };
+  await db
+    .update(lorebookEntries)
+    .set({ content, dynamicState: JSON.stringify(dynamic) })
+    .where(eq(lorebookEntries.id, "managed-entry"));
+}
+
 async function build(
   targetChatId = rpId,
   targetCharacterIds = cast,
@@ -484,6 +500,80 @@ try {
         .update(chats)
         .set({ characterIds: JSON.stringify([cast[0]]) })
         .where(eq(chats.id, members[0]!.dmChatId));
+    }
+  });
+
+  await check("Individual RP pins its own saved DM even with no shared Conversation rooms", async () => {
+    try {
+      await setConfig([]);
+      await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, rpId));
+      await setOwnDmMemory("DM-ONLY-SAVED");
+      assert.match((await build(rpId, [cast[0]!])).block ?? "", /DM-ONLY-SAVED/u);
+      assert.equal((await build(rpId, [cast[1]!])).block, null, "another cast member cannot read the saved DM");
+      const [saved] = await db.select().from(lorebookEntries).where(eq(lorebookEntries.id, "managed-entry"));
+      const dynamic = JSON.parse(saved!.dynamicState);
+      dynamic.convoMemoryBridge.unknownToCastIds = ["a"];
+      await db
+        .update(lorebookEntries)
+        .set({ dynamicState: JSON.stringify(dynamic) })
+        .where(eq(lorebookEntries.id, "managed-entry"));
+      assert.equal((await build(rpId, [cast[0]!])).block, null, "unknownTo stays closed without shared sources");
+      await setOwnDmMemory("DM-ONLY-SAVED");
+      await db
+        .update(chats)
+        .set({ metadata: JSON.stringify({ crossChatAwareness: false, inactiveCharacterIds: [cast[0]] }) })
+        .where(eq(chats.id, members[0]!.dmChatId));
+      assert.equal((await build(rpId, [cast[0]!])).block, null, "inactive DM stays closed without shared sources");
+      await db
+        .update(chats)
+        .set({ metadata: '{"crossChatAwareness":false}' })
+        .where(eq(chats.id, members[0]!.dmChatId));
+      await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, rpId));
+      assert.equal((await build()).block, null, "merged RP cannot promote the private memory");
+    } finally {
+      await clearManaged();
+      await setConfig();
+      await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, rpId));
+      await db
+        .update(chats)
+        .set({ metadata: '{"crossChatAwareness":false}' })
+        .where(eq(chats.id, members[0]!.dmChatId));
+    }
+  });
+
+  await check("Individual RP bounds the final multiline DM block in XML, markdown and none", async () => {
+    try {
+      await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, rpId));
+      await setMessages(groups[0]!, []);
+      await setMessages(groups[1]!, []);
+      const body = "x\n".repeat(2500);
+      await setOwnDmMemory(body);
+      for (const wrapFormat of ["xml", "markdown", "none"] as const) {
+        const result = await buildCmbRecentContext({
+          db,
+          targetChatId: rpId,
+          targetCharacterIds: [cast[0]!],
+          generation: "ordinary",
+          timeZone: "UTC",
+          wrapFormat,
+        });
+        assert.ok(
+          result.block === null || result.block.length <= 12000,
+          "post-wrap bound also applies without raw messages",
+        );
+        if (wrapFormat === "xml") assert.equal(result.block, null, "oversized XML memory is omitted whole");
+        else assert.ok(result.block?.includes(body.trim()), "unexpanded body remains available within the bound");
+      }
+      await setMessages(groups[0]!, [{ content: "SMALL-SHARED-RAW" }]);
+      const raw = await build(rpId, [cast[0]!]);
+      assert.match(raw.block ?? "", /SMALL-SHARED-RAW/u);
+      assert.doesNotMatch(raw.block ?? "", /<cmb_recent_dm_memory>/u);
+      assert.ok(raw.block!.length <= 12000);
+      const [saved] = await db.select().from(lorebookEntries).where(eq(lorebookEntries.id, "managed-entry"));
+      assert.equal(saved!.content, body, "rejecting the prompt block never clips stored memory");
+    } finally {
+      await clearManaged();
+      await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, rpId));
     }
   });
 

@@ -613,7 +613,7 @@ async function buildCmbRecentContextInner(
     ...ensemble.groupConvoChatIds.map((chatId) => ({ chatId, chatRole: "group" as const })),
   ].filter((source) => source.chatId !== targetChatId);
   const sourceIds = sourceSpecs.map((source) => source.chatId);
-  if (sourceIds.length === 0 || sourceIds.length > MAX_MAPPED_SOURCES) return null;
+  if (sourceIds.length > MAX_MAPPED_SOURCES) return null;
   if (new Set(sourceIds).size !== sourceIds.length) return null;
   const dmChatIds = new Set(ensemble.members.map((member) => member.dmChatId));
   if (sourceIds.some((chatId) => dmChatIds.has(chatId))) return null;
@@ -690,7 +690,7 @@ async function buildCmbRecentContextInner(
     }
     sourceDescriptors.push({ chat: sourceChat, sourceIndex, chatRole: source.chatRole });
   }
-  if (sourceDescriptors.length === 0) return null;
+  if (sourceDescriptors.length === 0 && !individualRpTarget) return null;
   sourceDescriptors.sort(
     (a, b) => b.chat.updatedAt.localeCompare(a.chat.updatedAt) || a.chat.id.localeCompare(b.chat.id),
   );
@@ -815,13 +815,15 @@ async function buildCmbRecentContextInner(
       if (memory && memory.content.trim()) {
         const annotated = withCmbProvenance(memory, memory.content);
         // No silent clipping of a saved memory, nor unbounded prompt growth.
-        if (annotated.length <= 6000)
-          ownDmMemory = wrapContent(
+        if (annotated.length <= 6000) {
+          const wrappedMemory = wrapContent(
             "Latest saved memory from your own linked DM. This is not a complete transcript.\n\n" +
               sanitizePromptLeaf(annotated, wrapFormat),
             "CMB Recent DM Memory",
             wrapFormat,
           );
+          if (wrappedMemory.length <= MAX_CONTEXT_CHARS) ownDmMemory = wrappedMemory;
+        }
       }
     }
   }
@@ -905,7 +907,8 @@ async function buildCmbRecentContextInner(
     if (expired() || sourceMessages === null) return null;
     pendingMessages.push(...sourceMessages);
   }
-  if (pendingMessages.length === 0) return ownDmMemory || null;
+  if (pendingMessages.length === 0)
+    return ownDmMemory.length > 0 && ownDmMemory.length <= MAX_CONTEXT_CHARS ? ownDmMemory : null;
 
   pendingMessages.sort(
     (left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),

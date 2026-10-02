@@ -3837,6 +3837,7 @@
   "ui.chat.chatvideolightbox.closeVideo": "Close video",
   "ui.chat.chatvideolightbox.videoPreview": "Video preview",
   "ui.chat.cmbconvoroutes.defaultOoc": "Default OOC room",
+  "ui.chat.cmbconvoroutes.defaultOocUnavailable": "{{room}} · {{reason}}",
   "ui.chat.cmbconvoroutes.enable": "Send between CMB rooms",
   "ui.chat.cmbconvoroutes.enableDescription": "Uses this Roleplay's CMB cast. A character's DM goes to that character's own conversation, OOC goes to the default room below, and a group only gets a message when a character names it. Registered conversations can steer this Roleplay with Influence and Note. Off by default.",
   "ui.chat.cmbconvoroutes.excludedRoom": "Not used: {{room}} ({{reason}})",

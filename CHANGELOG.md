@@ -4,6 +4,10 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- Unavailable default CMB Conversation rooms use localized display text in Roleplay settings.
+
+- Character card history is loaded only when accessed and released from memory after a clean storage flush or idle tick. Original history files, restore, imports and backups are preserved. Opening or changing history still loads the full history table, so this reduces idle memory rather than that operation's peak; `MARINARA_EAGER_STORAGE` retains the previous always-resident behavior.
+
 - Anthropic connections keep enabled native tools, including custom webhooks, when a manually entered model is not in the built-in catalog. Optional tuning parameters remain suppressed for unknown models, while tool calls and their results are handled normally without changing the selected model.
 
 - Calls keep today's conversation excerpt when an unrelated CMB memory has lost its source chunk. Only a restricted memory with an unknown source still holds the calls of its own ensemble rooms.

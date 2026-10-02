@@ -98,7 +98,10 @@ export function CmbConvoRoutesSection({ chatId, nativeLinkedChatId, chatName }: 
             {defaultOocChatId && !validDefault && (
               // The stored room is shown as it is, so "no default room" stays a real choice that clears it.
               <option value={defaultOocChatId} disabled>
-                {`${chatName(defaultOocChatId) ?? defaultOocChatId} · ${reason("default-room-unavailable")}`}
+                {t("ui.chat.cmbconvoroutes.defaultOocUnavailable", {
+                  room: chatName(defaultOocChatId) ?? defaultOocChatId,
+                  reason: reason("default-room-unavailable"),
+                })}
               </option>
             )}
             {view.defaultOocCandidates.map((room) => (

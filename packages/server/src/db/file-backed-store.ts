@@ -585,6 +585,16 @@ const LAZY_UNIT_TABLES: ReadonlySet<string> =
  */
 const LAZY_UNIT_LOAD_ORDER: readonly string[] = [...LAZY_UNIT_TABLES];
 
+// Card history is not a chat unit. Lease the whole table on demand so global
+// version-id uniqueness, imports and misfiled-row recovery keep their existing
+// semantics. ponytail: this removes idle residency, not the peak of opening
+// history; per-character loading needs a separate complete id/stray index.
+const LAZY_HISTORY_TABLE = "character_card_versions";
+const LAZY_TABLES: ReadonlySet<string> = new Set([
+  ...LAZY_UNIT_TABLES,
+  ...(LAZY_UNIT_TABLES.size > 0 ? [LAZY_HISTORY_TABLE] : []),
+]);
+
 /**
  * Whether a table is in the lazy per-chat residency TIER in this process
  * (false for every table under MARINARA_EAGER_STORAGE). This is static tier
@@ -2394,7 +2404,7 @@ class FileTableStore {
    * "emptied by deletes". Any skipped key must then be re-queued as dirty so a
    * later flush resolves it once residency is restored.
    */
-  private fullyResidentTables = new Set<string>(FILE_BACKED_TABLES.filter((table) => !LAZY_UNIT_TABLES.has(table)));
+  private fullyResidentTables = new Set<string>(FILE_BACKED_TABLES.filter((table) => !LAZY_TABLES.has(table)));
   /**
    * Chat units whose shards are resident across every lazy table (#5592
    * Phase 2). A unit loads whole — messages before message_swipes, mirroring
@@ -3440,6 +3450,7 @@ class FileTableStore {
               // that chat's on-disk rows. Preparing here also keeps
               // function-valued column defaults generated exactly once.
               const preparedRows = inputRows.map((input) => prepareInsertRow(meta, input));
+              if (meta.name === LAZY_HISTORY_TABLE) this.ensureTableLoaded(meta.name);
               // Load the destination units BEFORE the duplicate/uniqueness scan
               // (#5592 Phase 2): onConflict matching and assertUniqueRow are
               // only sound against the unit's full row set. A key with no shard
@@ -3750,6 +3761,7 @@ class FileTableStore {
       // swap below, and a failed strict write requeues the merged batch.
       const pendingLazyUnits = new Set<string>();
       for (const [table, keys] of this.strictPendingShards) {
+        if (table === LAZY_HISTORY_TABLE) this.ensureTableLoaded(table);
         if (!LAZY_UNIT_TABLES.has(table) || this.fullyResidentTables.has(table)) continue;
         for (const key of keys) pendingLazyUnits.add(key);
       }
@@ -4128,7 +4140,7 @@ class FileTableStore {
     // an entry here means an unscopable query leased the whole table (#5611).
     const leased = new Set<string>();
     for (const table of this.fullyResidentTables) {
-      if (LAZY_UNIT_TABLES.has(table)) leased.add(table);
+      if (LAZY_TABLES.has(table)) leased.add(table);
     }
     return leased;
   }
@@ -4458,6 +4470,10 @@ class FileTableStore {
    * the table is scanned. Unbounded conditions lease the whole table.
    */
   ensureQueryScopeLoaded(meta: TableMeta, condition: Condition) {
+    if (meta.name === LAZY_HISTORY_TABLE) {
+      this.ensureTableLoaded(meta.name);
+      return;
+    }
     if (!LAZY_UNIT_TABLES.has(meta.name) || this.fullyResidentTables.has(meta.name)) return;
     const scope = this.unitScopeForCondition(meta, condition);
     if (scope === null) {
@@ -4530,7 +4546,7 @@ class FileTableStore {
    */
   ensureTableLoaded(table: Table | string) {
     const meta = getMeta(table);
-    if (!LAZY_UNIT_TABLES.has(meta.name) || this.fullyResidentTables.has(meta.name)) return;
+    if (!LAZY_TABLES.has(meta.name) || this.fullyResidentTables.has(meta.name)) return;
     const discovered = this.lazyDiscoveredShards.get(meta.name);
     if (discovered && discovered.size > 0) {
       // loadShardFileSync's read-once set is the authoritative skip check —
@@ -4662,27 +4678,47 @@ class FileTableStore {
     const residentIds = primaryKey
       ? new Set(resident.map((row) => row[primaryKey]).filter((id) => typeof id === "string"))
       : null;
+    // History is loaded completely before any write. Match eager recovery:
+    // canonical copies win, then the earliest createdAt at equal canonicality.
+    // Chat units retain their resident-wins rule for incremental loads/writes.
+    const historyRowsById =
+      table === LAZY_HISTORY_TABLE && primaryKey
+        ? new Map(resident.map((row) => [String(row[primaryKey]), row]))
+        : null;
     let strayIds = this.strayResidentIds.get(table);
     let strayFoundThisMerge = false;
     const added: Row[] = [];
     const replacements = new Map<string, Row>();
     let duplicateCount = 0;
-    for (const row of incoming) {
+    for (const row of historyRowsById ? [...incoming].sort(compareRowOrder) : incoming) {
       const id = primaryKey && typeof row[primaryKey] === "string" ? (row[primaryKey] as string) : null;
       const isCanonical = encodeShardKey(this.shardKeyForRow(table, row)) === sourceEncoded;
       if (id && residentIds) {
         if (residentIds.has(id)) {
-          if (isCanonical && strayIds?.has(id)) {
-            // The resident copy is a stray from a foreign file; the canonical
-            // file's copy wins, mirroring the eager loader's dedup rule.
+          const keptHistory = historyRowsById?.get(id);
+          const earlierHistory =
+            keptHistory && isCanonical === !strayIds?.has(id) && compareRowOrder(row, keptHistory) < 0;
+          if ((isCanonical && strayIds?.has(id)) || earlierHistory) {
+            // Canonical beats stray; a cold full-history load also keeps the
+            // eager loader's sort-first copy when canonicality is equal.
             replacements.set(id, row);
-            strayIds.delete(id);
+            if (isCanonical) strayIds?.delete(id);
+            if (historyRowsById && keptHistory) {
+              historyRowsById.set(id, row);
+              duplicateCount++;
+              const loserKey = this.shardKeyForRow(table, keptHistory);
+              const dirtyKeys = this.dirtyShards.get(table) ?? new Set<string>();
+              dirtyKeys.add(loserKey);
+              this.dirtyShards.set(table, dirtyKeys);
+              this.recordLoadHealMarks(table, [loserKey]);
+            }
           } else {
             duplicateCount += 1;
           }
           continue;
         }
         residentIds.add(id);
+        historyRowsById?.set(id, row);
         if (!isCanonical) {
           strayFoundThisMerge = true;
           // One Set per table, reused across the whole merge: allocating a
@@ -4720,7 +4756,7 @@ class FileTableStore {
     // table-wide stray set here would let a single misfiled row pin every
     // unit loaded afterwards, silently disabling the eviction cap on the
     // corrupt installs it most needs to protect.
-    if (duplicateCount > 0 || replacements.size > 0 || strayFoundThisMerge) {
+    if (LAZY_UNIT_TABLES.has(table) && (duplicateCount > 0 || replacements.size > 0 || strayFoundThisMerge)) {
       for (const key of keys) {
         if (!this.pinnedUnits.has(key)) {
           this.pinnedUnits.add(key);
@@ -4732,12 +4768,15 @@ class FileTableStore {
       }
     }
     if (added.length === 0 && replacements.size === 0) return keys;
-    const compareRows = compareRowOrder;
+    const compareRows = (a: Row, b: Row) =>
+      compareRowOrder(a, b) ||
+      (historyRowsById && primaryKey ? String(a[primaryKey]).localeCompare(String(b[primaryKey])) : 0);
     const swapReplaced = (row: Row) => {
       const id = primaryKey && typeof row[primaryKey] === "string" ? (row[primaryKey] as string) : null;
       return (id && replacements.get(id)) || row;
     };
-    const merged = resident.map(swapReplaced).concat(added).sort(compareRows);
+    const additions = historyRowsById ? added.map(swapReplaced) : added;
+    const merged = resident.map(swapReplaced).concat(additions).sort(compareRows);
     this.tables.set(table, merged);
     const ctx = this.loadEffectTransactionContext();
     const snapshot = ctx?.snapshots.get(table);
@@ -4748,7 +4787,7 @@ class FileTableStore {
       // call argument, which overflows the call stack past ~100k rows — and
       // that throw landed AFTER the length = 0 truncation, leaving an empty
       // rollback snapshot that a later rollback installed as the live table.
-      const mirrored = snapshot.map(swapReplaced).concat(added).sort(compareRows);
+      const mirrored = snapshot.map(swapReplaced).concat(additions).sort(compareRows);
       snapshot.length = 0;
       for (const row of mirrored) snapshot.push(row);
     }
@@ -4796,10 +4835,25 @@ class FileTableStore {
    * scope-resolvable conjunct), never to data loss.
    */
   private maybeEvictUnits() {
-    if (LAZY_UNIT_TABLES.size === 0 || this.writesClosed) return;
+    if (LAZY_TABLES.size === 0 || this.writesClosed) return;
+    if (this.activeFlush || this.activeTransactionCount > 0 || this.txContext.getStore()) return;
+    // History uses a full-table lease, independent of the chat LRU/cap. Only
+    // drop clean rows at this no-writer boundary; captured query/export arrays
+    // remain valid. A later strict barrier reloads best-effort pending shards.
+    if (
+      this.fullyResidentTables.has(LAZY_HISTORY_TABLE) &&
+      !this.dirtyTables.has(LAZY_HISTORY_TABLE) &&
+      !this.dirtyShards.get(LAZY_HISTORY_TABLE)?.size &&
+      !this.staleShardFiles.get(LAZY_HISTORY_TABLE)?.size &&
+      this.backupRecoveredPaths.size === 0
+    ) {
+      this.fullyResidentTables.delete(LAZY_HISTORY_TABLE);
+      this.tables.set(LAZY_HISTORY_TABLE, []);
+      this.loadedShardEncodings.delete(LAZY_HISTORY_TABLE);
+      this.strayResidentIds.delete(LAZY_HISTORY_TABLE);
+    }
     const cap = getMaxResidentChatUnits();
     if (cap === 0) return;
-    if (this.activeFlush || this.activeTransactionCount > 0 || this.txContext.getStore()) return;
     // A global scan only loads this TABLE, not complete chat units. Release
     // its clean excess without falsely adding those units to loadedUnits.
     // Captured query/export arrays stay intact: rows and arrays are replaced,
@@ -5226,9 +5280,10 @@ class FileTableStore {
         /* no shard dir yet — fresh install or pre-migration */
       }
       const dataFiles = discoverShardPrimaries(entries);
-      if (LAZY_UNIT_TABLES.has(table)) {
+      if (LAZY_TABLES.has(table)) {
         // Lazy tier (#5592 Phase 2): boot DISCOVERS shards without loading
-        // them. Rows enter memory per chat unit on first touch, through the
+        // them. Rows enter memory per chat unit (or a full history lease)
+        // on first touch, through the
         // same per-file recovery pipeline the eager path runs below — which
         // is also when self-heal marks are recorded, since a boot-time dirty
         // key for a unit that is not resident could never flush safely.
@@ -5485,7 +5540,7 @@ class FileTableStore {
         // Lazy tables have no boot row count to compare (#5592 Phase 2) —
         // their manifest entry is either the harvested message-index size or
         // absent, and either way the diagnostic is meaningless here.
-        if (LAZY_UNIT_TABLES.has(table)) return [];
+        if (LAZY_TABLES.has(table)) return [];
         const declared = declaredTableCounts?.[table];
         const actual = counts[table] ?? 0;
         if (declared === undefined && actual === 0) return [];
@@ -5582,7 +5637,7 @@ class FileTableStore {
       // discovery was boot-only, which was invisible while units never
       // unloaded — but an EVICTED unit reloads through this index, and a
       // chat created after boot would otherwise reload permanently empty.
-      if (LAZY_UNIT_TABLES.has(table)) {
+      if (LAZY_TABLES.has(table)) {
         const discovered = this.lazyDiscoveredShards.get(table) ?? new Set<string>();
         discovered.add(encoded);
         this.lazyDiscoveredShards.set(table, discovered);
@@ -5639,7 +5694,7 @@ class FileTableStore {
       // cycle and turn finishClose's drain-until-clean loop into a shutdown
       // hang. The next flush from any real cause re-captures the key via the
       // dirtyShards swap; dropping it at process exit loses nothing.
-      if (!this.fullyResidentTables.has(table) && !this.loadedUnits.has(key)) {
+      if (!this.fullyResidentTables.has(table) && !(LAZY_UNIT_TABLES.has(table) && this.loadedUnits.has(key))) {
         logger.warn(
           { table, shardKey: key },
           "[file-storage] Dirty shard key belongs to an unloaded unit; deferring its flush until the unit loads.",
@@ -5711,7 +5766,7 @@ class FileTableStore {
 
     for (const table of FILE_BACKED_TABLES) {
       const rows = this.rows(table);
-      if (LAZY_UNIT_TABLES.has(table) && !this.fullyResidentTables.has(table)) {
+      if (LAZY_TABLES.has(table) && !this.fullyResidentTables.has(table)) {
         // Partial residency makes rows.length a lie (#5592 Phase 2). The
         // messages count is recoverable from the complete shard index; the
         // other lazy tables' totals are simply unknown and stay out of the

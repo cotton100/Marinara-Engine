@@ -119,25 +119,19 @@ export function cmbSourceRoom(entry: Pick<LorebookEntry, "tag" | "dynamicState">
     : null;
 }
 
-/** Only generated provenance headers, never history or a memory's body. */
-export function dedupeCmbProvenanceGuidance(
-  messages: Array<{ role: string; content: string; contextKind?: string }>,
-): void {
-  let included = false;
-  for (const message of messages) {
-    if (message.role !== "system" || message.contextKind === "history") continue;
-    message.content = message.content.replace(
-      /(\[CMB memory provenance\]\r?\n)((?:[ \t]*(?:Source message record time|Recorded source room\(s\)|Multiple recorded occurrences|Source room|Source:|Memory record|Original source is marked missing|Source attribution is marked ambiguous)[^\r\n]*\r?\n){1,8})([ \t]*Record times[^\r\n]*)(\r?\n[ \t]*\r?\n)/gu,
-      (whole, header: string, details: string, guidance: string, gap: string) => {
-        if (guidance.trim() !== CMB_PROVENANCE_GUIDANCE) return whole;
-        if (!included) {
-          included = true;
-          return whole;
-        }
-        return header + details + gap.slice(gap.indexOf("\n") + 1);
-      },
-    );
-  }
+/** Select a separately rendered variant; never remove matching text from any prompt body. */
+export function selectCmbRecentContextGuidance(
+  result: { block: string | null; blockWithoutProvenanceGuidance?: string },
+  messages: ReadonlyArray<{ role: string; content: string; contextKind?: string }>,
+): string | null {
+  if (!result.block) return null;
+  const included = messages.some(
+    (message) =>
+      message.role === "system" &&
+      message.contextKind !== "history" &&
+      message.content.includes(CMB_PROVENANCE_GUIDANCE),
+  );
+  return included ? (result.blockWithoutProvenanceGuidance ?? result.block) : result.block;
 }
 
 /** CMB transfers between rooms; the current room retains its native history/recall path. */

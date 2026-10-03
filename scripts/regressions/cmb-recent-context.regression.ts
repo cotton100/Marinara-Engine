@@ -441,6 +441,12 @@ try {
       assert.match(a.block!, /SAVED-OWN-DM/u);
       assert.match(a.block!, /<cmb_recent_dm_memory>/u);
       assert.match(a.block!, /2026-09-24T00:03:00.000Z/u);
+      assert.ok(a.blockWithoutProvenanceGuidance?.includes(body));
+      assert.ok(!a.blockWithoutProvenanceGuidance?.includes("Record times are not in-world event dates."));
+      assert.equal(
+        a.block!.replace(/^[ \t]*Record times are not in-world event dates[^\n]*\n/mu, ""),
+        a.blockWithoutProvenanceGuidance,
+      );
       assert.doesNotMatch(a.block!, /PRIVATE-DM-A|PRIVATE-DM-B/u);
       assert.doesNotMatch((await build(rpId, [cast[1]!])).block!, /SAVED-OWN-DM|PRIVATE-DM/u);
       await db.update(chats).set({ metadata: '{"groupChatMode":"merged"}' }).where(eq(chats.id, rpId));
@@ -508,7 +514,13 @@ try {
       await setConfig([]);
       await db.update(chats).set({ metadata: '{"groupChatMode":"individual"}' }).where(eq(chats.id, rpId));
       await setOwnDmMemory("DM-ONLY-SAVED");
-      assert.match((await build(rpId, [cast[0]!])).block ?? "", /DM-ONLY-SAVED/u);
+      const dmOnly = await build(rpId, [cast[0]!]);
+      assert.match(dmOnly.block ?? "", /DM-ONLY-SAVED/u);
+      assert.match(dmOnly.blockWithoutProvenanceGuidance ?? "", /DM-ONLY-SAVED/u);
+      assert.equal(
+        dmOnly.block!.replace(/^[ \t]*Record times are not in-world event dates[^\n]*\n/mu, ""),
+        dmOnly.blockWithoutProvenanceGuidance,
+      );
       assert.equal((await build(rpId, [cast[1]!])).block, null, "another cast member cannot read the saved DM");
       const [saved] = await db.select().from(lorebookEntries).where(eq(lorebookEntries.id, "managed-entry"));
       const dynamic = JSON.parse(saved!.dynamicState);

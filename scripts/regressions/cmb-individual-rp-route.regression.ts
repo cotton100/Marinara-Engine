@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import ts from "../../packages/server/node_modules/typescript/lib/typescript.js";
+import { selectCmbRecentContextGuidance } from "../../packages/server/src/services/lorebook/cmb-provenance.js";
 
 type Fixture = {
   chatMode?: string;
@@ -46,7 +47,7 @@ function routeSlice(source: string) {
   assert.ok(injection.getEnd() < variable("preparedMessagesForGen").getStart(file), "injection precedes provider prep");
   assert.equal(
     block.initializer!.getText(file).replace(/\s+/gu, ""),
-    "awaitgetIndividualRpCmbContextBlock(targetCharId,speaksOnlyTargetCharacter,)",
+    "awaitgetIndividualRpCmbContextBlock(targetCharId,speaksOnlyTargetCharacter,gameAwareMessagesForGen,)",
     "use the actual provider target and its single-speaker boundary",
   );
   const followUp = nodes.find((node): node is ts.WhileStatement => ts.isWhileStatement(node));
@@ -89,11 +90,11 @@ function routeSlice(source: string) {
     })();`,
     { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } },
   ).outputText;
-  const run = new Function("fixture", script);
+  const run = new Function("fixture", "selectCmbRecentContextGuidance", script);
   const mutate = (node: ts.Node, text: string) =>
     source.slice(0, node.getStart(file)) + text + source.slice(node.getEnd());
   return {
-    run: (fixture: Fixture = {}) => run(fixture),
+    run: (fixture: Fixture = {}) => run(fixture, selectCmbRecentContextGuidance),
     mutations: {
       sharedPrefetch: mutate(
         promise.initializer!,

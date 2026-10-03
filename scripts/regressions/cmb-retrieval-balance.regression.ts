@@ -8,7 +8,7 @@ import { resolveAndBudgetActivatedLorebookEntries } from "../../packages/server/
 import {
   cmbSourceRoom,
   CMB_PROVENANCE_GUIDANCE,
-  dedupeCmbProvenanceGuidance,
+  selectCmbRecentContextGuidance,
   withCmbProvenance,
 } from "../../packages/server/src/services/lorebook/cmb-provenance.js";
 import { wrapContent } from "../../packages/server/src/services/prompt/format-engine.js";
@@ -152,50 +152,47 @@ for (const source of [
 const guidanceCount = (value: string) => value.split(CMB_PROVENANCE_GUIDANCE).length - 1;
 for (const format of ["none", "xml", "markdown"] as const) {
   const lore = wrapContent(withCmbProvenance(group[0]!, "Group body."), "World Info", format);
-  const recent = wrapContent(withCmbProvenance(dm[0]!, "DM body."), "CMB Recent DM Memory", format);
-  const messages = [
-    { role: "assistant", contextKind: "history", content: lore },
-    { role: "system", content: lore },
-    { role: "system", content: recent },
-  ];
-  dedupeCmbProvenanceGuidance(messages);
-  assert.equal(messages[0]!.content, lore, "historical assistant text remains verbatim");
-  assert.equal(
-    guidanceCount(
-      messages
-        .slice(1)
-        .map((a) => a.content)
-        .join("\n"),
-    ),
-    1,
-  );
-  assert.ok(messages[2]!.content.includes(at) && messages[2]!.content.includes('dm chat ID "dm"'));
-  assert.ok(messages[2]!.content.includes("DM body."));
-  const once = JSON.stringify(messages);
-  dedupeCmbProvenanceGuidance(messages);
-  assert.equal(JSON.stringify(messages), once);
-  const dmOnly = [{ role: "system", content: recent }];
-  dedupeCmbProvenanceGuidance(dmOnly);
-  assert.equal(dmOnly[0]!.content, recent, "DM keeps guidance when general lore has no permitted selection");
-  const merged = [{ role: "system", content: lore + "\n\n" + recent }];
-  dedupeCmbProvenanceGuidance(merged);
-  assert.equal(guidanceCount(merged[0]!.content), 1);
+  // Include a complete generated-looking header inside authored content, not only its guideline.
+  for (const body of ["DM body.", CMB_PROVENANCE_GUIDANCE, withCmbProvenance(group[0]!, "Quoted original fragment.")]) {
+    const recent = {
+      block: wrapContent(withCmbProvenance(dm[0]!, body), "CMB Recent DM Memory", format),
+      blockWithoutProvenanceGuidance: wrapContent(
+        withCmbProvenance(dm[0]!, body, false),
+        "CMB Recent DM Memory",
+        format,
+      ),
+    };
+    const messages = [
+      { role: "system", content: lore },
+      { role: "assistant", contextKind: "history", content: lore },
+    ];
+    const before = JSON.stringify({ recent, messages });
+    const selected = selectCmbRecentContextGuidance(recent, messages)!;
+    assert.equal(selected, recent.blockWithoutProvenanceGuidance);
+    assert.equal(
+      guidanceCount(lore + selected),
+      1 + guidanceCount(body),
+      "only the newly generated instruction is omitted",
+    );
+    assert.equal(selectCmbRecentContextGuidance(recent, []), recent.block, "DM-only retains its instruction");
+    for (const role of ["assistant", "user", "system"]) {
+      assert.equal(
+        selectCmbRecentContextGuidance(recent, [{ role, contextKind: "history", content: lore }]),
+        recent.block,
+      );
+    }
+    assert.equal(JSON.stringify({ recent, messages }), before, "all bodies and histories are immutable");
+  }
 }
-const quoted = [
-  { role: "system", content: CMB_PROVENANCE_GUIDANCE },
-  { role: "system", content: withCmbProvenance(group[0]!, CMB_PROVENANCE_GUIDANCE) },
-  { role: "system", content: withCmbProvenance(dm[0]!, "body") },
-];
-dedupeCmbProvenanceGuidance(quoted);
 assert.equal(
-  guidanceCount(quoted.map((a) => a.content).join("\n")),
-  3,
-  "only header instructions are deduplicated, not matching leaf text",
+  selectCmbRecentContextGuidance({ block: null, blockWithoutProvenanceGuidance: "stale" }, [
+    { role: "system", content: CMB_PROVENANCE_GUIDANCE },
+  ]),
+  null,
 );
 const route = readFileSync(new URL("../../packages/server/src/routes/generate.routes.ts", import.meta.url), "utf8");
-const dedupeAt = route.indexOf("dedupeCmbProvenanceGuidance(preparedMessagesForGen)");
+const dedupeAt = route.indexOf("const individualRpCmbContextBlock = await");
 assert.ok(dedupeAt > route.indexOf("const scopedLorebookScan = await scopedScanPromise"));
-assert.ok(dedupeAt > route.indexOf("const individualRpCmbContextBlock = await"));
 assert.ok(dedupeAt < route.indexOf("const toProviderMessages ="));
 console.info(
   "CMB search balance: configured limits, relevant/visible candidates, ordinary lore, budgets and per-responder single guidance PASS",

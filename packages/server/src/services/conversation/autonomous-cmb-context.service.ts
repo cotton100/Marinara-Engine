@@ -143,6 +143,8 @@ export type CmbRecentContextInput = Omit<AutonomousCmbPendingContextInput, "targ
 
 export type CmbRecentContextResult = {
   block: string | null;
+  /** Same accepted content/budget, omitting only our newly generated DM instruction. */
+  blockWithoutProvenanceGuidance?: string;
   /** Unavailable is not permission to fall back to an unfiltered native RP transcript. */
   scope: "unavailable" | "unmanaged" | "managed";
   rpChatId: string | null;
@@ -752,6 +754,7 @@ async function buildCmbRecentContextInner(
   // An Individual RP reader gets at most one saved memory from their own DM.
   // Never read a private DM transcript or promote another member's raw history.
   let ownDmMemory = "";
+  let ownDmMemoryWithoutGuidance = "";
   if (targetRole === "rp" && individualRpTarget && targetCharacterIds.length === 1) {
     const ownDmId = ensemble.members.find((member) => member.characterId === targetCharacterIds[0])?.dmChatId;
     if (!ownDmId) return null;
@@ -822,7 +825,15 @@ async function buildCmbRecentContextInner(
             "CMB Recent DM Memory",
             wrapFormat,
           );
-          if (wrappedMemory.length <= MAX_CONTEXT_CHARS) ownDmMemory = wrappedMemory;
+          if (wrappedMemory.length <= MAX_CONTEXT_CHARS) {
+            ownDmMemory = wrappedMemory;
+            ownDmMemoryWithoutGuidance = wrapContent(
+              "Latest saved memory from your own linked DM. This is not a complete transcript.\n\n" +
+                sanitizePromptLeaf(withCmbProvenance(memory, memory.content, false), wrapFormat),
+              "CMB Recent DM Memory",
+              wrapFormat,
+            );
+          }
         }
       }
     }
@@ -907,8 +918,11 @@ async function buildCmbRecentContextInner(
     if (expired() || sourceMessages === null) return null;
     pendingMessages.push(...sourceMessages);
   }
-  if (pendingMessages.length === 0)
-    return ownDmMemory.length > 0 && ownDmMemory.length <= MAX_CONTEXT_CHARS ? ownDmMemory : null;
+  if (pendingMessages.length === 0) {
+    if (!ownDmMemory || ownDmMemory.length > MAX_CONTEXT_CHARS) return null;
+    result.blockWithoutProvenanceGuidance = ownDmMemoryWithoutGuidance;
+    return ownDmMemory;
+  }
 
   pendingMessages.sort(
     (left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
@@ -921,7 +935,14 @@ async function buildCmbRecentContextInner(
     selected.shift();
     rendered = render();
   }
-  return rendered.length > 0 && rendered.length <= MAX_CONTEXT_CHARS ? rendered : null;
+  if (!rendered || rendered.length > MAX_CONTEXT_CHARS) return null;
+  result.blockWithoutProvenanceGuidance = [
+    ownDmMemoryWithoutGuidance,
+    renderPendingContext(selected, characterNames, timeZone, wrapFormat),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  return rendered;
 }
 
 /**

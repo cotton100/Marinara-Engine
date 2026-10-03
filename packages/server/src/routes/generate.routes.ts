@@ -2,7 +2,7 @@ import { registerSequentialGameTasks } from "../services/game/sequential-tasks.j
 import { createAdvancedMemoryService, selectAdvancedMemoryMessages } from "../services/advanced-memory.js";
 import { prepareAdvancedMemoryContext } from "../services/generation/advanced-memory-context.js";
 import { measureContextBudget } from "../services/llm/base-provider.js";
-import { dedupeCmbProvenanceGuidance } from "../services/lorebook/cmb-provenance.js";
+import { selectCmbRecentContextGuidance } from "../services/lorebook/cmb-provenance.js";
 import {
   resolveAdvancedMemoryPrompt,
   createAdvancedMemoryPlacement,
@@ -2385,6 +2385,7 @@ export async function generateRoutes(app: FastifyInstance) {
       const getIndividualRpCmbContextBlock = async (
         targetCharId: string | null,
         speaksOnlyTargetCharacter: boolean,
+        promptMessages: GenerationPromptMessage[],
       ): Promise<string | null> => {
         if (!targetCharId || !speaksOnlyTargetCharacter || !ordinaryCmbIndividualRoleplay) return null;
         const audienceStillMatches = () =>
@@ -2407,7 +2408,7 @@ export async function generateRoutes(app: FastifyInstance) {
           individualRpCmbContexts.set(targetCharId, pending);
         }
         const result = await pending;
-        return audienceStillMatches() ? result.block : null;
+        return audienceStillMatches() ? selectCmbRecentContextGuidance(result, promptMessages) : null;
       };
 
       let groupHistoryCharacterNamesByIdPromise: Promise<Map<string, string>> | null = null;
@@ -6876,20 +6877,6 @@ export async function generateRoutes(app: FastifyInstance) {
           // and a merged generation that may voice several characters at once
           // stays on the hand-free spectator view.
           let gameAwareMessagesForGen = await prepareConversationLorebookForResponder(targetCharId, messagesForGen);
-          const individualRpCmbContextBlock = await getIndividualRpCmbContextBlock(
-            targetCharId,
-            speaksOnlyTargetCharacter,
-          );
-          if (individualRpCmbContextBlock) {
-            gameAwareMessagesForGen = [...gameAwareMessagesForGen];
-            const firstUserIdx = gameAwareMessagesForGen.findIndex(
-              (message) => message.role === "user" || message.role === "assistant",
-            );
-            gameAwareMessagesForGen.splice(firstUserIdx >= 0 ? firstUserIdx : gameAwareMessagesForGen.length, 0, {
-              role: "system",
-              content: individualRpCmbContextBlock,
-            });
-          }
           if (conversationScopesAwarenessToResponder && targetCharId) {
             let responderAwarenessBlock: string | null = null;
             if (conversationCrossChatAwarenessEnabled && !input.regenerateMessageId) {
@@ -6984,6 +6971,23 @@ export async function generateRoutes(app: FastifyInstance) {
               lorebookPromptScanResult,
               currentLorebookScan,
             );
+          }
+          // Decide after the actual audience's lore is selected. Choose the pre-rendered DM
+          // variant instead of searching/removing text in user-authored memory or history.
+          const individualRpCmbContextBlock = await getIndividualRpCmbContextBlock(
+            targetCharId,
+            speaksOnlyTargetCharacter,
+            gameAwareMessagesForGen,
+          );
+          if (individualRpCmbContextBlock) {
+            gameAwareMessagesForGen = [...gameAwareMessagesForGen];
+            const firstUserIdx = gameAwareMessagesForGen.findIndex(
+              (message) => message.role === "user" || message.role === "assistant",
+            );
+            gameAwareMessagesForGen.splice(firstUserIdx >= 0 ? firstUserIdx : gameAwareMessagesForGen.length, 0, {
+              role: "system",
+              content: individualRpCmbContextBlock,
+            });
           }
           setCmbPromptMemories(audienceCharacterIds, currentPromptLorebookScan?.activatedEntries ?? []);
           const targetContextBlock = targetCharId
@@ -7087,9 +7091,6 @@ export async function generateRoutes(app: FastifyInstance) {
             }
           }
           dedupeLastMessageWrappers(preparedMessagesForGen);
-          // After per-speaker filtering, keep one common instruction across
-          // ordinary lore and the responder's recent DM supplement.
-          dedupeCmbProvenanceGuidance(preparedMessagesForGen);
           if (
             deferCharacterMacros &&
             preparedMessagesForGen.some((message) => hasDeferredCharacterMacros(message.content))

@@ -29,16 +29,22 @@ const DEFAULT_TOP_K = 8;
 export const DEFAULT_LOCAL_MEMORY_EMBEDDING_SPACE_ID = "local:Xenova/all-MiniLM-L6-v2:plain-v1";
 const memoryMutationTails = new Map<string, Promise<void>>();
 
+/** Shared by native memory chunks and the compact CMB tail; do not duplicate bodies on the wire. */
+export function hasMemorySpeakerLabel(
+  message: { role: string; content: string },
+  characterNames: Record<string, string>,
+): boolean {
+  if (message.role !== "assistant") return false;
+  const knownNames = new Set(Object.values(characterNames).map(normalizeSpeakerName));
+  return Boolean(parseGroupedSpeakerSegments(message.content, knownNames)?.[0]?.speaker);
+}
+
 /** Preserve the same explicit speaker labels the Conversation UI uses. */
 export function formatMemoryTranscriptLine(
   message: { role: string; characterId: string | null; content: string },
   nameMap: { userName: string; characterNames: Record<string, string> },
 ): string {
-  if (message.role === "assistant") {
-    const knownNames = new Set(Object.values(nameMap.characterNames).map(normalizeSpeakerName));
-    const segments = parseGroupedSpeakerSegments(message.content, knownNames);
-    if (segments?.[0]?.speaker) return message.content;
-  }
+  if (hasMemorySpeakerLabel(message, nameMap.characterNames)) return message.content;
   const name =
     message.role === "user"
       ? nameMap.userName

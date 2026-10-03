@@ -103,7 +103,7 @@ import {
   resolveCmbRoleplayRoutes,
 } from "../services/conversation/cmb-convo-routes.js";
 import { clearChatActivity, recordUserReaction } from "../services/conversation/autonomous.service.js";
-import { rebuildMemoryChunks } from "../services/memory-recall.js";
+import { hasMemorySpeakerLabel, rebuildMemoryChunks } from "../services/memory-recall.js";
 import { createAdvancedMemoryService } from "../services/advanced-memory.js";
 import { copyAdvancedMemoryRecords, remapAdvancedMemoryMetadata } from "../services/advanced-memory-transfer.js";
 import { forwardPromptPreview } from "./generate/prompt-preview.js";
@@ -2099,7 +2099,21 @@ export async function chatsRoutes(app: FastifyInstance) {
     ) {
       return reply.status(400).send({ error: "limit must be an integer between 1 and 250" });
     }
-    return storage.listMessageTail(req.params.id, limit);
+    const tail = await storage.listMessageTail(req.params.id, limit);
+    if (!tail.some((message) => message.role === "assistant")) return tail;
+    const chat = await storage.getById(req.params.id);
+    const roster = chat ? JSON.parse(chat.characterIds) : [];
+    const ids = [...new Set([...roster, ...tail.map((message) => message.characterId)].filter(Boolean))] as string[];
+    const rows = await createCharactersStorage(app.db).getByIds(ids);
+    const characterNames: Record<string, string> = {};
+    for (const row of rows) {
+      const data = parseExtra(row.data);
+      if (typeof data.name === "string" && data.name.trim()) characterNames[row.id] = data.name;
+    }
+    return tail.map((message) => ({
+      ...message,
+      memorySpeakerLabeled: hasMemorySpeakerLabel(message, characterNames),
+    }));
   });
 
   // Total message count for a chat (lightweight, for absolute numbering)
@@ -2128,6 +2142,7 @@ export async function chatsRoutes(app: FastifyInstance) {
         createdAt: memoryChunks.createdAt,
       })
       .from(memoryChunks)
+      .tableOnly()
       .where(eq(memoryChunks.chatId, req.params.id))
       .orderBy(desc(memoryChunks.lastMessageAt));
 

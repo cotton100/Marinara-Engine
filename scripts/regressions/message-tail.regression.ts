@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Fastify from "../../packages/server/node_modules/fastify/fastify.js";
 import { createFileNativeDB } from "../../packages/server/src/db/file-backed-store.js";
-import { chats, messages } from "../../packages/server/src/db/schema/index.js";
+import { characters, chats, messages } from "../../packages/server/src/db/schema/index.js";
 import { chatsRoutes } from "../../packages/server/src/routes/chats.routes.js";
 
 const storageDir = mkdtempSync(join(tmpdir(), "marinara-message-tail-"));
@@ -40,10 +40,11 @@ try {
   assert.equal(defaultTail.at(-1).id, "tail-250", "the bounded tail ends at the newest tied row");
   assert.deepEqual(
     Object.keys(defaultTail[0]).sort(),
-    ["characterId", "chatId", "content", "createdAt", "id", "role"],
-    "message-tail exposes only its six-field contract",
+    ["characterId", "chatId", "content", "createdAt", "id", "memorySpeakerLabeled", "role"],
+    "message-tail exposes only its compact fields and an additive speaker flag",
   );
   assert.equal(defaultResponse.body.includes("unusedLargeField"), false, "message metadata must not leak");
+  assert.equal(defaultTail[0].memorySpeakerLabeled, false);
 
   const limitedResponse = await app.inject({
     method: "GET",
@@ -79,6 +80,53 @@ try {
     Object.hasOwn(legacyResponse.json()[0], "extra"),
     true,
     "the existing paginated message DTO remains unchanged",
+  );
+
+  await db.insert(characters).values([
+    { id: "speaker-a", data: JSON.stringify({ name: "Alpha" }) },
+    { id: "speaker-b", data: JSON.stringify({ name: "O'Neil" }) },
+  ]);
+  await db.insert(chats).values({
+    id: "speakers",
+    name: "Synthetic speakers",
+    mode: "conversation",
+    characterIds: JSON.stringify(["speaker-a", "speaker-b"]),
+  });
+  const bodies = ["O’Neil: hello\nAlpha: reply", "Alpha: already labelled", "plain text", "Unknown: prose"];
+  await db.insert(messages).values(
+    bodies.map((content, i) => ({
+      id: `speaker-${i}`,
+      chatId: "speakers",
+      role: "assistant" as const,
+      characterId: "speaker-a",
+      content,
+      createdAt: `2026-10-04T00:00:0${i}.000Z`,
+    })),
+  );
+  await db
+    .insert(messages)
+    .values({
+      id: "speaker-4",
+      chatId: "speakers",
+      role: "user",
+      content: "Alpha: quoted",
+      createdAt: "2026-10-04T00:00:04.000Z",
+    });
+  const formatted = await app.inject({ method: "GET", url: "/api/chats/speakers/message-tail" });
+  assert.equal(formatted.statusCode, 200, formatted.body);
+  const rows = formatted.json();
+  assert.deepEqual(
+    rows.map((row: { memorySpeakerLabeled: boolean }) => row.memorySpeakerLabeled),
+    [true, true, false, false, false],
+  );
+  assert.deepEqual(
+    rows.slice(0, 4).map((row: { content: string }) => row.content),
+    bodies,
+    "original content is untouched",
+  );
+  assert.ok(
+    rows.every((row: object) => !Object.hasOwn(row, "memoryContent")),
+    "never duplicate full text on the wire",
   );
 } finally {
   await app.close();

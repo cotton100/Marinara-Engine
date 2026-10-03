@@ -324,6 +324,8 @@ type SelectFromBuilder<TProjection extends Projection | undefined> = {
 };
 
 type SelectQueryBuilder<TResult> = PromiseLike<TResult[]> & {
+  /** Opt in to table-scoped CMB reads; writes and joins retain whole-unit loading. */
+  tableOnly: () => SelectQueryBuilder<TResult>;
   innerJoin: (table: Table, condition: Condition) => SelectQueryBuilder<any>;
   where: (condition: Condition) => SelectQueryBuilder<TResult>;
   orderBy: (...orderings: Ordering[]) => SelectQueryBuilder<TResult>;
@@ -3418,8 +3420,9 @@ class FileTableStore {
    * table before any filtering — only happens for rows that match, in the
    * callers that need real contexts downstream.
    */
-  *matchingRows(meta: TableMeta, condition: Condition | undefined): IterableIterator<Row> {
-    this.ensureQueryScopeLoaded(meta, condition);
+  *matchingRows(meta: TableMeta, condition: Condition | undefined, tableOnly = false): IterableIterator<Row> {
+    if (tableOnly) this.ensureReadTableScopeLoaded(meta, condition);
+    else this.ensureQueryScopeLoaded(meta, condition);
     const ctx: RowContext = { rows: {}, baseTable: meta.name, joined: false, readOriginal: this.readOriginal };
     for (const row of this.rows(meta.name)) {
       ctx.rows[meta.name] = row;
@@ -4484,6 +4487,45 @@ class FileTableStore {
   }
 
   /**
+   * Compact CMB reads need messages OR native memories, not a whole chat's
+   * swipes/game state/etc. Reuse the normal load/merge/recovery machinery and
+   * its read-once state. No unit is declared complete by this read. A later
+   * write, join or healing event still loads that unit before changing it.
+   * ponytail: one JSON shard still parses in full; streaming tails need a
+   * separate storage design, not a raw-file shortcut around dirty state.
+   */
+  private ensureReadTableScopeLoaded(meta: TableMeta, condition: Condition) {
+    if (!LAZY_UNIT_TABLES.has(meta.name) || this.fullyResidentTables.has(meta.name)) {
+      this.ensureQueryScopeLoaded(meta, condition);
+      return;
+    }
+    const scope = this.unitScopeForCondition(meta, condition);
+    if ((meta.name !== "messages" && meta.name !== "memory_chunks") || scope === null) {
+      this.ensureQueryScopeLoaded(meta, condition);
+      return;
+    }
+    for (const key of scope) {
+      if (this.loadedUnits.has(key) || (meta.name === "messages" && this.messageStrayFilesByUnit.has(key))) {
+        this.ensureUnitsLoaded([key]);
+        continue;
+      }
+      const encoded = encodeShardKey(key);
+      if (!this.lazyDiscoveredShards.get(meta.name)?.has(encoded)) continue;
+      const rows = this.loadShardFileSync(meta.name, encoded);
+      const keys = rows.length ? this.mergeLoadedRows(meta.name, rows, encoded) : new Set<string>();
+      if (
+        this.dirtyShards.get(meta.name)?.has(key) ||
+        this.staleShardFiles.get(meta.name)?.has(encoded) ||
+        this.pinnedUnits.has(key) ||
+        [...keys].some((rowKey) => rowKey !== key)
+      ) {
+        // Recovery needs complete units for canonical rewrites and rollback.
+        this.ensureUnitsLoaded([key, ...keys]);
+      }
+    }
+  }
+
+  /**
    * Loads whole chat units: for each key, every lazy table's shard for that
    * key enters memory together, messages first. A key with no shard files is
    * still marked loaded — that is how brand-new chats become writable. Stray
@@ -4854,14 +4896,14 @@ class FileTableStore {
     }
     const cap = getMaxResidentChatUnits();
     if (cap === 0) return;
-    // A global scan only loads this TABLE, not complete chat units. Release
+    // Global scans and compact CMB reads load TABLES, not complete chat units. Release
     // its clean excess without falsely adding those units to loadedUnits.
     // Captured query/export arrays stay intact: rows and arrays are replaced,
     // never mutated by this sweep. The scan's peak allocation is unchanged.
     const retainedUnits = new Set([...this.loadedUnits, ...this.pinnedUnits]);
     const retainedEncodings = new Set([...retainedUnits].map(encodeShardKey));
     for (const table of LAZY_UNIT_LOAD_ORDER) {
-      if (!this.fullyResidentTables.has(table)) continue;
+      if (!this.fullyResidentTables.has(table) && !this.loadedShardEncodings.get(table)?.size) continue;
       if (
         this.dirtyTables.has(table) ||
         this.dirtyShards.get(table)?.size ||
@@ -5834,6 +5876,7 @@ class FileTableStore {
 }
 
 class SelectQuery implements SelectQueryBuilder<any> {
+  private loadTableOnly = false;
   private joins: JoinSpec[] = [];
   private condition: Condition;
   private orderings: Ordering[] = [];
@@ -5848,6 +5891,11 @@ class SelectQuery implements SelectQueryBuilder<any> {
 
   innerJoin(table: Table, condition: Condition) {
     this.joins.push({ table: getMeta(table), condition });
+    return this;
+  }
+
+  tableOnly() {
+    this.loadTableOnly = true;
     return this;
   }
 
@@ -5878,7 +5926,7 @@ class SelectQuery implements SelectQueryBuilder<any> {
       // context array below — the join loop needs a context per base row.
       if (this.joins.length === 0) {
         const matched: RowContext[] = [];
-        for (const row of this.store.matchingRows(this.fromMeta, this.condition)) {
+        for (const row of this.store.matchingRows(this.fromMeta, this.condition, this.loadTableOnly)) {
           matched.push(this.store.contextForRow(this.fromMeta, row));
         }
         return this.finish(matched);

@@ -1933,6 +1933,7 @@ export function createChatsStorage(db: DB) {
           createdAt: messages.createdAt,
         })
         .from(messages)
+        .tableOnly()
         .where(eq(messages.chatId, chatId))
         .orderBy(desc(messages.createdAt), desc(messages.id))
         .limit(limit);

@@ -4,6 +4,9 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- CMB memory lists and compact message tails load only the requested chat table instead of also loading swipes and other chat data. Clean partial reads are released by the existing idle/flush sweep when the chat residency cap is enabled; writes, transactions and recovery retain the normal complete-unit safeguards. Message JSON shards still parse in full, so this is not a hard RAM cap.
+- Compact CMB message tails share native memory speaker-label detection, preventing pending memories from prepending a second or conflicting speaker without sending a duplicate copy of the message text.
+
 - OpenAI GPT-6 family models entered manually, including GPT-6.1 Sol, send the supported completion-token limit in both streamed and one-shot requests. This fixes AI-assisted memory recording rejected for sending the legacy token field without changing the selected model, output cap, custom gateway conventions or stored memories.
 
 - Individual CMB Roleplay recent context includes at most one permitted saved memory from the responder's own DM, without reading private DM transcripts or bypassing compressed/disabled memories. Current-room CMB fragments no longer compete with external memories in ordinary scans; native history/recall and explicit selections remain available. CMB source/date metadata stays on every selected memory, with common guidance emitted once per budgeted scan. New native memory chunks preserve explicit Conversation speaker labels instead of prepending a conflicting or duplicate turn owner.

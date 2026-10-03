@@ -4,6 +4,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ## [Unreleased]
 
+- OpenAI GPT-6 family models entered manually, including GPT-6.1 Sol, send the supported completion-token limit in both streamed and one-shot requests. This fixes AI-assisted memory recording rejected for sending the legacy token field without changing the selected model, output cap, custom gateway conventions or stored memories.
+
 - Individual CMB Roleplay recent context includes at most one permitted saved memory from the responder's own DM, without reading private DM transcripts or bypassing compressed/disabled memories. Current-room CMB fragments no longer compete with external memories in ordinary scans; native history/recall and explicit selections remain available. CMB source/date metadata stays on every selected memory, with common guidance emitted once per budgeted scan. New native memory chunks preserve explicit Conversation speaker labels instead of prepending a conflicting or duplicate turn owner.
 
 - Unavailable default CMB Conversation rooms use localized display text in Roleplay settings.

@@ -650,6 +650,50 @@ try {
   for (const key of ["temperature", "top_p", "top_k", "min_p", "frequency_penalty", "presence_penalty"]) {
     assert.equal(key in customParametersRequestBody, false);
   }
+
+  // New GPT-6 family IDs need the reasoning-token field even before catalog registration.
+  // Reuse the real HTTP fixture for both wire paths; don't change custom gateway conventions.
+  const nativeGpt6 = createLLMProvider("openai", `http://127.0.0.1:${address.port}/v1`, "test", null, null, 1234);
+  for (const model of ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "GPT-6.1-SOL"]) {
+    for (const stream of [false, true]) {
+      for (const method of ["chat", "chatComplete"] as const) {
+        customParametersRequestBody = null;
+        const options = { model, stream, maxTokens: 5000 };
+        const result =
+          method === "chat"
+            ? await collectProviderOutput(nativeGpt6, options)
+            : (await nativeGpt6.chatComplete([{ role: "user", content: "test GPT-6 token field" }], options)).content;
+        assert.equal(result, "configured");
+        assert.ok(customParametersRequestBody);
+        assert.equal(customParametersRequestBody.max_completion_tokens, 1234, `${model}/${method}/${stream}`);
+        assert.equal("max_tokens" in customParametersRequestBody, false);
+        assert.equal("temperature" in customParametersRequestBody, false, "unknown-model suppression stays intact");
+      }
+    }
+  }
+  customParametersRequestBody = null;
+  await nativeGpt6.chatComplete([{ role: "user", content: "token send switch" }], {
+    model: "gpt-6.1-sol",
+    enabledParameters: { maxTokens: false },
+  });
+  assert.ok(customParametersRequestBody);
+  assert.equal("max_tokens" in customParametersRequestBody, false);
+  assert.equal("max_completion_tokens" in customParametersRequestBody, false);
+
+  for (const model of ["gpt-6.1-sol", "gpt-60-fixture"]) {
+    customParametersRequestBody = null;
+    await provider.chatComplete([{ role: "user", content: "custom token convention" }], { model, maxTokens: 123 });
+    assert.ok(customParametersRequestBody);
+    assert.equal(customParametersRequestBody.max_tokens, 123, "generic custom endpoints retain max_tokens");
+    assert.equal("max_completion_tokens" in customParametersRequestBody, false);
+  }
+  customParametersRequestBody = null;
+  await nativeGpt6.chatComplete([{ role: "user", content: "not the GPT-6 family" }], {
+    model: "gpt-60-fixture",
+    maxTokens: 123,
+  });
+  assert.ok(customParametersRequestBody);
+  assert.equal(customParametersRequestBody.max_tokens, 123, "the family match has a version boundary");
 } finally {
   await new Promise<void>((resolve, reject) =>
     customParametersServer.close((error) => (error ? reject(error) : resolve())),

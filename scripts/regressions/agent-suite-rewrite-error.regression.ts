@@ -21,11 +21,26 @@ const { agentsRoutes } = await import("../../packages/server/src/routes/agents.r
 const { errorHandler } = await import("../../packages/server/src/middleware/error-handler.js");
 const { createConnectionsStorage } = await import("../../packages/server/src/services/storage/connections.storage.js");
 
-type Behaviour = { status: number; body: string } | { status: number; echoAuthorization: true } | { content: string };
+type Behaviour =
+  | { status: number; body: string }
+  | { status: number; echoAuthorization: true }
+  | { content: string; requireCompletionTokens?: boolean };
 let behaviour: Behaviour = { content: '{"updates":[]}' };
 const provider = createServer(async (request, response) => {
-  for await (const _chunk of request) {
-    /* drain */
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  const body = JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>;
+  if (
+    "requireCompletionTokens" in behaviour &&
+    behaviour.requireCompletionTokens &&
+    ("max_tokens" in body || typeof body.max_completion_tokens !== "number" || body.max_completion_tokens <= 0)
+  ) {
+    response.writeHead(400, { "content-type": "application/json" }).end(
+      JSON.stringify({
+        error: { message: "Unsupported parameter: max_tokens. Use max_completion_tokens with this model." },
+      }),
+    );
+    return;
   }
   if ("echoAuthorization" in behaviour) {
     // Some gateways quote the credential they rejected.
@@ -77,6 +92,21 @@ try {
   const ok = await rewrite();
   assert.equal(ok.statusCode, 200, ok.body);
   assert.equal(ok.json().rewrittenText, '{"updates":[]}');
+  checks++;
+
+  // The real Persona Preference Memory extension uses this same one-shot route.
+  // A manually entered GPT-6.1 Sol must work before it reaches the built-in catalog.
+  const sol = await createConnectionsStorage(db).create({
+    name: "Mock GPT-6.1 rewrite provider",
+    provider: "openai",
+    baseUrl: `http://127.0.0.1:${address.port}/v1`,
+    model: "gpt-6.1-sol",
+    apiKey: "fixture-key-never-echoed",
+  });
+  behaviour = { content: '{"updates":[]}', requireCompletionTokens: true };
+  const solResult = await rewrite(sol.id);
+  assert.equal(solResult.statusCode, 200, solResult.body);
+  assert.equal(solResult.json().rewrittenText, '{"updates":[]}');
   checks++;
 
   behaviour = { status: 401, body: JSON.stringify({ error: { message: "Incorrect API key provided" } }) };

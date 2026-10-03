@@ -642,7 +642,8 @@ export class OpenAIProvider extends BaseLLMProvider {
   private isReasoningModel(model: string): boolean {
     if (this.isGenericCustomProvider() && !this.isOpenAINoSamplingModel(model)) return false;
     const m = model.toLowerCase();
-    return /^(o1|o3|o4)/.test(m) || m.startsWith("gpt-5") || isOpenAIGpt6AstraModel(m);
+    // GPT-6 family IDs use max_completion_tokens even before catalog registration.
+    return /^(o1|o3|o4)/.test(m) || m.startsWith("gpt-5") || /^gpt-6(?:[.-]|$)/.test(m);
   }
 
   private isXAIEndpoint(): boolean {

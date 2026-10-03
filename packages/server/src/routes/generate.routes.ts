@@ -2,6 +2,7 @@ import { registerSequentialGameTasks } from "../services/game/sequential-tasks.j
 import { createAdvancedMemoryService, selectAdvancedMemoryMessages } from "../services/advanced-memory.js";
 import { prepareAdvancedMemoryContext } from "../services/generation/advanced-memory-context.js";
 import { measureContextBudget } from "../services/llm/base-provider.js";
+import { dedupeCmbProvenanceGuidance } from "../services/lorebook/cmb-provenance.js";
 import {
   resolveAdvancedMemoryPrompt,
   createAdvancedMemoryPlacement,
@@ -7086,6 +7087,9 @@ export async function generateRoutes(app: FastifyInstance) {
             }
           }
           dedupeLastMessageWrappers(preparedMessagesForGen);
+          // After per-speaker filtering, keep one common instruction across
+          // ordinary lore and the responder's recent DM supplement.
+          dedupeCmbProvenanceGuidance(preparedMessagesForGen);
           if (
             deferCharacterMacros &&
             preparedMessagesForGen.some((message) => hasDeferredCharacterMacros(message.content))

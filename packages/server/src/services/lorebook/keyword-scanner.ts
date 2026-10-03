@@ -16,6 +16,42 @@ import { LIMITS, testPrimaryKeys, testSecondaryKeys } from "@marinara-engine/sha
 import { logger } from "../../lib/logger.js";
 import { calibrateLorebookSimilarity } from "./embeddings.js";
 import { vmRegexExecutor } from "./regex-timeout.js";
+import { cmbSourceRoom } from "./cmb-provenance.js";
+
+type SemanticCandidate = { entry: LorebookEntry; similarity: number };
+
+/** Keep ordinary lore slots unchanged; interleave eligible CMB rooms inside each book. */
+function balanceCmbRooms(ranked: SemanticCandidate[]): SemanticCandidate[] {
+  const books = new Map<string, Map<string | null, SemanticCandidate[]>>();
+  for (const candidate of ranked) {
+    if (candidate.entry.tag !== "convo-memory-bridge") continue;
+    let rooms = books.get(candidate.entry.lorebookId);
+    if (!rooms) books.set(candidate.entry.lorebookId, (rooms = new Map()));
+    const room = cmbSourceRoom(candidate.entry);
+    let entries = rooms.get(room);
+    if (!entries) rooms.set(room, (entries = []));
+    entries.push(candidate);
+  }
+  const balanced = new Map<string, SemanticCandidate[]>();
+  for (const [book, rooms] of books) {
+    const queues = [...rooms.values()];
+    const order: SemanticCandidate[] = [];
+    for (let round = 0; ; round++) {
+      const before = order.length;
+      for (const queue of queues) if (queue[round]) order.push(queue[round]!);
+      if (before === order.length) break;
+    }
+    balanced.set(book, order);
+  }
+  const offsets = new Map<string, number>();
+  return ranked.map((candidate) => {
+    if (candidate.entry.tag !== "convo-memory-bridge") return candidate;
+    const book = candidate.entry.lorebookId;
+    const offset = offsets.get(book) ?? 0;
+    offsets.set(book, offset + 1);
+    return balanced.get(book)![offset]!;
+  });
+}
 
 /** Compute cosine similarity between two vectors. Returns 0 for empty/mismatched vectors. */
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -673,7 +709,8 @@ export function scanForActivatedEntries(
     }
 
     const semanticCountsByLorebookId = new Map<string, number>();
-    for (const candidate of semanticCandidates.sort((a, b) => b.similarity - a.similarity)) {
+    // All visibility, threshold, space, timing and probability gates have already run.
+    for (const candidate of balanceCmbRooms(semanticCandidates.sort((a, b) => b.similarity - a.similarity))) {
       const lorebookId = candidate.entry.lorebookId;
       const maxMatches = semanticMaxMatchesByLorebookId.get(lorebookId) ?? LIMITS.LOREBOOK_VECTOR_MAX_RESULTS_DEFAULT;
       const selectedCount = semanticCountsByLorebookId.get(lorebookId) ?? 0;

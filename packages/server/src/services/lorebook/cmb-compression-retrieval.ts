@@ -116,6 +116,8 @@ export async function resolveCmbCompressionEntries(
     generationTriggers?: string[];
     query?: string;
     detailBudget?: CmbDetailedRecallBudget;
+    /** Local CMB originals already covered by native recall; explicit selections are omitted. */
+    excludeUncompressedEntryIds?: ReadonlySet<string>;
   },
 ): Promise<LorebookEntry[]> {
   const budget = options.detailBudget ?? createCmbDetailedRecallBudget();
@@ -154,6 +156,7 @@ export async function resolveCmbCompressionEntries(
     const byCast = compressionRecords(dynamic);
     if (byCast === null) continue;
     const activeReaders = readers.filter(({ castId }) => record(byCast[castId])?.active === true);
+    if (!activeReaders.length && options.excludeUncompressedEntryIds?.has(entry.id)) continue;
     // Only eligible readers reach disk-backed originals, one event at a time.
     const readOriginal = async () => {
       if (!db) return !(entry as LorebookEntry & { cmbOriginalDeferred?: boolean }).cmbOriginalDeferred;

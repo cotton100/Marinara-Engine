@@ -6,6 +6,8 @@ This file is the release-notes source of truth for Marinara Engine. Reuse these 
 
 ### Fixed
 
+- CMB compressed memories can be recalled in their source chat as permitted character summaries. Local uncompressed duplicates still use native recall, and disabled, private, stale or invalid summaries remain excluded without reopening their original details.
+
 - CMB semantic retrieval interleaves relevant memories from eligible source rooms within each lorebook's existing Vector Limit (1–100, default 10), instead of allowing a busier room to fill every result. Visibility, relevance thresholds, explicit selections and token budgets remain unchanged. Common source-time guidance is emitted once across generated system provenance headers, including an Individual RP responder's recent DM supplement; source/date labels and memory bodies remain intact.
 
 - CMB memory lists and compact message tails load only the requested chat table instead of also loading swipes and other chat data. Clean partial reads are released by the existing idle/flush sweep when the chat residency cap is enabled; writes, transactions and recovery retain the normal complete-unit safeguards. Message JSON shards still parse in full, so this is not a hard RAM cap.

@@ -20,12 +20,14 @@ const { getDB, closeDB } = await import("../../packages/server/src/db/connection
 const { agentsRoutes } = await import("../../packages/server/src/routes/agents.routes.js");
 const { errorHandler } = await import("../../packages/server/src/middleware/error-handler.js");
 const { createConnectionsStorage } = await import("../../packages/server/src/services/storage/connections.storage.js");
+const { MAX_RATE_LIMIT_RETRIES } = await import("../../packages/server/src/services/llm/rate-limit-aware-provider.js");
 
 type Behaviour =
   | { status: number; body: string }
   | { status: number; echoAuthorization: true }
   | { content: string; requireCompletionTokens?: boolean };
 let behaviour: Behaviour = { content: '{"updates":[]}' };
+let rateLimitRequests = 0;
 const provider = createServer(async (request, response) => {
   const chunks: Buffer[] = [];
   for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -50,6 +52,11 @@ const provider = createServer(async (request, response) => {
     return;
   }
   if ("status" in behaviour) {
+    if (behaviour.status === 429) {
+      // Exercise retry exhaustion without waiting through the production backoff schedule.
+      rateLimitRequests++;
+      response.setHeader("retry-after", "0");
+    }
     response.writeHead(behaviour.status, { "content-type": "application/json" }).end(behaviour.body);
     return;
   }
@@ -189,6 +196,7 @@ try {
   const limited = await rewrite();
   assert.equal(limited.statusCode, 502);
   assert.match(limited.json().error, /Rate limit reached/u);
+  assert.equal(rateLimitRequests, MAX_RATE_LIMIT_RETRIES + 1, "the initial request and all retries reached the mock");
   checks++;
 
   behaviour = { status: 503, body: "<html><title>Upstream unavailable</title></html>" };

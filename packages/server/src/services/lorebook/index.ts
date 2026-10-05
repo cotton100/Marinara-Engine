@@ -1184,9 +1184,12 @@ export async function processLorebooks(
     relevantLorebooksById,
   );
   hasCmbCandidates = allEntries.some((entry) => entry.tag === "convo-memory-bridge");
-  // Filter before semantic top-K/budgeting so local chunks cannot crowd out linked-room memories.
-  allEntries = allEntries.filter(
-    (entry) => forcedIds.includes(entry.id) || !isCmbMemoryOnlyFromChat(entry, options?.chatId),
+  // Native recall covers local originals, but excludes compressed sources. Let
+  // the permission-aware resolver keep their summaries before top-K/budgeting.
+  const excludeUncompressedEntryIds = new Set(
+    allEntries
+      .filter((entry) => !forcedIds.includes(entry.id) && isCmbMemoryOnlyFromChat(entry, options?.chatId))
+      .map((entry) => entry.id),
   );
 
   // Apply per-chat entry state overrides — an entry that was disabled by ephemeral
@@ -1218,6 +1221,7 @@ export async function processLorebooks(
     gameState ?? null,
   );
   allEntries = await resolveCmbCompressionEntries(db, allEntries, {
+    excludeUncompressedEntryIds,
     audienceCharacterIds: options?.cmbAudienceCharacterIds ?? matchingContext.activeCharacterIds,
     contextCharacterIds: matchingContext.activeCharacterIds,
     activeCharacterTags: matchingContext.activeCharacterTags,
